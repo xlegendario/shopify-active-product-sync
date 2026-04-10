@@ -125,6 +125,24 @@ app.post("/run", async (_, res) => {
   }
 });
 
+// Temporary GET endpoint for testing in browser
+app.get("/run", async (req, res) => {
+  try {
+    const result = await syncActiveProducts();
+    res.json({
+      success: true,
+      message: "Sync completed successfully",
+      totalActiveProducts: result.total
+    });
+  } catch (error) {
+    console.error("Sync error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
