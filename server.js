@@ -189,7 +189,8 @@ async function syncMerchant(merchant, runId) {
     sentAt: new Date().toISOString(),
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
-    shopifyDomain: merchant.shopifyDomain
+    shopifyDomain: merchant.shopifyDomain,
+    shopifyToken: merchant.shopifyToken
   });
 
   const query = `
@@ -246,6 +247,7 @@ async function syncMerchant(merchant, runId) {
         merchantRecordId: merchant.recordId,
         merchantName: merchant.name,
         shopifyDomain: merchant.shopifyDomain,
+        shopifyToken: merchant.shopifyToken,
         page,
         batchInPage: i + 1,
         batchesInPage: batches.length,
@@ -265,6 +267,7 @@ async function syncMerchant(merchant, runId) {
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
     shopifyDomain: merchant.shopifyDomain,
+    shopifyToken: merchant.shopifyToken,
     totalProductsSeen,
     totalActiveProducts,
     totalBatchesSent
