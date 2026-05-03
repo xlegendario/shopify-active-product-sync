@@ -377,6 +377,26 @@ function buildStockxName(retailed) {
     .trim();
 }
 
+async function buildVariantRecordsMap({ merchant, product, variants }) {
+  const productId = String(product.legacyResourceId || getNumericId(product.id));
+  const recordsByVariantId = new Map();
+
+  for (const variant of variants) {
+    const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+
+    const existing = await findStoreListing({
+      merchantRecordId: merchant.recordId,
+      productId,
+      variantId
+    });
+
+    recordsByVariantId.set(variantId, existing);
+    await sleep(220);
+  }
+
+  return recordsByVariantId;
+}
+
 async function findStoreListing({ merchantRecordId, productId, variantId }) {
   const formula = `AND(
     {Merchant Record ID} = '${airtableEscape(merchantRecordId)}',
@@ -388,7 +408,17 @@ async function findStoreListing({ merchantRecordId, productId, variantId }) {
   return records[0] || null;
 }
 
-async function upsertStoreListing({ merchant, syncId, product, variant, retailed, retailedStatus, productSku }) {
+async function upsertStoreListing({
+  merchant,
+  syncId,
+  product,
+  variant,
+  retailed,
+  retailedStatus,
+  productSku,
+  existingRecord = null,
+  enrich = false
+}) {
   const now = new Date().toISOString();
 
   const productId = String(product.legacyResourceId || getNumericId(product.id));
@@ -397,49 +427,51 @@ async function upsertStoreListing({ merchant, syncId, product, variant, retailed
     variant.inventoryItem?.legacyResourceId || getNumericId(variant.inventoryItem?.id)
   );
 
-  const stockxProductName = buildStockxName(retailed);
-
-  const fields = {
+  const baseFields = {
     "Client": [merchant.recordId],
     "Merchant Record ID": merchant.recordId,
-  
+
     "Shopify Product ID": productId,
     "Shopify Variant ID": variantId,
     "Shopify Inventory Item ID": inventoryItemId,
-  
-    "StockX Product Name": stockxProductName,
+
     "Shopify Product Name": product.title || "",
     "Size": variant.title || "",
     "SKU": productSku || "",
-  
-    "Brand": retailed?.brand || "",
-    "Retailed Status": retailedStatus,
+
     "Last Seen Sync ID": syncId,
     "Last Shopify Sync At": now,
     "Status": "active"
   };
 
-  if (retailed?.image) {
-    fields.Picture = [
-      {
-        url: retailed.image,
-        filename: `${stockxProductName || product.title || variantId}.webp`
-      }
-    ];
+  const shouldEnrich =
+    enrich ||
+    !existingRecord ||
+    ["failed", "not_found"].includes(existingRecord?.fields?.["Retailed Status"]);
+
+  if (shouldEnrich) {
+    const stockxProductName = buildStockxName(retailed);
+
+    baseFields["StockX Product Name"] = stockxProductName;
+    baseFields["Brand"] = retailed?.brand || "";
+    baseFields["Retailed Status"] = retailedStatus;
+
+    if (retailed?.image) {
+      baseFields.Picture = [
+        {
+          url: retailed.image,
+          filename: `${stockxProductName || product.title || variantId}.webp`
+        }
+      ];
+    }
   }
 
-  const existing = await findStoreListing({
-    merchantRecordId: merchant.recordId,
-    productId,
-    variantId
-  });
-
-  if (existing) {
-    await updateAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, existing.id, fields);
-    return { action: "updated", recordId: existing.id };
+  if (existingRecord) {
+    await updateAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, existingRecord.id, baseFields);
+    return { action: "updated", recordId: existingRecord.id };
   }
 
-  const created = await createAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, fields);
+  const created = await createAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, baseFields);
   return { action: "created", recordId: created.id };
 }
 
@@ -493,21 +525,44 @@ async function syncMerchant(merchant, runId) {
     const firstVariantSku = variants[0]?.sku || "";
     const retailedQuery = firstVariantSku || fullProduct.title;
 
-    const retailed = await searchRetailed(retailedQuery);
-
+    const existingByVariantId = await buildVariantRecordsMap({
+      merchant,
+      product: fullProduct,
+      variants
+    });
+    
+    const allVariantsExist = variants.every((variant) => {
+      const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+      return Boolean(existingByVariantId.get(variantId));
+    });
+    
+    const needsRetailedRetry = variants.some((variant) => {
+      const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+      const existing = existingByVariantId.get(variantId);
+      return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
+    });
+    
+    let retailed = null;
     let retailedStatus = "ok";
     
-    if (!retailedQuery) {
-      retailedStatus = "not_found";
-      retailedMisses += 1;
-    } else if (!retailed) {
-      retailedStatus = "failed";
-      retailedMisses += 1;
+    if (!allVariantsExist || needsRetailedRetry) {
+      retailed = await searchRetailed(retailedQuery);
+    
+      if (!retailedQuery) {
+        retailedStatus = "not_found";
+        retailedMisses += 1;
+      } else if (!retailed) {
+        retailedStatus = "failed";
+        retailedMisses += 1;
+      }
     }
-
+    
     for (const variant of variants) {
       variantsProcessed += 1;
-
+    
+      const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+      const existingRecord = existingByVariantId.get(variantId);
+    
       const result = await upsertStoreListing({
         merchant,
         syncId,
@@ -515,12 +570,14 @@ async function syncMerchant(merchant, runId) {
         variant,
         retailed,
         retailedStatus,
-        productSku: firstVariantSku
+        productSku: firstVariantSku,
+        existingRecord,
+        enrich: !existingRecord || needsRetailedRetry
       });
-
+    
       if (result.action === "created") created += 1;
       if (result.action === "updated") updated += 1;
-
+    
       await sleep(220);
     }
   }
@@ -655,26 +712,59 @@ app.get("/run-test", async (_req, res) => {
       const firstVariantSku = variants[0]?.sku || "";
       const retailedQuery = firstVariantSku || fullProduct.title;
 
-      const retailed = await searchRetailed(retailedQuery);
-
+      const existingByVariantId = await buildVariantRecordsMap({
+        merchant,
+        product: fullProduct,
+        variants
+      });
+      
+      const allVariantsExist = variants.every((variant) => {
+        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+        return Boolean(existingByVariantId.get(variantId));
+      });
+      
+      const needsRetailedRetry = variants.some((variant) => {
+        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+        const existing = existingByVariantId.get(variantId);
+        return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
+      });
+      
+      let retailed = null;
       let retailedStatus = "ok";
-
-      if (!retailedQuery) retailedStatus = "not_found";
-      else if (!retailed) retailedStatus = "failed";
-
+      
+      if (!allVariantsExist || needsRetailedRetry) {
+        retailed = await searchRetailed(retailedQuery);
+      
+        if (!retailedQuery) retailedStatus = "not_found";
+        else if (!retailed) retailedStatus = "failed";
+      }
+      
       for (const variant of variants) {
         variantsProcessed += 1;
-
-        await upsertStoreListing({
+      
+        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+        const existingRecord = existingByVariantId.get(variantId);
+      
+        const result = await upsertStoreListing({
           merchant,
           syncId,
           product: fullProduct,
           variant,
           retailed,
           retailedStatus,
-          productSku: firstVariantSku
+          productSku: firstVariantSku,
+          existingRecord,
+          enrich: !existingRecord || needsRetailedRetry
         });
-
+      
+        console.log("TEST upsert result:", {
+          product: fullProduct.title,
+          variant: variant.title,
+          sku: firstVariantSku,
+          action: result.action,
+          recordId: result.recordId
+        });
+      
         await sleep(200);
       }
     }
