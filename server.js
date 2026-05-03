@@ -665,7 +665,7 @@ app.get("/run-test", async (_req, res) => {
       for (const variant of variants) {
         variantsProcessed += 1;
 
-        await upsertStoreListing({
+        const upsertResult = await upsertStoreListing({
           merchant,
           syncId,
           product: fullProduct,
@@ -673,6 +673,14 @@ app.get("/run-test", async (_req, res) => {
           retailed,
           retailedStatus,
           productSku: firstVariantSku
+        });
+        
+        console.log("TEST upsert result:", {
+          product: fullProduct.title,
+          variant: variant.title,
+          sku: firstVariantSku,
+          action: upsertResult.action,
+          recordId: upsertResult.recordId
         });
 
         await sleep(200);
