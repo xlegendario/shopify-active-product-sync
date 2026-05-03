@@ -366,11 +366,8 @@ app.get("/run-test-full", async (_req, res) => {
       syncId,
       runId,
       sentAt: new Date().toISOString(),
-      test: true,
-      merchantRecordId: merchant.recordId,
-      merchantName: merchant.name,
-      shopifyDomain: merchant.shopifyDomain
-    });
+      test: true
+    }, merchant);
 
     const query = `
       query GetProducts {
@@ -401,14 +398,11 @@ app.get("/run-test-full", async (_req, res) => {
       runId,
       sentAt: new Date().toISOString(),
       test: true,
-      merchantRecordId: merchant.recordId,
-      merchantName: merchant.name,
-      shopifyDomain: merchant.shopifyDomain,
       page: 1,
       batchInPage: 1,
       batchesInPage: 1,
       products: activeProducts
-    });
+    }, merchant);
 
     await sendToMake({
       event: "sync_completed",
@@ -416,13 +410,10 @@ app.get("/run-test-full", async (_req, res) => {
       runId,
       sentAt: new Date().toISOString(),
       test: true,
-      merchantRecordId: merchant.recordId,
-      merchantName: merchant.name,
-      shopifyDomain: merchant.shopifyDomain,
       totalProductsSeen: result.data.products.edges.length,
       totalActiveProducts: activeProducts.length,
       totalBatchesSent: 1
-    });
+    }, merchant);
 
     res.json({
       success: true,
