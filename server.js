@@ -60,11 +60,20 @@ function chunkArray(array, size) {
   return chunks;
 }
 
-async function sendToMake(payload) {
+async function sendToMake(payload, merchant = null) {
+  // 🔥 auto-inject token if merchant is passed
+  if (merchant) {
+    payload.shopifyToken = merchant.shopifyToken;
+    payload.shopifyDomain = merchant.shopifyDomain;
+    payload.merchantRecordId = merchant.recordId;
+    payload.merchantName = merchant.name;
+  }
+
   console.log("Sending to Make:", {
     event: payload.event,
     syncId: payload.syncId,
     merchantRecordId: payload.merchantRecordId,
+    hasToken: !!payload.shopifyToken,
     batchSize: payload.products?.length || 0
   });
 
@@ -77,11 +86,6 @@ async function sendToMake(payload) {
   });
 
   const responseText = await response.text();
-
-  console.log("Make response:", {
-    status: response.status,
-    body: responseText.slice(0, 500)
-  });
 
   if (!response.ok) {
     throw new Error(`Make webhook failed: ${response.status} ${responseText}`);
