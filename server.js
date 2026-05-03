@@ -618,6 +618,88 @@ app.get("/run", async (_req, res) => {
   }
 });
 
+app.get("/run-test", async (_req, res) => {
+  try {
+    assertEnv();
+
+    const merchants = await fetchActiveMerchants();
+
+    if (!merchants.length) {
+      return res.json({
+        success: false,
+        message: "No active merchants"
+      });
+    }
+
+    const merchant = merchants[0];
+    const runId = createSyncId();
+    const syncId = `${runId}_${merchant.recordId}`;
+
+    console.log("TEST RUN", { merchant: merchant.name, syncId });
+
+    const products = await fetchActiveProducts(merchant);
+
+    // 👇 LIMIT TO 5 PRODUCTS
+    const testProducts = products.slice(0, 5);
+
+    let variantsProcessed = 0;
+
+    for (const product of testProducts) {
+      const fullProduct = await fetchProductVariants(merchant, product.id);
+      const variants = fullProduct.variants.edges.map((e) => e.node);
+
+      const firstSku = variants.find((v) => v.sku)?.sku || "";
+      const retaildQuery = firstSku || fullProduct.title;
+
+      const retaild = await searchRetaild(retaildQuery);
+
+      let retaildStatus = "ok";
+
+      if (!retaildQuery) retaildStatus = "not_found";
+      else if (!retaild) retaildStatus = "failed";
+
+      for (const variant of variants) {
+        variantsProcessed += 1;
+
+        await upsertStoreListing({
+          merchant,
+          syncId,
+          product: fullProduct,
+          variant,
+          retaild,
+          retaildStatus
+        });
+
+        await sleep(200);
+      }
+    }
+
+    // ❗ BELANGRIJK: GEEN deactivate in test
+    // await deactivateOldListings(merchant, syncId);
+
+    await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
+      "Last Sync ID": syncId,
+      "Last Shopify Sync At": new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      message: "Test run completed",
+      merchant: merchant.name,
+      productsProcessed: testProducts.length,
+      variantsProcessed
+    });
+
+  } catch (error) {
+    console.error("Test run error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
