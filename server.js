@@ -5,11 +5,20 @@ app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 10000;
 
-const SHOPIFY_STORE_DOMAIN = (process.env.SHOPIFY_STORE_DOMAIN || "")
-  .replace(/^https?:\/\//, "")
-  .replace(/\/$/, "");
+const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN || "";
+const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || "";
+const AIRTABLE_MERCHANTS_TABLE_NAME =
+  process.env.AIRTABLE_MERCHANTS_TABLE_NAME || "Merchants";
 
-const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || "";
+const AIRTABLE_MERCHANT_ACTIVE_FIELD =
+  process.env.AIRTABLE_MERCHANT_ACTIVE_FIELD || "Active?";
+
+const AIRTABLE_SHOPIFY_URL_FIELD =
+  process.env.AIRTABLE_SHOPIFY_URL_FIELD || "Shopify URL";
+
+const AIRTABLE_SHOPIFY_TOKEN_FIELD =
+  process.env.AIRTABLE_SHOPIFY_TOKEN_FIELD || "Shopify Token";
+
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || "";
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
@@ -17,8 +26,8 @@ const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
 function assertEnv() {
   const missing = [];
 
-  if (!SHOPIFY_STORE_DOMAIN) missing.push("SHOPIFY_STORE_DOMAIN");
-  if (!SHOPIFY_ACCESS_TOKEN) missing.push("SHOPIFY_ACCESS_TOKEN");
+  if (!AIRTABLE_TOKEN) missing.push("AIRTABLE_TOKEN");
+  if (!AIRTABLE_BASE_ID) missing.push("AIRTABLE_BASE_ID");
   if (!MAKE_WEBHOOK_URL) missing.push("MAKE_WEBHOOK_URL");
 
   if (missing.length > 0) {
@@ -30,34 +39,32 @@ function createSyncId() {
   return `sync_${new Date().toISOString()}`;
 }
 
-function getShopifyGraphqlUrl() {
-  return `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+function normalizeShopifyDomain(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/$/, "");
 }
 
-async function shopifyGraphQL(query, variables = {}) {
-  const response = await fetch(getShopifyGraphqlUrl(), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
-    },
-    body: JSON.stringify({ query, variables })
-  });
+function getNumericProductId(gid) {
+  return String(gid).split("/").pop();
+}
 
-  const text = await response.text();
-  const data = JSON.parse(text);
+function chunkArray(array, size) {
+  const chunks = [];
 
-  if (!response.ok || data.errors) {
-    throw new Error(JSON.stringify(data.errors || data));
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
   }
 
-  return data;
+  return chunks;
 }
 
 async function sendToMake(payload) {
   console.log("Sending to Make:", {
     event: payload.event,
     syncId: payload.syncId,
+    merchantRecordId: payload.merchantRecordId,
     batchSize: payload.products?.length || 0
   });
 
@@ -81,25 +88,107 @@ async function sendToMake(payload) {
   }
 }
 
-function chunkArray(array, size) {
-  const chunks = [];
+async function fetchActiveMerchants() {
+  const table = encodeURIComponent(AIRTABLE_MERCHANTS_TABLE_NAME);
+  const formula = encodeURIComponent(`{${AIRTABLE_MERCHANT_ACTIVE_FIELD}} = 1`);
 
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size));
+  let url =
+    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${table}` +
+    `?filterByFormula=${formula}`;
+
+  const merchants = [];
+
+  while (url) {
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${AIRTABLE_TOKEN}`
+      }
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(`Airtable error: ${JSON.stringify(data)}`);
+    }
+
+    for (const record of data.records || []) {
+      const fields = record.fields || {};
+
+      const rawShopifyUrl = fields[AIRTABLE_SHOPIFY_URL_FIELD];
+      const shopifyToken = fields[AIRTABLE_SHOPIFY_TOKEN_FIELD];
+
+      const shopifyDomain = normalizeShopifyDomain(rawShopifyUrl);
+
+      if (!shopifyDomain || !shopifyToken) {
+        console.warn("Skipping merchant missing Shopify URL or token:", {
+          recordId: record.id,
+          rawShopifyUrl,
+          hasToken: Boolean(shopifyToken)
+        });
+        continue;
+      }
+
+      merchants.push({
+        recordId: record.id,
+        name: fields.Name || fields["Name"] || record.id,
+        shopifyDomain,
+        shopifyToken
+      });
+    }
+
+    if (data.offset) {
+      url =
+        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${table}` +
+        `?filterByFormula=${formula}&offset=${encodeURIComponent(data.offset)}`;
+    } else {
+      url = null;
+    }
   }
 
-  return chunks;
+  return merchants;
 }
 
-async function syncActiveProducts() {
-  assertEnv();
+async function shopifyGraphQL({ shopifyDomain, shopifyToken }, query, variables = {}) {
+  const url = `https://${shopifyDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-  const syncId = createSyncId();
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": shopifyToken
+    },
+    body: JSON.stringify({ query, variables })
+  });
+
+  const text = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Shopify non-JSON response from ${shopifyDomain}: ${text.slice(0, 500)}`);
+  }
+
+  if (!response.ok || data.errors) {
+    throw new Error(
+      `Shopify error for ${shopifyDomain}: ${JSON.stringify(data.errors || data)}`
+    );
+  }
+
+  return data;
+}
+
+async function syncMerchant(merchant, runId) {
+  const syncId = `${runId}_${merchant.recordId}`;
 
   await sendToMake({
     event: "sync_started",
     syncId,
-    sentAt: new Date().toISOString()
+    runId,
+    sentAt: new Date().toISOString(),
+    merchantRecordId: merchant.recordId,
+    merchantName: merchant.name,
+    shopifyDomain: merchant.shopifyDomain
   });
 
   const query = `
@@ -129,18 +218,21 @@ async function syncActiveProducts() {
   while (hasNextPage) {
     page += 1;
 
-    const result = await shopifyGraphQL(query, { cursor });
+    const result = await shopifyGraphQL(merchant, query, { cursor });
     const connection = result.data.products;
 
-    const activeIds = connection.edges
+    const activeProducts = connection.edges
       .map((edge) => edge.node)
       .filter((product) => product.status === "ACTIVE")
-      .map((product) => product.id);
+      .map((product) => ({
+        id: product.id,
+        shopifyProductId: getNumericProductId(product.id)
+      }));
 
     totalProductsSeen += connection.edges.length;
-    totalActiveProducts += activeIds.length;
+    totalActiveProducts += activeProducts.length;
 
-    const batches = chunkArray(activeIds, BATCH_SIZE);
+    const batches = chunkArray(activeProducts, BATCH_SIZE);
 
     for (let i = 0; i < batches.length; i += 1) {
       totalBatchesSent += 1;
@@ -148,11 +240,15 @@ async function syncActiveProducts() {
       await sendToMake({
         event: "product_batch",
         syncId,
+        runId,
         sentAt: new Date().toISOString(),
+        merchantRecordId: merchant.recordId,
+        merchantName: merchant.name,
+        shopifyDomain: merchant.shopifyDomain,
         page,
         batchInPage: i + 1,
         batchesInPage: batches.length,
-        products: batches[i].map((id) => ({ id }))
+        products: batches[i]
       });
     }
 
@@ -163,13 +259,20 @@ async function syncActiveProducts() {
   await sendToMake({
     event: "sync_completed",
     syncId,
+    runId,
     sentAt: new Date().toISOString(),
+    merchantRecordId: merchant.recordId,
+    merchantName: merchant.name,
+    shopifyDomain: merchant.shopifyDomain,
     totalProductsSeen,
     totalActiveProducts,
     totalBatchesSent
   });
 
   return {
+    merchantRecordId: merchant.recordId,
+    merchantName: merchant.name,
+    shopifyDomain: merchant.shopifyDomain,
     syncId,
     totalProductsSeen,
     totalActiveProducts,
@@ -177,10 +280,38 @@ async function syncActiveProducts() {
   };
 }
 
+async function syncAllMerchants() {
+  assertEnv();
+
+  const runId = createSyncId();
+  const merchants = await fetchActiveMerchants();
+
+  console.log(`Found ${merchants.length} active merchants`);
+
+  const results = [];
+
+  for (const merchant of merchants) {
+    console.log("Syncing merchant:", {
+      recordId: merchant.recordId,
+      name: merchant.name,
+      shopifyDomain: merchant.shopifyDomain
+    });
+
+    const result = await syncMerchant(merchant, runId);
+    results.push(result);
+  }
+
+  return {
+    runId,
+    merchantsSynced: results.length,
+    results
+  };
+}
+
 app.get("/", (_req, res) => {
   res.json({
     success: true,
-    message: "Shopify Active Product Sync is running"
+    message: "Multi-merchant Shopify Active Product Sync is running"
   });
 });
 
@@ -191,122 +322,24 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.get("/test-make", async (_req, res) => {
+app.get("/test-merchants", async (_req, res) => {
   try {
     assertEnv();
 
-    const syncId = createSyncId();
-
-    await sendToMake({
-      event: "product_batch",
-      syncId,
-      sentAt: new Date().toISOString(),
-      test: true,
-      products: [
-        { id: "gid://shopify/Product/8651421024523" },
-        { id: "gid://shopify/Product/8651451924747" }
-      ]
-    });
+    const merchants = await fetchActiveMerchants();
 
     res.json({
       success: true,
-      message: "Test batch sent to Make",
-      syncId
+      count: merchants.length,
+      merchants: merchants.map((merchant) => ({
+        recordId: merchant.recordId,
+        name: merchant.name,
+        shopifyDomain: merchant.shopifyDomain,
+        hasToken: Boolean(merchant.shopifyToken)
+      }))
     });
   } catch (error) {
-    console.error("Test Make error:", error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.get("/run", async (_req, res) => {
-  try {
-    const result = await syncActiveProducts();
-
-    res.json({
-      success: true,
-      message: "Sync completed successfully",
-      ...result
-    });
-  } catch (error) {
-    console.error("Sync error:", error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.post("/run", async (_req, res) => {
-  try {
-    const result = await syncActiveProducts();
-
-    res.json({
-      success: true,
-      message: "Sync completed successfully",
-      ...result
-    });
-  } catch (error) {
-    console.error("Sync error:", error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.get("/run-test-batch", async (_req, res) => {
-  try {
-    assertEnv();
-
-    const syncId = createSyncId();
-
-    const query = `
-      query GetProducts($cursor: String) {
-        products(first: 5, after: $cursor) {
-          edges {
-            node {
-              id
-              status
-            }
-          }
-        }
-      }
-    `;
-
-    const result = await shopifyGraphQL(query, { cursor: null });
-
-    const activeIds = result.data.products.edges
-      .map((edge) => edge.node)
-      .filter((product) => product.status === "ACTIVE")
-      .map((product) => product.id);
-
-    await sendToMake({
-      event: "product_batch",
-      syncId,
-      sentAt: new Date().toISOString(),
-      test: true,
-      page: 1,
-      batchInPage: 1,
-      batchesInPage: 1,
-      products: activeIds.map((id) => ({ id }))
-    });
-
-    res.json({
-      success: true,
-      message: "Sent one test batch to Make",
-      syncId,
-      count: activeIds.length,
-      ids: activeIds
-    });
-  } catch (error) {
-    console.error("Test batch error:", error);
+    console.error("Test merchants error:", error);
 
     res.status(500).json({
       success: false,
@@ -319,13 +352,28 @@ app.get("/run-test-full", async (_req, res) => {
   try {
     assertEnv();
 
-    const syncId = createSyncId();
+    const merchants = await fetchActiveMerchants();
+
+    if (!merchants.length) {
+      return res.json({
+        success: false,
+        message: "No active merchants found"
+      });
+    }
+
+    const merchant = merchants[0];
+    const runId = createSyncId();
+    const syncId = `${runId}_${merchant.recordId}`;
 
     await sendToMake({
       event: "sync_started",
       syncId,
+      runId,
       sentAt: new Date().toISOString(),
-      test: true
+      test: true,
+      merchantRecordId: merchant.recordId,
+      merchantName: merchant.name,
+      shopifyDomain: merchant.shopifyDomain
     });
 
     const query = `
@@ -341,44 +389,93 @@ app.get("/run-test-full", async (_req, res) => {
       }
     `;
 
-    const result = await shopifyGraphQL(query);
+    const result = await shopifyGraphQL(merchant, query);
 
-    const activeIds = result.data.products.edges
+    const activeProducts = result.data.products.edges
       .map((edge) => edge.node)
       .filter((product) => product.status === "ACTIVE")
-      .map((product) => product.id);
+      .map((product) => ({
+        id: product.id,
+        shopifyProductId: getNumericProductId(product.id)
+      }));
 
     await sendToMake({
       event: "product_batch",
       syncId,
+      runId,
       sentAt: new Date().toISOString(),
       test: true,
+      merchantRecordId: merchant.recordId,
+      merchantName: merchant.name,
+      shopifyDomain: merchant.shopifyDomain,
       page: 1,
       batchInPage: 1,
       batchesInPage: 1,
-      products: activeIds.map((id) => ({ id }))
+      products: activeProducts
     });
 
     await sendToMake({
       event: "sync_completed",
       syncId,
+      runId,
       sentAt: new Date().toISOString(),
       test: true,
+      merchantRecordId: merchant.recordId,
+      merchantName: merchant.name,
+      shopifyDomain: merchant.shopifyDomain,
       totalProductsSeen: result.data.products.edges.length,
-      totalActiveProducts: activeIds.length,
+      totalActiveProducts: activeProducts.length,
       totalBatchesSent: 1
     });
 
     res.json({
       success: true,
-      message: "Mini full sync sent to Make",
+      message: "Mini full sync for first active merchant sent to Make",
+      merchantRecordId: merchant.recordId,
+      merchantName: merchant.name,
       syncId,
-      totalProductsSeen: result.data.products.edges.length,
-      totalActiveProducts: activeIds.length,
-      totalBatchesSent: 1
+      count: activeProducts.length
     });
   } catch (error) {
     console.error("Mini full sync error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/run", async (_req, res) => {
+  try {
+    const result = await syncAllMerchants();
+
+    res.json({
+      success: true,
+      message: "Multi-merchant sync completed successfully",
+      ...result
+    });
+  } catch (error) {
+    console.error("Sync error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/run", async (_req, res) => {
+  try {
+    const result = await syncAllMerchants();
+
+    res.json({
+      success: true,
+      message: "Multi-merchant sync completed successfully",
+      ...result
+    });
+  } catch (error) {
+    console.error("Sync error:", error);
 
     res.status(500).json({
       success: false,
