@@ -7,28 +7,36 @@ const PORT = process.env.PORT || 10000;
 
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN || "";
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID || "";
+
 const AIRTABLE_MERCHANTS_TABLE_NAME =
   process.env.AIRTABLE_MERCHANTS_TABLE_NAME || "Merchants";
 
+const AIRTABLE_STORE_LISTINGS_TABLE_NAME =
+  process.env.AIRTABLE_STORE_LISTINGS_TABLE_NAME || "Store Listings";
+
 const AIRTABLE_MERCHANT_ACTIVE_FIELD =
-  process.env.AIRTABLE_MERCHANT_ACTIVE_FIELD || "Active?";
+  process.env.AIRTABLE_MERCHANT_ACTIVE_FIELD || "Test Active?";
 
 const AIRTABLE_SHOPIFY_URL_FIELD =
-  process.env.AIRTABLE_SHOPIFY_URL_FIELD || "Shopify URL";
+  process.env.AIRTABLE_SHOPIFY_URL_FIELD || "Shopify Store URL";
 
 const AIRTABLE_SHOPIFY_TOKEN_FIELD =
   process.env.AIRTABLE_SHOPIFY_TOKEN_FIELD || "Shopify Token";
 
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
-const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || "";
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
+
+const RETAILED_API_BASE =
+  process.env.RETAILED_API_BASE || "https://app.retailed.io/api/v1/scraper/stockx/search";
+
+const RETAILED_API_KEY = process.env.RETAILED_API_KEY || "";
+const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || "15000", 10);
 
 function assertEnv() {
   const missing = [];
 
   if (!AIRTABLE_TOKEN) missing.push("AIRTABLE_TOKEN");
   if (!AIRTABLE_BASE_ID) missing.push("AIRTABLE_BASE_ID");
-  if (!MAKE_WEBHOOK_URL) missing.push("MAKE_WEBHOOK_URL");
 
   if (missing.length > 0) {
     throw new Error(`Missing environment variables: ${missing.join(", ")}`);
@@ -46,123 +54,174 @@ function normalizeShopifyDomain(value) {
     .replace(/\/$/, "");
 }
 
-function getNumericProductId(gid) {
-  return String(gid).split("/").pop();
+function getNumericId(gid) {
+  return String(gid || "").split("/").pop();
 }
 
-function chunkArray(array, size) {
-  const chunks = [];
-
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size));
-  }
-
-  return chunks;
+function airtableEscape(value) {
+  return String(value || "").replace(/'/g, "\\'");
 }
 
-async function sendToMake(payload, merchant = null) {
-  // 🔥 auto-inject token if merchant is passed
-  if (merchant) {
-    payload.shopifyToken = merchant.shopifyToken;
-    payload.shopifyDomain = merchant.shopifyDomain;
-    payload.merchantRecordId = merchant.recordId;
-    payload.merchantName = merchant.name;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, options = {}, retries = 2) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+
+      clearTimeout(timeout);
+
+      if (
+        response.status === 429 ||
+        response.status >= 500
+      ) {
+        const text = await response.text();
+        throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
+      }
+
+      return response;
+    } catch (error) {
+      clearTimeout(timeout);
+      lastError = error;
+
+      if (attempt < retries) {
+        const delay = [1000, 3000, 7000][attempt] || 7000;
+        console.warn(`Retrying request in ${delay}ms`, {
+          url,
+          attempt: attempt + 1,
+          error: error.message
+        });
+        await sleep(delay);
+      }
+    }
   }
 
-  console.log("Sending to Make:", {
-    event: payload.event,
-    syncId: payload.syncId,
-    merchantRecordId: payload.merchantRecordId,
-    hasToken: !!payload.shopifyToken,
-    batchSize: payload.products?.length || 0
-  });
+  throw lastError;
+}
 
-  const response = await fetch(MAKE_WEBHOOK_URL, {
-    method: "POST",
+async function airtableRequest(path, options = {}) {
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${path}`;
+
+  const response = await fetchWithRetry(url, {
+    ...options,
     headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
+      Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  }, 3);
 
-  const responseText = await response.text();
+  const data = await response.json();
 
   if (!response.ok) {
-    throw new Error(`Make webhook failed: ${response.status} ${responseText}`);
+    throw new Error(`Airtable error: ${JSON.stringify(data)}`);
   }
+
+  return data;
+}
+
+async function fetchAllAirtableRecords(tableName, filterByFormula = "") {
+  const table = encodeURIComponent(tableName);
+  const records = [];
+
+  let urlPath = table;
+  const params = new URLSearchParams();
+
+  if (filterByFormula) {
+    params.set("filterByFormula", filterByFormula);
+  }
+
+  let offset = null;
+
+  do {
+    const pageParams = new URLSearchParams(params);
+
+    if (offset) {
+      pageParams.set("offset", offset);
+    }
+
+    const path = `${urlPath}?${pageParams.toString()}`;
+    const data = await airtableRequest(path);
+
+    records.push(...(data.records || []));
+    offset = data.offset || null;
+  } while (offset);
+
+  return records;
+}
+
+async function updateAirtableRecord(tableName, recordId, fields) {
+  const table = encodeURIComponent(tableName);
+
+  return airtableRequest(`${table}/${recordId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ fields })
+  });
+}
+
+async function createAirtableRecord(tableName, fields) {
+  const table = encodeURIComponent(tableName);
+
+  return airtableRequest(table, {
+    method: "POST",
+    body: JSON.stringify({ fields })
+  });
 }
 
 async function fetchActiveMerchants() {
-  const table = encodeURIComponent(AIRTABLE_MERCHANTS_TABLE_NAME);
-  const formula = encodeURIComponent(`{${AIRTABLE_MERCHANT_ACTIVE_FIELD}} = 1`);
-
-  let url =
-    `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${table}` +
-    `?filterByFormula=${formula}`;
+  const formula = `{${AIRTABLE_MERCHANT_ACTIVE_FIELD}} = 1`;
+  const records = await fetchAllAirtableRecords(AIRTABLE_MERCHANTS_TABLE_NAME, formula);
 
   const merchants = [];
 
-  while (url) {
-    const response = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${AIRTABLE_TOKEN}`
-      }
-    });
+  for (const record of records) {
+    const fields = record.fields || {};
 
-    const data = await response.json();
+    const rawShopifyUrl = fields[AIRTABLE_SHOPIFY_URL_FIELD];
+    const shopifyToken = fields[AIRTABLE_SHOPIFY_TOKEN_FIELD];
+    const shopifyDomain = normalizeShopifyDomain(rawShopifyUrl);
 
-    if (!response.ok) {
-      throw new Error(`Airtable error: ${JSON.stringify(data)}`);
-    }
-
-    for (const record of data.records || []) {
-      const fields = record.fields || {};
-
-      const rawShopifyUrl = fields[AIRTABLE_SHOPIFY_URL_FIELD];
-      const shopifyToken = fields[AIRTABLE_SHOPIFY_TOKEN_FIELD];
-
-      const shopifyDomain = normalizeShopifyDomain(rawShopifyUrl);
-
-      if (!shopifyDomain || !shopifyToken) {
-        console.warn("Skipping merchant missing Shopify URL or token:", {
-          recordId: record.id,
-          rawShopifyUrl,
-          hasToken: Boolean(shopifyToken)
-        });
-        continue;
-      }
-
-      merchants.push({
+    if (!shopifyDomain || !shopifyToken) {
+      console.warn("Skipping merchant missing Shopify URL/token", {
         recordId: record.id,
-        name: fields.Name || fields["Name"] || record.id,
-        shopifyDomain,
-        shopifyToken
+        rawShopifyUrl,
+        hasToken: Boolean(shopifyToken)
       });
+      continue;
     }
 
-    if (data.offset) {
-      url =
-        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${table}` +
-        `?filterByFormula=${formula}&offset=${encodeURIComponent(data.offset)}`;
-    } else {
-      url = null;
-    }
+    merchants.push({
+      recordId: record.id,
+      name: fields.Name || record.id,
+      shopifyDomain,
+      shopifyToken
+    });
   }
 
   return merchants;
 }
 
-async function shopifyGraphQL({ shopifyDomain, shopifyToken }, query, variables = {}) {
-  const url = `https://${shopifyDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+async function shopifyGraphQL(merchant, query, variables = {}) {
+  const url = `https://${merchant.shopifyDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": shopifyToken
+      "X-Shopify-Access-Token": merchant.shopifyToken
     },
     body: JSON.stringify({ query, variables })
-  });
+  }, 3);
 
   const text = await response.text();
 
@@ -170,34 +229,26 @@ async function shopifyGraphQL({ shopifyDomain, shopifyToken }, query, variables 
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error(`Shopify non-JSON response from ${shopifyDomain}: ${text.slice(0, 500)}`);
+    throw new Error(`Shopify non-JSON response from ${merchant.shopifyDomain}: ${text.slice(0, 500)}`);
   }
 
   if (!response.ok || data.errors) {
-    throw new Error(
-      `Shopify error for ${shopifyDomain}: ${JSON.stringify(data.errors || data)}`
-    );
+    throw new Error(`Shopify error for ${merchant.shopifyDomain}: ${JSON.stringify(data.errors || data)}`);
   }
 
   return data;
 }
 
-async function syncMerchant(merchant, runId) {
-  const syncId = `${runId}_${merchant.recordId}`;
-
-  await sendToMake({
-    event: "sync_started",
-    syncId,
-    runId,
-    sentAt: new Date().toISOString()
-  }, merchant);
-
+async function fetchActiveProducts(merchant) {
   const query = `
     query GetProducts($cursor: String) {
       products(first: 250, after: $cursor) {
         edges {
           node {
             id
+            legacyResourceId
+            title
+            handle
             status
           }
         }
@@ -211,68 +262,270 @@ async function syncMerchant(merchant, runId) {
 
   let cursor = null;
   let hasNextPage = true;
-  let page = 0;
-  let totalProductsSeen = 0;
-  let totalActiveProducts = 0;
-  let totalBatchesSent = 0;
+  const products = [];
 
   while (hasNextPage) {
-    page += 1;
-
     const result = await shopifyGraphQL(merchant, query, { cursor });
     const connection = result.data.products;
 
-    const activeProducts = connection.edges
-      .map((edge) => edge.node)
-      .filter((product) => product.status === "ACTIVE")
-      .map((product) => ({
-        id: product.id,
-        shopifyProductId: getNumericProductId(product.id)
-      }));
-
-    totalProductsSeen += connection.edges.length;
-    totalActiveProducts += activeProducts.length;
-
-    const batches = chunkArray(activeProducts, BATCH_SIZE);
-
-    for (let i = 0; i < batches.length; i += 1) {
-      totalBatchesSent += 1;
-
-      await sendToMake({
-        event: "product_batch",
-        syncId,
-        runId,
-        sentAt: new Date().toISOString(),
-        page,
-        batchInPage: i + 1,
-        batchesInPage: batches.length,
-        products: batches[i]
-      }, merchant);
+    for (const edge of connection.edges) {
+      if (edge.node.status === "ACTIVE") {
+        products.push(edge.node);
+      }
     }
 
     hasNextPage = connection.pageInfo.hasNextPage;
     cursor = connection.pageInfo.endCursor;
   }
 
-  await sendToMake({
-    event: "sync_completed",
-    syncId,
-    runId,
-    sentAt: new Date().toISOString(),
-    totalProductsSeen,
-    totalActiveProducts,
-    totalBatchesSent
-  }, merchant);
+  return products;
+}
+
+async function fetchProductVariants(merchant, productGid) {
+  const query = `
+    query GetProductVariants($id: ID!) {
+      product(id: $id) {
+        id
+        legacyResourceId
+        title
+        handle
+        status
+        variants(first: 250) {
+          edges {
+            node {
+              id
+              legacyResourceId
+              title
+              sku
+              price
+              inventoryQuantity
+              inventoryItem {
+                id
+                legacyResourceId
+              }
+              selectedOptions {
+                name
+                value
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(merchant, query, { id: productGid });
+  return result.data.product;
+}
+
+async function searchRetaild(query) {
+  if (!query) return null;
+
+  const url = `${RETAILED_API_BASE}?query=${encodeURIComponent(query)}`;
+
+  try {
+    const headers = {};
+
+    if (RETAILED_API_KEY) {
+      headers.Authorization = `Bearer ${RETAILED_API_KEY}`;
+    }
+
+    const response = await fetchWithRetry(url, {
+      method: "GET",
+      headers
+    }, 2);
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(`Retaild error: ${JSON.stringify(data)}`);
+    }
+
+    const first = Array.isArray(data) ? data[0] : data?.data?.[0] || data?.results?.[0] || null;
+
+    if (!first) return null;
+
+    return {
+      name: first.name || "",
+      colorway: first.colorway || "",
+      brand: first.brand || "",
+      image: first.image || ""
+    };
+  } catch (error) {
+    console.warn("Retaild lookup failed, continuing without Retaild data", {
+      query,
+      error: error.message
+    });
+
+    return null;
+  }
+}
+
+function buildStockxName(retaild) {
+  if (!retaild) return "";
+
+  return [retaild.name, retaild.colorway]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+}
+
+async function findStoreListing({ merchantRecordId, productId, variantId }) {
+  const formula = `AND(
+    {Merchant Record ID} = '${airtableEscape(merchantRecordId)}',
+    {Shopify Product ID} = '${airtableEscape(productId)}',
+    {Shopify Variant ID} = '${airtableEscape(variantId)}'
+  )`;
+
+  const records = await fetchAllAirtableRecords(AIRTABLE_STORE_LISTINGS_TABLE_NAME, formula);
+  return records[0] || null;
+}
+
+async function upsertStoreListing({ merchant, syncId, product, variant, retaild }) {
+  const now = new Date().toISOString();
+
+  const productId = String(product.legacyResourceId || getNumericId(product.id));
+  const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+  const inventoryItemId = String(
+    variant.inventoryItem?.legacyResourceId || getNumericId(variant.inventoryItem?.id)
+  );
+
+  const stockxProductName = buildStockxName(retaild);
+
+  const fields = {
+    "Client": [merchant.recordId],
+    "Merchant Record ID": merchant.recordId,
+
+    "Shopify Product ID": productId,
+    "Shopify Variant ID": variantId,
+    "Shopify Inventory Item ID": inventoryItemId,
+
+    "StockX Product Name": stockxProductName,
+    "Shopify Product Name": product.title || "",
+    "Size": variant.title || "",
+    "SKU": variant.sku || "",
+
+    "Brand": retaild?.brand || "",
+    "Last Seen Sync ID": syncId,
+    "Last Shopify Sync At": now,
+    "Status": "active"
+  };
+
+  if (retaild?.image) {
+    fields.Picture = [
+      {
+        url: retaild.image,
+        filename: `${stockxProductName || product.title || variantId}.webp`
+      }
+    ];
+  }
+
+  const existing = await findStoreListing({
+    merchantRecordId: merchant.recordId,
+    productId,
+    variantId
+  });
+
+  if (existing) {
+    await updateAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, existing.id, fields);
+    return { action: "updated", recordId: existing.id };
+  }
+
+  const created = await createAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, fields);
+  return { action: "created", recordId: created.id };
+}
+
+async function deactivateOldListings(merchant, syncId) {
+  const formula = `AND(
+    {Merchant Record ID} = '${airtableEscape(merchant.recordId)}',
+    {Status} = 'active',
+    OR(
+      {Last Seen Sync ID} = BLANK(),
+      {Last Seen Sync ID} != '${airtableEscape(syncId)}'
+    )
+  )`;
+
+  const records = await fetchAllAirtableRecords(AIRTABLE_STORE_LISTINGS_TABLE_NAME, formula);
+
+  for (const record of records) {
+    await updateAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, record.id, {
+      "Status": "inactive"
+    });
+
+    await sleep(220);
+  }
+
+  return records.length;
+}
+
+async function syncMerchant(merchant, runId) {
+  const syncId = `${runId}_${merchant.recordId}`;
+
+  console.log("Syncing merchant", {
+    merchantRecordId: merchant.recordId,
+    merchantName: merchant.name,
+    shopifyDomain: merchant.shopifyDomain,
+    syncId
+  });
+
+  const products = await fetchActiveProducts(merchant);
+
+  let productsProcessed = 0;
+  let variantsProcessed = 0;
+  let created = 0;
+  let updated = 0;
+  let retaildMisses = 0;
+
+  for (const product of products) {
+    productsProcessed += 1;
+
+    const fullProduct = await fetchProductVariants(merchant, product.id);
+    const variants = fullProduct.variants.edges.map((edge) => edge.node);
+
+    const firstSku = variants.find((variant) => variant.sku)?.sku || "";
+    const retaildQuery = firstSku || fullProduct.title;
+
+    const retaild = await searchRetaild(retaildQuery);
+
+    if (!retaild) {
+      retaildMisses += 1;
+    }
+
+    for (const variant of variants) {
+      variantsProcessed += 1;
+
+      const result = await upsertStoreListing({
+        merchant,
+        syncId,
+        product: fullProduct,
+        variant,
+        retaild
+      });
+
+      if (result.action === "created") created += 1;
+      if (result.action === "updated") updated += 1;
+
+      await sleep(220);
+    }
+  }
+
+  const deactivated = await deactivateOldListings(merchant, syncId);
+
+  await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
+    "Last Sync ID": syncId,
+    "Last Shopify Sync At": new Date().toISOString()
+  });
 
   return {
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
-    shopifyDomain: merchant.shopifyDomain,
-    shopifyToken: merchant.shopifyToken,
     syncId,
-    totalProductsSeen,
-    totalActiveProducts,
-    totalBatchesSent
+    productsProcessed,
+    variantsProcessed,
+    created,
+    updated,
+    deactivated,
+    retaildMisses
   };
 }
 
@@ -282,17 +535,9 @@ async function syncAllMerchants() {
   const runId = createSyncId();
   const merchants = await fetchActiveMerchants();
 
-  console.log(`Found ${merchants.length} active merchants`);
-
   const results = [];
 
   for (const merchant of merchants) {
-    console.log("Syncing merchant:", {
-      recordId: merchant.recordId,
-      name: merchant.name,
-      shopifyDomain: merchant.shopifyDomain
-    });
-
     const result = await syncMerchant(merchant, runId);
     results.push(result);
   }
@@ -307,7 +552,7 @@ async function syncAllMerchants() {
 app.get("/", (_req, res) => {
   res.json({
     success: true,
-    message: "Multi-merchant Shopify Active Product Sync is running"
+    message: "Shopify Store Listings Sync is running"
   });
 });
 
@@ -335,97 +580,6 @@ app.get("/test-merchants", async (_req, res) => {
       }))
     });
   } catch (error) {
-    console.error("Test merchants error:", error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.get("/run-test-full", async (_req, res) => {
-  try {
-    assertEnv();
-
-    const merchants = await fetchActiveMerchants();
-
-    if (!merchants.length) {
-      return res.json({
-        success: false,
-        message: "No active merchants found"
-      });
-    }
-
-    const merchant = merchants[0];
-    const runId = createSyncId();
-    const syncId = `${runId}_${merchant.recordId}`;
-
-    await sendToMake({
-      event: "sync_started",
-      syncId,
-      runId,
-      sentAt: new Date().toISOString(),
-      test: true
-    }, merchant);
-
-    const query = `
-      query GetProducts {
-        products(first: 5) {
-          edges {
-            node {
-              id
-              status
-            }
-          }
-        }
-      }
-    `;
-
-    const result = await shopifyGraphQL(merchant, query);
-
-    const activeProducts = result.data.products.edges
-      .map((edge) => edge.node)
-      .filter((product) => product.status === "ACTIVE")
-      .map((product) => ({
-        id: product.id,
-        shopifyProductId: getNumericProductId(product.id)
-      }));
-
-    await sendToMake({
-      event: "product_batch",
-      syncId,
-      runId,
-      sentAt: new Date().toISOString(),
-      test: true,
-      page: 1,
-      batchInPage: 1,
-      batchesInPage: 1,
-      products: activeProducts
-    }, merchant);
-
-    await sendToMake({
-      event: "sync_completed",
-      syncId,
-      runId,
-      sentAt: new Date().toISOString(),
-      test: true,
-      totalProductsSeen: result.data.products.edges.length,
-      totalActiveProducts: activeProducts.length,
-      totalBatchesSent: 1
-    }, merchant);
-
-    res.json({
-      success: true,
-      message: "Mini full sync for first active merchant sent to Make",
-      merchantRecordId: merchant.recordId,
-      merchantName: merchant.name,
-      syncId,
-      count: activeProducts.length
-    });
-  } catch (error) {
-    console.error("Mini full sync error:", error);
-
     res.status(500).json({
       success: false,
       error: error.message
@@ -439,26 +593,7 @@ app.get("/run", async (_req, res) => {
 
     res.json({
       success: true,
-      message: "Multi-merchant sync completed successfully",
-      ...result
-    });
-  } catch (error) {
-    console.error("Sync error:", error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-app.post("/run", async (_req, res) => {
-  try {
-    const result = await syncAllMerchants();
-
-    res.json({
-      success: true,
-      message: "Multi-merchant sync completed successfully",
+      message: "Sync completed successfully",
       ...result
     });
   } catch (error) {
