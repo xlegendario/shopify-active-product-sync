@@ -381,7 +381,7 @@ async function findStoreListing({ merchantRecordId, productId, variantId }) {
   return records[0] || null;
 }
 
-async function upsertStoreListing({ merchant, syncId, product, variant, retaild }) {
+async function upsertStoreListing({ merchant, syncId, product, variant, retaild, retaildStatus }) {
   const now = new Date().toISOString();
 
   const productId = String(product.legacyResourceId || getNumericId(product.id));
@@ -395,17 +395,18 @@ async function upsertStoreListing({ merchant, syncId, product, variant, retaild 
   const fields = {
     "Client": [merchant.recordId],
     "Merchant Record ID": merchant.recordId,
-
+  
     "Shopify Product ID": productId,
     "Shopify Variant ID": variantId,
     "Shopify Inventory Item ID": inventoryItemId,
-
+  
     "StockX Product Name": stockxProductName,
     "Shopify Product Name": product.title || "",
     "Size": variant.title || "",
     "SKU": variant.sku || "",
-
+  
     "Brand": retaild?.brand || "",
+    "Retaild Status": retaildStatus,
     "Last Seen Sync ID": syncId,
     "Last Shopify Sync At": now,
     "Status": "active"
@@ -487,6 +488,16 @@ async function syncMerchant(merchant, runId) {
 
     const retaild = await searchRetaild(retaildQuery);
 
+    let retaildStatus = "ok";
+    
+    if (!retaildQuery) {
+      retaildStatus = "not_found";
+      retaildMisses += 1;
+    } else if (!retaild) {
+      retaildStatus = "failed";
+      retaildMisses += 1;
+    }
+
     if (!retaild) {
       retaildMisses += 1;
     }
@@ -499,7 +510,8 @@ async function syncMerchant(merchant, runId) {
         syncId,
         product: fullProduct,
         variant,
-        retaild
+        retaild,
+        retaildStatus
       });
 
       if (result.action === "created") created += 1;
