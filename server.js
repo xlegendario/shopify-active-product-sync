@@ -262,7 +262,7 @@ async function shopifyGraphQL(merchant, query, variables = {}) {
 async function fetchActiveProducts(merchant) {
   const query = `
     query GetProducts($cursor: String) {
-      products(first: 250, after: $cursor) {
+      products(first: 250, after: $cursor, query: "status:active") {
         edges {
           node {
             id
@@ -270,6 +270,26 @@ async function fetchActiveProducts(merchant) {
             title
             handle
             status
+            variants(first: 250) {
+              edges {
+                node {
+                  id
+                  legacyResourceId
+                  title
+                  sku
+                  price
+                  inventoryQuantity
+                  inventoryItem {
+                    id
+                    legacyResourceId
+                  }
+                  selectedOptions {
+                    name
+                    value
+                  }
+                }
+              }
+            }
           }
         }
         pageInfo {
@@ -289,9 +309,7 @@ async function fetchActiveProducts(merchant) {
     const connection = result.data.products;
 
     for (const edge of connection.edges) {
-      if (edge.node.status === "ACTIVE") {
-        products.push(edge.node);
-      }
+      products.push(edge.node);
     }
 
     hasNextPage = connection.pageInfo.hasNextPage;
@@ -566,9 +584,9 @@ async function syncMerchant(merchant, runId) {
     try {
       productsProcessed += 1;
   
-      const fullProduct = await fetchProductVariants(merchant, product.id);
+      const fullProduct = product;
       const variants = fullProduct.variants.edges.map((edge) => edge.node);
-  
+      
       const firstVariantSku = variants[0]?.sku || "";
       const retailedQuery = firstVariantSku || fullProduct.title;
   
@@ -781,7 +799,7 @@ app.get("/run-test", async (_req, res) => {
     let variantsProcessed = 0;
 
     for (const product of testProducts) {
-      const fullProduct = await fetchProductVariants(merchant, product.id);
+      const fullProduct = product;
       const variants = fullProduct.variants.edges.map((e) => e.node);
 
       const firstVariantSku = variants[0]?.sku || "";
