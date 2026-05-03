@@ -186,6 +186,7 @@ async function syncMerchant(merchant, runId) {
     syncId,
     runId,
     sentAt: new Date().toISOString(),
+    test: true,
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
     shopifyDomain: merchant.shopifyDomain,
@@ -243,14 +244,15 @@ async function syncMerchant(merchant, runId) {
         syncId,
         runId,
         sentAt: new Date().toISOString(),
+        test: true,
         merchantRecordId: merchant.recordId,
         merchantName: merchant.name,
         shopifyDomain: merchant.shopifyDomain,
         shopifyToken: merchant.shopifyToken,
-        page,
-        batchInPage: i + 1,
-        batchesInPage: batches.length,
-        products: batches[i]
+        page: 1,
+        batchInPage: 1,
+        batchesInPage: 1,
+        products: activeProducts
       });
     }
 
@@ -263,19 +265,21 @@ async function syncMerchant(merchant, runId) {
     syncId,
     runId,
     sentAt: new Date().toISOString(),
+    test: true,
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
     shopifyDomain: merchant.shopifyDomain,
     shopifyToken: merchant.shopifyToken,
-    totalProductsSeen,
-    totalActiveProducts,
-    totalBatchesSent
+    totalProductsSeen: result.data.products.edges.length,
+    totalActiveProducts: activeProducts.length,
+    totalBatchesSent: 1
   });
 
   return {
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
     shopifyDomain: merchant.shopifyDomain,
+    shopifyToken: merchant.shopifyToken,
     syncId,
     totalProductsSeen,
     totalActiveProducts,
