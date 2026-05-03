@@ -261,6 +261,60 @@ app.post("/run", async (_req, res) => {
   }
 });
 
+app.get("/run-test-batch", async (_req, res) => {
+  try {
+    assertEnv();
+
+    const syncId = createSyncId();
+
+    const query = `
+      query GetProducts($cursor: String) {
+        products(first: 5, after: $cursor) {
+          edges {
+            node {
+              id
+              status
+            }
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGraphQL(query, { cursor: null });
+
+    const activeIds = result.data.products.edges
+      .map((edge) => edge.node)
+      .filter((product) => product.status === "ACTIVE")
+      .map((product) => product.id);
+
+    await sendToMake({
+      event: "product_batch",
+      syncId,
+      sentAt: new Date().toISOString(),
+      test: true,
+      page: 1,
+      batchInPage: 1,
+      batchesInPage: 1,
+      products: activeIds.map((id) => ({ id }))
+    });
+
+    res.json({
+      success: true,
+      message: "Sent one test batch to Make",
+      syncId,
+      count: activeIds.length,
+      ids: activeIds
+    });
+  } catch (error) {
+    console.error("Test batch error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
