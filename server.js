@@ -65,6 +65,7 @@ async function sendToMake(payload) {
     event: payload.event,
     syncId: payload.syncId,
     merchantRecordId: payload.merchantRecordId,
+    shopifyToken: merchant.shopifyToken,
     batchSize: payload.products?.length || 0
   });
 
