@@ -14,6 +14,9 @@ const AIRTABLE_MERCHANTS_TABLE_NAME =
 const AIRTABLE_STORE_LISTINGS_TABLE_NAME =
   process.env.AIRTABLE_STORE_LISTINGS_TABLE_NAME || "Store Listings";
 
+const AIRTABLE_SYNC_ERRORS_TABLE_NAME =
+  process.env.AIRTABLE_SYNC_ERRORS_TABLE_NAME || "Sync Errors";
+
 const AIRTABLE_MERCHANT_ACTIVE_FIELD =
   process.env.AIRTABLE_MERCHANT_ACTIVE_FIELD || "Test Active?";
 
@@ -176,6 +179,23 @@ async function createAirtableRecord(tableName, fields) {
     method: "POST",
     body: JSON.stringify({ fields })
   });
+}
+
+async function logSyncError({ merchant, syncId, product, error }) {
+  try {
+    await createAirtableRecord(AIRTABLE_SYNC_ERRORS_TABLE_NAME, {
+      "Merchant": [merchant.recordId],
+      "Merchant Record ID": merchant.recordId,
+      "Sync ID": syncId,
+      "Shopify Product ID": String(product?.legacyResourceId || getNumericId(product?.id)),
+      "Shopify Product Name": product?.title || "",
+      "Error Message": error instanceof Error ? error.message : String(error),
+      "Created At": new Date().toISOString(),
+      "Resolved?": false
+    });
+  } catch (logError) {
+    console.error("Failed to log sync error:", logError);
+  }
 }
 
 async function fetchActiveMerchants() {
@@ -379,19 +399,43 @@ function buildStockxName(retailed) {
 
 async function buildVariantRecordsMap({ merchant, product, variants }) {
   const productId = String(product.legacyResourceId || getNumericId(product.id));
+
+  const variantIds = variants.map((variant) =>
+    String(variant.legacyResourceId || getNumericId(variant.id))
+  );
+
+  if (!variantIds.length) {
+    return new Map();
+  }
+
+  const variantConditions = variantIds
+    .map((variantId) => `{Shopify Variant ID} = '${airtableEscape(variantId)}'`)
+    .join(",");
+
+  const formula = `AND(
+    {Merchant Record ID} = '${airtableEscape(merchant.recordId)}',
+    {Shopify Product ID} = '${airtableEscape(productId)}',
+    OR(${variantConditions})
+  )`;
+
+  const records = await fetchAllAirtableRecords(
+    AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+    formula
+  );
+
   const recordsByVariantId = new Map();
 
-  for (const variant of variants) {
-    const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+  for (const record of records) {
+    const variantId = String(record.fields?.["Shopify Variant ID"] || "");
+    if (variantId) {
+      recordsByVariantId.set(variantId, record);
+    }
+  }
 
-    const existing = await findStoreListing({
-      merchantRecordId: merchant.recordId,
-      productId,
-      variantId
-    });
-
-    recordsByVariantId.set(variantId, existing);
-    await sleep(220);
+  for (const variantId of variantIds) {
+    if (!recordsByVariantId.has(variantId)) {
+      recordsByVariantId.set(variantId, null);
+    }
   }
 
   return recordsByVariantId;
@@ -516,73 +560,103 @@ async function syncMerchant(merchant, runId) {
   let updated = 0;
   let retailedMisses = 0;
 
+  let failedProducts = 0;
+
   for (const product of products) {
-    productsProcessed += 1;
-
-    const fullProduct = await fetchProductVariants(merchant, product.id);
-    const variants = fullProduct.variants.edges.map((edge) => edge.node);
-
-    const firstVariantSku = variants[0]?.sku || "";
-    const retailedQuery = firstVariantSku || fullProduct.title;
-
-    const existingByVariantId = await buildVariantRecordsMap({
-      merchant,
-      product: fullProduct,
-      variants
-    });
-    
-    const allVariantsExist = variants.every((variant) => {
-      const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-      return Boolean(existingByVariantId.get(variantId));
-    });
-    
-    const needsRetailedRetry = variants.some((variant) => {
-      const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-      const existing = existingByVariantId.get(variantId);
-      return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
-    });
-    
-    let retailed = null;
-    let retailedStatus = "ok";
-    
-    if (!allVariantsExist || needsRetailedRetry) {
-      retailed = await searchRetailed(retailedQuery);
-    
-      if (!retailedQuery) {
-        retailedStatus = "not_found";
-        retailedMisses += 1;
-      } else if (!retailed) {
-        retailedStatus = "failed";
-        retailedMisses += 1;
+    try {
+      productsProcessed += 1;
+  
+      const fullProduct = await fetchProductVariants(merchant, product.id);
+      const variants = fullProduct.variants.edges.map((edge) => edge.node);
+  
+      const firstVariantSku = variants[0]?.sku || "";
+      const retailedQuery = firstVariantSku || fullProduct.title;
+  
+      const existingByVariantId = await buildVariantRecordsMap({
+        merchant,
+        product: fullProduct,
+        variants
+      });
+  
+      const allVariantsExist = variants.every((variant) => {
+        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+        return Boolean(existingByVariantId.get(variantId));
+      });
+  
+      const needsRetailedRetry = variants.some((variant) => {
+        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+        const existing = existingByVariantId.get(variantId);
+        return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
+      });
+  
+      let retailed = null;
+      let retailedStatus = "ok";
+  
+      if (!allVariantsExist || needsRetailedRetry) {
+        retailed = await searchRetailed(retailedQuery);
+  
+        if (!retailedQuery) {
+          retailedStatus = "not_found";
+          retailedMisses += 1;
+        } else if (!retailed) {
+          retailedStatus = "failed";
+          retailedMisses += 1;
+        }
       }
-    }
-    
-    for (const variant of variants) {
-      variantsProcessed += 1;
-    
-      const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-      const existingRecord = existingByVariantId.get(variantId);
-    
-      const result = await upsertStoreListing({
+  
+      for (const variant of variants) {
+        variantsProcessed += 1;
+  
+        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+        const existingRecord = existingByVariantId.get(variantId);
+  
+        const result = await upsertStoreListing({
+          merchant,
+          syncId,
+          product: fullProduct,
+          variant,
+          retailed,
+          retailedStatus,
+          productSku: firstVariantSku,
+          existingRecord,
+          enrich: !existingRecord || needsRetailedRetry
+        });
+  
+        if (result.action === "created") created += 1;
+        if (result.action === "updated") updated += 1;
+  
+        await sleep(220);
+      }
+    } catch (error) {
+      failedProducts += 1;
+  
+      console.error("Product sync failed:", {
+        merchantRecordId: merchant.recordId,
+        productId: product.id,
+        productTitle: product.title,
+        error: error.message
+      });
+  
+      await logSyncError({
         merchant,
         syncId,
-        product: fullProduct,
-        variant,
-        retailed,
-        retailedStatus,
-        productSku: firstVariantSku,
-        existingRecord,
-        enrich: !existingRecord || needsRetailedRetry
+        product,
+        error
       });
-    
-      if (result.action === "created") created += 1;
-      if (result.action === "updated") updated += 1;
-    
-      await sleep(220);
     }
   }
 
-  const deactivated = await deactivateOldListings(merchant, syncId);
+  let deactivated = 0;
+
+  if (failedProducts === 0) {
+    deactivated = await deactivateOldListings(merchant, syncId);
+  } else {
+    console.warn("Skipping inactive cleanup because products failed", {
+      merchantRecordId: merchant.recordId,
+      syncId,
+      failedProducts
+    });
+  }
 
   await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
     "Last Sync ID": syncId,
@@ -598,7 +672,8 @@ async function syncMerchant(merchant, runId) {
     created,
     updated,
     deactivated,
-    retailedMisses
+    retailedMisses,
+    failedProducts
   };
 }
 
