@@ -26,16 +26,16 @@ function assertEnv() {
   }
 }
 
+function createSyncId() {
+  return `sync_${new Date().toISOString()}`;
+}
+
 function getShopifyGraphqlUrl() {
   return `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 }
 
 async function shopifyGraphQL(query, variables = {}) {
-  const url = getShopifyGraphqlUrl();
-
-  console.log("Shopify URL:", url);
-
-  const response = await fetch(url, {
+  const response = await fetch(getShopifyGraphqlUrl(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -44,44 +44,21 @@ async function shopifyGraphQL(query, variables = {}) {
     body: JSON.stringify({ query, variables })
   });
 
-  const rawText = await response.text();
+  const text = await response.text();
+  const data = JSON.parse(text);
 
-  let data;
-  try {
-    data = JSON.parse(rawText);
-  } catch (error) {
-    throw new Error(
-      `Shopify returned non-JSON response. HTTP ${response.status}. Body: ${rawText.slice(0, 1000)}`
-    );
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `Shopify HTTP ${response.status}: ${JSON.stringify(data).slice(0, 2000)}`
-    );
-  }
-
-  if (data.errors && data.errors.length > 0) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
+  if (!response.ok || data.errors) {
+    throw new Error(JSON.stringify(data.errors || data));
   }
 
   return data;
 }
 
-async function sendToMake(productIds, meta = {}) {
-  const payload = {
-    source: "render-shopify-sync",
-    sentAt: new Date().toISOString(),
-    batchSize: productIds.length,
-    ...meta,
-    products: productIds.map((id) => ({ id }))
-  };
-
-  console.log("Sending batch to Make", {
-    webhookConfigured: !!MAKE_WEBHOOK_URL,
-    batchSize: payload.batchSize,
-    meta,
-    firstThreeIds: productIds.slice(0, 3)
+async function sendToMake(payload) {
+  console.log("Sending to Make:", {
+    event: payload.event,
+    syncId: payload.syncId,
+    batchSize: payload.products?.length || 0
   });
 
   const response = await fetch(MAKE_WEBHOOK_URL, {
@@ -94,26 +71,21 @@ async function sendToMake(productIds, meta = {}) {
 
   const responseText = await response.text();
 
-  console.log("Make webhook response", {
+  console.log("Make response:", {
     status: response.status,
-    bodyPreview: responseText.slice(0, 1000)
+    body: responseText.slice(0, 500)
   });
 
   if (!response.ok) {
-    throw new Error(`Make webhook failed with status ${response.status}: ${responseText}`);
+    throw new Error(`Make webhook failed: ${response.status} ${responseText}`);
   }
-
-  return {
-    status: response.status,
-    body: responseText
-  };
 }
 
-function chunkArray(array, chunkSize) {
+function chunkArray(array, size) {
   const chunks = [];
 
-  for (let i = 0; i < array.length; i += chunkSize) {
-    chunks.push(array.slice(i, i + chunkSize));
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
   }
 
   return chunks;
@@ -121,6 +93,14 @@ function chunkArray(array, chunkSize) {
 
 async function syncActiveProducts() {
   assertEnv();
+
+  const syncId = createSyncId();
+
+  await sendToMake({
+    event: "sync_started",
+    syncId,
+    sentAt: new Date().toISOString()
+  });
 
   const query = `
     query GetProducts($cursor: String) {
@@ -141,66 +121,59 @@ async function syncActiveProducts() {
 
   let cursor = null;
   let hasNextPage = true;
-  let totalActiveProducts = 0;
-  let totalProductsSeen = 0;
   let page = 0;
+  let totalProductsSeen = 0;
+  let totalActiveProducts = 0;
   let totalBatchesSent = 0;
 
   while (hasNextPage) {
     page += 1;
 
-    console.log(`Fetching Shopify page ${page} with cursor:`, cursor);
-
     const result = await shopifyGraphQL(query, { cursor });
-    const productsConnection = result?.data?.products;
+    const connection = result.data.products;
 
-    if (!productsConnection) {
-      throw new Error(`Unexpected Shopify response shape: ${JSON.stringify(result).slice(0, 2000)}`);
-    }
+    const activeIds = connection.edges
+      .map((edge) => edge.node)
+      .filter((product) => product.status === "ACTIVE")
+      .map((product) => product.id);
 
-    const nodes = productsConnection.edges
-      .map((edge) => edge?.node)
-      .filter(Boolean);
-
-    totalProductsSeen += nodes.length;
-
-    const activeIds = nodes
-      .filter((node) => node.status === "ACTIVE")
-      .map((node) => node.id);
-
+    totalProductsSeen += connection.edges.length;
     totalActiveProducts += activeIds.length;
-
-    console.log(`Page ${page} fetched`, {
-      productsOnPage: nodes.length,
-      activeOnPage: activeIds.length,
-      hasNextPage: productsConnection.pageInfo.hasNextPage
-    });
 
     const batches = chunkArray(activeIds, BATCH_SIZE);
 
-    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-      const batch = batches[batchIndex];
+    for (let i = 0; i < batches.length; i += 1) {
       totalBatchesSent += 1;
 
-      console.log(`Sending Make batch ${batchIndex + 1}/${batches.length} for Shopify page ${page}`);
-
-      await sendToMake(batch, {
+      await sendToMake({
+        event: "product_batch",
+        syncId,
+        sentAt: new Date().toISOString(),
         page,
-        batchInPage: batchIndex + 1,
+        batchInPage: i + 1,
         batchesInPage: batches.length,
-        hasNextPage: productsConnection.pageInfo.hasNextPage
+        products: batches[i].map((id) => ({ id }))
       });
     }
 
-    hasNextPage = productsConnection.pageInfo.hasNextPage;
-    cursor = productsConnection.pageInfo.endCursor || null;
+    hasNextPage = connection.pageInfo.hasNextPage;
+    cursor = connection.pageInfo.endCursor;
   }
 
-  return {
+  await sendToMake({
+    event: "sync_completed",
+    syncId,
+    sentAt: new Date().toISOString(),
     totalProductsSeen,
     totalActiveProducts,
-    totalBatchesSent,
-    batchSize: BATCH_SIZE
+    totalBatchesSent
+  });
+
+  return {
+    syncId,
+    totalProductsSeen,
+    totalActiveProducts,
+    totalBatchesSent
   };
 }
 
@@ -222,31 +195,30 @@ app.get("/test-make", async (_req, res) => {
   try {
     assertEnv();
 
-    const testIds = [
-      "gid://shopify/Product/1234567890",
-      "gid://shopify/Product/2345678901",
-      "gid://shopify/Product/3456789012"
-    ];
+    const syncId = createSyncId();
 
-    const makeResult = await sendToMake(testIds, {
+    await sendToMake({
+      event: "product_batch",
+      syncId,
+      sentAt: new Date().toISOString(),
       test: true,
-      page: 1,
-      batchInPage: 1,
-      batchesInPage: 1,
-      hasNextPage: false
+      products: [
+        { id: "gid://shopify/Product/8651421024523" },
+        { id: "gid://shopify/Product/8651451924747" }
+      ]
     });
 
     res.json({
       success: true,
-      message: "Test payload sent to Make",
-      makeResult
+      message: "Test batch sent to Make",
+      syncId
     });
   } catch (error) {
     console.error("Test Make error:", error);
 
     res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : String(error)
+      error: error.message
     });
   }
 });
@@ -265,7 +237,7 @@ app.get("/run", async (_req, res) => {
 
     res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : String(error)
+      error: error.message
     });
   }
 });
@@ -284,7 +256,7 @@ app.post("/run", async (_req, res) => {
 
     res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : String(error)
+      error: error.message
     });
   }
 });
