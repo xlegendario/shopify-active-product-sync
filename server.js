@@ -315,6 +315,78 @@ app.get("/run-test-batch", async (_req, res) => {
   }
 });
 
+app.get("/run-test-full", async (_req, res) => {
+  try {
+    assertEnv();
+
+    const syncId = createSyncId();
+
+    await sendToMake({
+      event: "sync_started",
+      syncId,
+      sentAt: new Date().toISOString(),
+      test: true
+    });
+
+    const query = `
+      query GetProducts {
+        products(first: 5) {
+          edges {
+            node {
+              id
+              status
+            }
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGraphQL(query);
+
+    const activeIds = result.data.products.edges
+      .map((edge) => edge.node)
+      .filter((product) => product.status === "ACTIVE")
+      .map((product) => product.id);
+
+    await sendToMake({
+      event: "product_batch",
+      syncId,
+      sentAt: new Date().toISOString(),
+      test: true,
+      page: 1,
+      batchInPage: 1,
+      batchesInPage: 1,
+      products: activeIds.map((id) => ({ id }))
+    });
+
+    await sendToMake({
+      event: "sync_completed",
+      syncId,
+      sentAt: new Date().toISOString(),
+      test: true,
+      totalProductsSeen: result.data.products.edges.length,
+      totalActiveProducts: activeIds.length,
+      totalBatchesSent: 1
+    });
+
+    res.json({
+      success: true,
+      message: "Mini full sync sent to Make",
+      syncId,
+      totalProductsSeen: result.data.products.edges.length,
+      totalActiveProducts: activeIds.length,
+      totalBatchesSent: 1
+    });
+  } catch (error) {
+    console.error("Mini full sync error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
