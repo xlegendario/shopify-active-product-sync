@@ -505,10 +505,6 @@ async function syncMerchant(merchant, runId) {
       retailedMisses += 1;
     }
 
-    if (!retailed) {
-      retailedMisses += 1;
-    }
-
     for (const variant of variants) {
       variantsProcessed += 1;
 
@@ -656,8 +652,8 @@ app.get("/run-test", async (_req, res) => {
       const fullProduct = await fetchProductVariants(merchant, product.id);
       const variants = fullProduct.variants.edges.map((e) => e.node);
 
-      const firstSku = variants.find((v) => v.sku)?.sku || "";
-      const retailedQuery = firstSku || fullProduct.title;
+      const firstVariantSku = variants[0]?.sku || "";
+      const retailedQuery = firstVariantSku || fullProduct.title;
 
       const retailed = await searchRetailed(retailedQuery);
 
@@ -675,7 +671,8 @@ app.get("/run-test", async (_req, res) => {
           product: fullProduct,
           variant,
           retailed,
-          retailedStatus
+          retailedStatus,
+          productSku: firstVariantSku
         });
 
         await sleep(200);
