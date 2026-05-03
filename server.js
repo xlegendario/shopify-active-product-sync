@@ -318,17 +318,17 @@ async function fetchProductVariants(merchant, productGid) {
   return result.data.product;
 }
 
-async function searchRetaild(query) {
+async function searchRetailed(query) {
   if (!query) return null;
 
   const url = `${RETAILED_API_BASE}?query=${encodeURIComponent(query)}`;
 
   try {
-    const headers = {};
+    const headers = {
+      "x-api-key": RETAILED_API_KEY
+    };
 
-    if (RETAILED_API_KEY) {
-      headers.Authorization = `Bearer ${RETAILED_API_KEY}`;
-    }
+    console.log("Retailed lookup:", { query, url, hasApiKey: Boolean(RETAILED_API_KEY) });
 
     const response = await fetchWithRetry(url, {
       method: "GET",
@@ -337,11 +337,18 @@ async function searchRetaild(query) {
 
     const data = await response.json();
 
+    console.log("Retailed response preview:", JSON.stringify(data).slice(0, 500));
+
     if (!response.ok) {
-      throw new Error(`Retaild error: ${JSON.stringify(data)}`);
+      throw new Error(`Retailed error: ${JSON.stringify(data)}`);
     }
 
-    const first = Array.isArray(data) ? data[0] : data?.data?.[0] || data?.results?.[0] || null;
+    const first =
+      (Array.isArray(data) && data[0]) ||
+      data?.data?.[0] ||
+      data?.results?.[0] ||
+      data?.products?.[0] ||
+      null;
 
     if (!first) return null;
 
@@ -352,7 +359,7 @@ async function searchRetaild(query) {
       image: first.image || ""
     };
   } catch (error) {
-    console.warn("Retaild lookup failed, continuing without Retaild data", {
+    console.warn("Retailed lookup failed, continuing without Retailed data", {
       query,
       error: error.message
     });
@@ -361,10 +368,10 @@ async function searchRetaild(query) {
   }
 }
 
-function buildStockxName(retaild) {
-  if (!retaild) return "";
+function buildStockxName(retailed) {
+  if (!retailed) return "";
 
-  return [retaild.name, retaild.colorway]
+  return [retailed.name, retailed.colorway]
     .filter(Boolean)
     .join(" ")
     .trim();
@@ -381,7 +388,7 @@ async function findStoreListing({ merchantRecordId, productId, variantId }) {
   return records[0] || null;
 }
 
-async function upsertStoreListing({ merchant, syncId, product, variant, retaild, retaildStatus }) {
+async function upsertStoreListing({ merchant, syncId, product, variant, retailed, retailedStatus, productSku }) {
   const now = new Date().toISOString();
 
   const productId = String(product.legacyResourceId || getNumericId(product.id));
@@ -390,7 +397,7 @@ async function upsertStoreListing({ merchant, syncId, product, variant, retaild,
     variant.inventoryItem?.legacyResourceId || getNumericId(variant.inventoryItem?.id)
   );
 
-  const stockxProductName = buildStockxName(retaild);
+  const stockxProductName = buildStockxName(retailed);
 
   const fields = {
     "Client": [merchant.recordId],
@@ -403,19 +410,19 @@ async function upsertStoreListing({ merchant, syncId, product, variant, retaild,
     "StockX Product Name": stockxProductName,
     "Shopify Product Name": product.title || "",
     "Size": variant.title || "",
-    "SKU": variant.sku || "",
+    "SKU": productSku || "",
   
-    "Brand": retaild?.brand || "",
-    "Retaild Status": retaildStatus,
+    "Brand": retailed?.brand || "",
+    "Retailed Status": retailedStatus,
     "Last Seen Sync ID": syncId,
     "Last Shopify Sync At": now,
     "Status": "active"
   };
 
-  if (retaild?.image) {
+  if (retailed?.image) {
     fields.Picture = [
       {
-        url: retaild.image,
+        url: retailed.image,
         filename: `${stockxProductName || product.title || variantId}.webp`
       }
     ];
@@ -475,7 +482,7 @@ async function syncMerchant(merchant, runId) {
   let variantsProcessed = 0;
   let created = 0;
   let updated = 0;
-  let retaildMisses = 0;
+  let retailedMisses = 0;
 
   for (const product of products) {
     productsProcessed += 1;
@@ -483,23 +490,23 @@ async function syncMerchant(merchant, runId) {
     const fullProduct = await fetchProductVariants(merchant, product.id);
     const variants = fullProduct.variants.edges.map((edge) => edge.node);
 
-    const firstSku = variants.find((variant) => variant.sku)?.sku || "";
-    const retaildQuery = firstSku || fullProduct.title;
+    const firstVariantSku = variants[0]?.sku || "";
+    const retailedQuery = firstVariantSku || fullProduct.title;
 
-    const retaild = await searchRetaild(retaildQuery);
+    const retailed = await searchRetailed(retailedQuery);
 
-    let retaildStatus = "ok";
+    let retailedStatus = "ok";
     
-    if (!retaildQuery) {
-      retaildStatus = "not_found";
-      retaildMisses += 1;
-    } else if (!retaild) {
-      retaildStatus = "failed";
-      retaildMisses += 1;
+    if (!retailedQuery) {
+      retailedStatus = "not_found";
+      retailedMisses += 1;
+    } else if (!retailed) {
+      retailedStatus = "failed";
+      retailedMisses += 1;
     }
 
-    if (!retaild) {
-      retaildMisses += 1;
+    if (!retailed) {
+      retailedMisses += 1;
     }
 
     for (const variant of variants) {
@@ -510,8 +517,9 @@ async function syncMerchant(merchant, runId) {
         syncId,
         product: fullProduct,
         variant,
-        retaild,
-        retaildStatus
+        retailed,
+        retailedStatus,
+        productSku: firstVariantSku
       });
 
       if (result.action === "created") created += 1;
@@ -537,7 +545,7 @@ async function syncMerchant(merchant, runId) {
     created,
     updated,
     deactivated,
-    retaildMisses
+    retailedMisses
   };
 }
 
@@ -649,14 +657,14 @@ app.get("/run-test", async (_req, res) => {
       const variants = fullProduct.variants.edges.map((e) => e.node);
 
       const firstSku = variants.find((v) => v.sku)?.sku || "";
-      const retaildQuery = firstSku || fullProduct.title;
+      const retailedQuery = firstSku || fullProduct.title;
 
-      const retaild = await searchRetaild(retaildQuery);
+      const retailed = await searchRetailed(retailedQuery);
 
-      let retaildStatus = "ok";
+      let retailedStatus = "ok";
 
-      if (!retaildQuery) retaildStatus = "not_found";
-      else if (!retaild) retaildStatus = "failed";
+      if (!retailedQuery) retailedStatus = "not_found";
+      else if (!retailed) retailedStatus = "failed";
 
       for (const variant of variants) {
         variantsProcessed += 1;
@@ -666,8 +674,8 @@ app.get("/run-test", async (_req, res) => {
           syncId,
           product: fullProduct,
           variant,
-          retaild,
-          retaildStatus
+          retailed,
+          retailedStatus
         });
 
         await sleep(200);
