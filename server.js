@@ -189,13 +189,8 @@ async function syncMerchant(merchant, runId) {
     event: "sync_started",
     syncId,
     runId,
-    sentAt: new Date().toISOString(),
-    test: true,
-    merchantRecordId: merchant.recordId,
-    merchantName: merchant.name,
-    shopifyDomain: merchant.shopifyDomain,
-    shopifyToken: merchant.shopifyToken
-  });
+    sentAt: new Date().toISOString()
+  }, merchant);
 
   const query = `
     query GetProducts($cursor: String) {
@@ -248,16 +243,11 @@ async function syncMerchant(merchant, runId) {
         syncId,
         runId,
         sentAt: new Date().toISOString(),
-        test: true,
-        merchantRecordId: merchant.recordId,
-        merchantName: merchant.name,
-        shopifyDomain: merchant.shopifyDomain,
-        shopifyToken: merchant.shopifyToken,
-        page: 1,
-        batchInPage: 1,
-        batchesInPage: 1,
-        products: activeProducts
-      });
+        page,
+        batchInPage: i + 1,
+        batchesInPage: batches.length,
+        products: batches[i]
+      }, merchant);
     }
 
     hasNextPage = connection.pageInfo.hasNextPage;
@@ -269,15 +259,10 @@ async function syncMerchant(merchant, runId) {
     syncId,
     runId,
     sentAt: new Date().toISOString(),
-    test: true,
-    merchantRecordId: merchant.recordId,
-    merchantName: merchant.name,
-    shopifyDomain: merchant.shopifyDomain,
-    shopifyToken: merchant.shopifyToken,
-    totalProductsSeen: result.data.products.edges.length,
-    totalActiveProducts: activeProducts.length,
-    totalBatchesSent: 1
-  });
+    totalProductsSeen,
+    totalActiveProducts,
+    totalBatchesSent
+  }, merchant);
 
   return {
     merchantRecordId: merchant.recordId,
