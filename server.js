@@ -35,6 +35,9 @@ const RETAILED_API_BASE =
 const RETAILED_API_KEY = process.env.RETAILED_API_KEY || "";
 const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || "15000", 10);
 
+let isSyncRunning = false;
+let activeSyncStartedAt = null;
+
 function assertEnv() {
   const missing = [];
 
