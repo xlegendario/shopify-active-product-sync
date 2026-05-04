@@ -181,6 +181,61 @@ async function createAirtableRecord(tableName, fields) {
   });
 }
 
+function chunkArray(array, size) {
+  const chunks = [];
+
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+
+  return chunks;
+}
+
+async function batchCreateAirtableRecords(tableName, records) {
+  if (!records.length) return [];
+
+  const table = encodeURIComponent(tableName);
+  const created = [];
+
+  for (const chunk of chunkArray(records, 10)) {
+    const result = await airtableRequest(table, {
+      method: "POST",
+      body: JSON.stringify({
+        records: chunk.map((fields) => ({ fields }))
+      })
+    });
+
+    created.push(...(result.records || []));
+    await sleep(220);
+  }
+
+  return created;
+}
+
+async function batchUpdateAirtableRecords(tableName, records) {
+  if (!records.length) return [];
+
+  const table = encodeURIComponent(tableName);
+  const updated = [];
+
+  for (const chunk of chunkArray(records, 10)) {
+    const result = await airtableRequest(table, {
+      method: "PATCH",
+      body: JSON.stringify({
+        records: chunk.map((record) => ({
+          id: record.id,
+          fields: record.fields
+        }))
+      })
+    });
+
+    updated.push(...(result.records || []));
+    await sleep(220);
+  }
+
+  return updated;
+}
+
 async function logSyncError({ merchant, syncId, product, error }) {
   try {
     await createAirtableRecord(AIRTABLE_SYNC_ERRORS_TABLE_NAME, {
@@ -470,7 +525,7 @@ async function findStoreListing({ merchantRecordId, productId, variantId }) {
   return records[0] || null;
 }
 
-async function upsertStoreListing({
+function buildStoreListingMutation({
   merchant,
   syncId,
   product,
@@ -489,7 +544,7 @@ async function upsertStoreListing({
     variant.inventoryItem?.legacyResourceId || getNumericId(variant.inventoryItem?.id)
   );
 
-  const baseFields = {
+  const fields = {
     "Client": [merchant.recordId],
     "Merchant Record ID": merchant.recordId,
 
@@ -514,12 +569,12 @@ async function upsertStoreListing({
   if (shouldEnrich) {
     const stockxProductName = buildStockxName(retailed);
 
-    baseFields["StockX Product Name"] = stockxProductName;
-    baseFields["Brand"] = retailed?.brand || "";
-    baseFields["Retailed Status"] = retailedStatus;
+    fields["StockX Product Name"] = stockxProductName;
+    fields["Brand"] = retailed?.brand || "";
+    fields["Retailed Status"] = retailedStatus;
 
     if (retailed?.image) {
-      baseFields.Picture = [
+      fields.Picture = [
         {
           url: retailed.image,
           filename: `${stockxProductName || product.title || variantId}.webp`
@@ -529,12 +584,17 @@ async function upsertStoreListing({
   }
 
   if (existingRecord) {
-    await updateAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, existingRecord.id, baseFields);
-    return { action: "updated", recordId: existingRecord.id };
+    return {
+      action: "update",
+      id: existingRecord.id,
+      fields
+    };
   }
 
-  const created = await createAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, baseFields);
-  return { action: "created", recordId: created.id };
+  return {
+    action: "create",
+    fields
+  };
 }
 
 async function deactivateOldListings(merchant, syncId) {
@@ -622,13 +682,16 @@ async function syncMerchant(merchant, runId) {
         }
       }
   
+      const recordsToCreate = [];
+      const recordsToUpdate = [];
+      
       for (const variant of variants) {
         variantsProcessed += 1;
-  
+      
         const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
         const existingRecord = existingByVariantId.get(variantId);
-  
-        const result = await upsertStoreListing({
+      
+        const mutation = buildStoreListingMutation({
           merchant,
           syncId,
           product: fullProduct,
@@ -639,12 +702,29 @@ async function syncMerchant(merchant, runId) {
           existingRecord,
           enrich: !existingRecord || needsRetailedRetry
         });
-  
-        if (result.action === "created") created += 1;
-        if (result.action === "updated") updated += 1;
-  
-        await sleep(220);
+      
+        if (mutation.action === "update") {
+          recordsToUpdate.push({
+            id: mutation.id,
+            fields: mutation.fields
+          });
+        } else {
+          recordsToCreate.push(mutation.fields);
+        }
       }
+      
+      const updatedRecords = await batchUpdateAirtableRecords(
+        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+        recordsToUpdate
+      );
+      
+      const createdRecords = await batchCreateAirtableRecords(
+        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+        recordsToCreate
+      );
+      
+      updated += updatedRecords.length;
+      created += createdRecords.length;
     } catch (error) {
       failedProducts += 1;
   
@@ -838,24 +918,59 @@ app.get("/run-test", async (_req, res) => {
         const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
         const existingRecord = existingByVariantId.get(variantId);
       
-        const result = await upsertStoreListing({
-          merchant,
-          syncId,
-          product: fullProduct,
-          variant,
-          retailed,
-          retailedStatus,
-          productSku: firstVariantSku,
-          existingRecord,
-          enrich: !existingRecord || needsRetailedRetry
-        });
-      
-        console.log("TEST upsert result:", {
+        const recordsToCreate = [];
+        const recordsToUpdate = [];
+        
+        for (const variant of variants) {
+          variantsProcessed += 1;
+        
+          const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+          const existingRecord = existingByVariantId.get(variantId);
+        
+          const mutation = buildStoreListingMutation({
+            merchant,
+            syncId,
+            product: fullProduct,
+            variant,
+            retailed,
+            retailedStatus,
+            productSku: firstVariantSku,
+            existingRecord,
+            enrich: !existingRecord || needsRetailedRetry
+          });
+        
+          console.log("TEST mutation:", {
+            product: fullProduct.title,
+            variant: variant.title,
+            sku: firstVariantSku,
+            action: mutation.action,
+            recordId: mutation.id || null
+          });
+        
+          if (mutation.action === "update") {
+            recordsToUpdate.push({
+              id: mutation.id,
+              fields: mutation.fields
+            });
+          } else {
+            recordsToCreate.push(mutation.fields);
+          }
+        }
+        
+        const updatedRecords = await batchUpdateAirtableRecords(
+          AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+          recordsToUpdate
+        );
+        
+        const createdRecords = await batchCreateAirtableRecords(
+          AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+          recordsToCreate
+        );
+        
+        console.log("TEST batch result:", {
           product: fullProduct.title,
-          variant: variant.title,
-          sku: firstVariantSku,
-          action: result.action,
-          recordId: result.recordId
+          updated: updatedRecords.length,
+          created: createdRecords.length
         });
       
         await sleep(200);
