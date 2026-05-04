@@ -756,6 +756,18 @@ async function syncMerchant(merchant, runId) {
     });
   }
 
+  console.log("SYNC FINISHED", {
+    merchant: merchant.name,
+    syncId,
+    productsProcessed,
+    variantsProcessed,
+    created,
+    updated,
+    deactivated,
+    retailedMisses,
+    failedProducts
+  });
+
   await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
     "Last Sync ID": syncId,
     "Last Shopify Sync At": new Date().toISOString()
