@@ -625,8 +625,9 @@ function buildStoreListingMutation({
 
     "Shopify Product Name": product.title || "",
     "Size": extractSize(variant.title),
-    "SKU": productSku || "",
 
+    ...(productSku ? { "SKU": productSku } : {}),
+    
     "Last Seen Sync ID": syncId,
     "Last Shopify Sync At": now,
     "Status": "active"
