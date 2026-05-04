@@ -236,6 +236,30 @@ async function batchUpdateAirtableRecords(tableName, records) {
   return updated;
 }
 
+async function batchDeleteAirtableRecords(tableName, recordIds) {
+  if (!recordIds.length) return [];
+
+  const table = encodeURIComponent(tableName);
+  const deleted = [];
+
+  for (const chunk of chunkArray(recordIds, 10)) {
+    const params = new URLSearchParams();
+
+    for (const id of chunk) {
+      params.append("records[]", id);
+    }
+
+    const result = await airtableRequest(`${table}?${params.toString()}`, {
+      method: "DELETE"
+    });
+
+    deleted.push(...(result.records || []));
+    await sleep(220);
+  }
+
+  return deleted;
+}
+
 async function logSyncError({ merchant, syncId, product, error }) {
   try {
     await createAirtableRecord(AIRTABLE_SYNC_ERRORS_TABLE_NAME, {
@@ -473,13 +497,13 @@ function buildStockxName(retailed) {
 async function buildVariantRecordsMap({ merchant, product, variants }) {
   const productId = String(product.legacyResourceId || getNumericId(product.id));
 
-  const variantIds = variants.map((variant) =>
-    String(variant.legacyResourceId || getNumericId(variant.id))
-  );
+  const variantIds = [...new Set(
+    variants.map((variant) =>
+      String(variant.legacyResourceId || getNumericId(variant.id))
+    )
+  )];
 
-  if (!variantIds.length) {
-    return new Map();
-  }
+  if (!variantIds.length) return new Map();
 
   const variantConditions = variantIds
     .map((variantId) => `{Shopify Variant ID} = '${airtableEscape(variantId)}'`)
@@ -498,20 +522,55 @@ async function buildVariantRecordsMap({ merchant, product, variants }) {
 
   const recordsByVariantId = new Map();
 
-  for (const record of records) {
-    const variantId = String(record.fields?.["Shopify Variant ID"] || "");
-    if (variantId) {
-      recordsByVariantId.set(variantId, record);
-    }
+  for (const variantId of variantIds) {
+    recordsByVariantId.set(variantId, {
+      primary: null,
+      duplicates: []
+    });
   }
 
-  for (const variantId of variantIds) {
-    if (!recordsByVariantId.has(variantId)) {
-      recordsByVariantId.set(variantId, null);
+  for (const record of records) {
+    const variantId = String(record.fields?.["Shopify Variant ID"] || "");
+    if (!variantId) continue;
+
+    const group = recordsByVariantId.get(variantId) || {
+      primary: null,
+      duplicates: []
+    };
+
+    if (!group.primary) {
+      group.primary = record;
+    } else {
+      group.duplicates.push(record);
     }
+
+    recordsByVariantId.set(variantId, group);
   }
 
   return recordsByVariantId;
+}
+
+async function deleteDuplicateStoreListings(existingByVariantId) {
+  const duplicateIds = [];
+
+  for (const [, group] of existingByVariantId.entries()) {
+    for (const duplicate of group.duplicates || []) {
+      duplicateIds.push(duplicate.id);
+    }
+  }
+
+  if (!duplicateIds.length) return 0;
+
+  console.warn("Deleting duplicate Store Listings", {
+    count: duplicateIds.length
+  });
+
+  const deleted = await batchDeleteAirtableRecords(
+    AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+    duplicateIds
+  );
+
+  return deleted.length;
 }
 
 async function findStoreListing({ merchantRecordId, productId, variantId }) {
@@ -660,20 +719,24 @@ async function syncMerchant(merchant, runId) {
       const firstVariantSku = variants[0]?.sku || "";
       const retailedQuery = firstVariantSku || fullProduct.title;
   
-      const existingByVariantId = await buildVariantRecordsMap({
-        merchant,
-        product: fullProduct,
-        variants
-      });
+      const duplicatesDeleted = await deleteDuplicateStoreListings(existingByVariantId);
+
+      if (duplicatesDeleted > 0) {
+        console.warn("Deleted duplicate Store Listings for product", {
+          productId: fullProduct.legacyResourceId,
+          productTitle: fullProduct.title,
+          duplicatesDeleted
+        });
+      }
   
       const allVariantsExist = variants.every((variant) => {
         const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        return Boolean(existingByVariantId.get(variantId));
+        return Boolean(existingByVariantId.get(variantId)?.primary);
       });
   
       const needsRetailedRetry = variants.some((variant) => {
         const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existing = existingByVariantId.get(variantId);
+        const existing = existingByVariantId.get(variantId)?.primary;
         return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
       });
   
@@ -699,7 +762,7 @@ async function syncMerchant(merchant, runId) {
         variantsProcessed += 1;
       
         const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existingRecord = existingByVariantId.get(variantId);
+        const existingRecord = existingByVariantId.get(variantId)?.primary || null;
       
         const mutation = buildStoreListingMutation({
           merchant,
@@ -856,6 +919,17 @@ app.get("/test-merchants", async (_req, res) => {
 });
 
 app.get("/run", async (_req, res) => {
+  if (isSyncRunning) {
+    return res.status(409).json({
+      success: false,
+      message: "Sync is already running",
+      activeSyncStartedAt
+    });
+  }
+
+  isSyncRunning = true;
+  activeSyncStartedAt = new Date().toISOString();
+
   try {
     const result = await syncAllMerchants();
 
@@ -871,10 +945,24 @@ app.get("/run", async (_req, res) => {
       success: false,
       error: error.message
     });
+  } finally {
+    isSyncRunning = false;
+    activeSyncStartedAt = null;
   }
 });
 
 app.get("/run-test", async (_req, res) => {
+  if (isSyncRunning) {
+    return res.status(409).json({
+      success: false,
+      message: "Sync is already running",
+      activeSyncStartedAt
+    });
+  }
+
+  isSyncRunning = true;
+  activeSyncStartedAt = new Date().toISOString();
+
   try {
     assertEnv();
 
@@ -894,11 +982,12 @@ app.get("/run-test", async (_req, res) => {
     console.log("TEST RUN", { merchant: merchant.name, syncId });
 
     const products = await fetchActiveProducts(merchant);
-
-    // 👇 LIMIT TO 5 PRODUCTS
     const testProducts = products.slice(0, 5);
 
     let variantsProcessed = 0;
+    let created = 0;
+    let updated = 0;
+    let duplicatesDeletedTotal = 0;
 
     for (const product of testProducts) {
       const fullProduct = product;
@@ -912,95 +1001,90 @@ app.get("/run-test", async (_req, res) => {
         product: fullProduct,
         variants
       });
-      
+
+      const duplicatesDeleted = await deleteDuplicateStoreListings(existingByVariantId);
+      duplicatesDeletedTotal += duplicatesDeleted;
+
       const allVariantsExist = variants.every((variant) => {
         const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        return Boolean(existingByVariantId.get(variantId));
+        return Boolean(existingByVariantId.get(variantId)?.primary);
       });
-      
+
       const needsRetailedRetry = variants.some((variant) => {
         const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existing = existingByVariantId.get(variantId);
+        const existing = existingByVariantId.get(variantId)?.primary;
         return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
       });
-      
+
       let retailed = null;
       let retailedStatus = "ok";
-      
+
       if (!allVariantsExist || needsRetailedRetry) {
         retailed = await searchRetailed(retailedQuery);
-      
+
         if (!retailedQuery) retailedStatus = "not_found";
         else if (!retailed) retailedStatus = "failed";
       }
-      
+
+      const recordsToCreate = [];
+      const recordsToUpdate = [];
+
       for (const variant of variants) {
         variantsProcessed += 1;
-      
-        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existingRecord = existingByVariantId.get(variantId);
-      
-        const recordsToCreate = [];
-        const recordsToUpdate = [];
-        
-        for (const variant of variants) {
-          variantsProcessed += 1;
-        
-          const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-          const existingRecord = existingByVariantId.get(variantId);
-        
-          const mutation = buildStoreListingMutation({
-            merchant,
-            syncId,
-            product: fullProduct,
-            variant,
-            retailed,
-            retailedStatus,
-            productSku: firstVariantSku,
-            existingRecord,
-            enrich: !existingRecord || needsRetailedRetry
-          });
-        
-          console.log("TEST mutation:", {
-            product: fullProduct.title,
-            variant: variant.title,
-            sku: firstVariantSku,
-            action: mutation.action,
-            recordId: mutation.id || null
-          });
-        
-          if (mutation.action === "update") {
-            recordsToUpdate.push({
-              id: mutation.id,
-              fields: mutation.fields
-            });
-          } else {
-            recordsToCreate.push(mutation.fields);
-          }
-        }
-        
-        const updatedRecords = await batchUpdateAirtableRecords(
-          AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-          recordsToUpdate
-        );
-        
-        const createdRecords = await batchCreateAirtableRecords(
-          AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-          recordsToCreate
-        );
-        
-        console.log("TEST batch result:", {
-          product: fullProduct.title,
-          updated: updatedRecords.length,
-          created: createdRecords.length
-        });
-      
-        await sleep(200);
-      }
-    }
 
-    // ❗ BELANGRIJK: GEEN deactivate in test
-    // await deactivateOldListings(merchant, syncId);
+        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
+        const existingRecord = existingByVariantId.get(variantId)?.primary || null;
+
+        const mutation = buildStoreListingMutation({
+          merchant,
+          syncId,
+          product: fullProduct,
+          variant,
+          retailed,
+          retailedStatus,
+          productSku: firstVariantSku,
+          existingRecord,
+          enrich: !existingRecord || needsRetailedRetry
+        });
+
+        console.log("TEST mutation:", {
+          product: fullProduct.title,
+          variant: variant.title,
+          sku: firstVariantSku,
+          action: mutation.action,
+          recordId: mutation.id || null
+        });
+
+        if (mutation.action === "update") {
+          recordsToUpdate.push({
+            id: mutation.id,
+            fields: mutation.fields
+          });
+        } else {
+          recordsToCreate.push(mutation.fields);
+        }
+      }
+
+      const updatedRecords = await batchUpdateAirtableRecords(
+        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+        recordsToUpdate
+      );
+
+      const createdRecords = await batchCreateAirtableRecords(
+        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
+        recordsToCreate
+      );
+
+      updated += updatedRecords.length;
+      created += createdRecords.length;
+
+      console.log("TEST batch result:", {
+        product: fullProduct.title,
+        updated: updatedRecords.length,
+        created: createdRecords.length,
+        duplicatesDeleted
+      });
+    }
 
     await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
       "Last Sync ID": syncId,
@@ -1012,7 +1096,10 @@ app.get("/run-test", async (_req, res) => {
       message: "Test run completed",
       merchant: merchant.name,
       productsProcessed: testProducts.length,
-      variantsProcessed
+      variantsProcessed,
+      created,
+      updated,
+      duplicatesDeleted: duplicatesDeletedTotal
     });
 
   } catch (error) {
@@ -1022,6 +1109,9 @@ app.get("/run-test", async (_req, res) => {
       success: false,
       error: error.message
     });
+  } finally {
+    isSyncRunning = false;
+    activeSyncStartedAt = null;
   }
 });
 
