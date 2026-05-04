@@ -266,7 +266,6 @@ async function batchDeleteAirtableRecords(tableName, recordIds) {
 async function logSyncError({ merchant, syncId, product, error }) {
   try {
     await createAirtableRecord(AIRTABLE_SYNC_ERRORS_TABLE_NAME, {
-      "Merchant": [merchant.recordId],
       "Merchant Record ID": merchant.recordId,
       "Sync ID": syncId,
       "Shopify Product ID": String(product?.legacyResourceId || getNumericId(product?.id)),
@@ -721,7 +720,13 @@ async function syncMerchant(merchant, runId) {
       
       const firstVariantSku = variants[0]?.sku || "";
       const retailedQuery = firstVariantSku || fullProduct.title;
-  
+
+      const existingByVariantId = await buildVariantRecordsMap({
+        merchant,
+        product: fullProduct,
+        variants
+      });
+        
       const duplicatesDeleted = await deleteDuplicateStoreListings(existingByVariantId);
 
       if (duplicatesDeleted > 0) {
