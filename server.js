@@ -525,6 +525,16 @@ async function findStoreListing({ merchantRecordId, productId, variantId }) {
   return records[0] || null;
 }
 
+function extractSize(value) {
+  const text = String(value || "");
+
+  const match = text.match(/\d+(?:[.,]\d+)?/);
+
+  if (!match) return "";
+
+  return match[0].replace(",", ".");
+}
+
 function buildStoreListingMutation({
   merchant,
   syncId,
@@ -553,7 +563,7 @@ function buildStoreListingMutation({
     "Shopify Inventory Item ID": inventoryItemId,
 
     "Shopify Product Name": product.title || "",
-    "Size": variant.title || "",
+    "Size": extractSize(variant.title),
     "SKU": productSku || "",
 
     "Last Seen Sync ID": syncId,
