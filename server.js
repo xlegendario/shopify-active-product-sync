@@ -279,7 +279,8 @@ async function upsertRiskyProductMatch({
   productSku,
   retailed,
   retailedStatus,
-  matchRiskLevel
+  matchRiskLevel,
+  riskyMap
 }) {
   const productId = String(product.legacyResourceId || getNumericId(product.id));
   const stockxProductName = buildStockxName(retailed);
@@ -319,10 +320,7 @@ async function upsertRiskyProductMatch({
     ];
   }
 
-  const existing = await findRiskyProductMatch({
-    merchantRecordId: merchant.recordId,
-    productId
-  });
+  const existing = riskyMap.get(productId);
 
   if (existing) {
     await updateAirtableRecord(
@@ -334,10 +332,7 @@ async function upsertRiskyProductMatch({
     return { action: "updated", recordId: existing.id };
   }
 
-  const created = await createAirtableRecord(
-    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
-    fields
-  );
+  riskyMap.set(productId, { id: created.id, fields });
 
   return { action: "created", recordId: created.id };
 }
@@ -715,6 +710,19 @@ async function syncMerchant(merchant, runId) {
   });
 
   const products = await fetchActiveProducts(merchant);
+  const existingRiskyRecords = await fetchAllAirtableRecords(
+    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+    `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
+  );
+  
+  const riskyMap = new Map();
+  
+  for (const record of existingRiskyRecords) {
+    const productId = record.fields["Shopify Product ID"];
+    if (productId) {
+      riskyMap.set(productId, record);
+    }
+  }
 
   let productsProcessed = 0;
   let variantsProcessed = 0;
@@ -763,7 +771,8 @@ async function syncMerchant(merchant, runId) {
         productSku: firstVariantSku,
         retailed,
         retailedStatus,
-        matchRiskLevel: productMatchRiskLevel
+        matchRiskLevel: productMatchRiskLevel,
+        riskyMap
       });
   
       if (riskyResult.action === "created") riskyCreated += 1;
