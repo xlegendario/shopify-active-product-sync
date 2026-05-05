@@ -320,7 +320,7 @@ async function upsertRiskyProductMatch({
     ];
   }
 
-  const existing = riskyMap.get(productId);
+  const existing = riskyMap?.get(productId) || null;
 
   if (existing) {
     await updateAirtableRecord(
@@ -1057,7 +1057,8 @@ app.get("/run-test", async (_req, res) => {
         productSku: firstVariantSku,
         retailed,
         retailedStatus,
-        matchRiskLevel: productMatchRiskLevel
+        matchRiskLevel: productMatchRiskLevel,
+        riskyMap
       });
     
       if (riskyResult.action === "created") riskyCreated += 1;
