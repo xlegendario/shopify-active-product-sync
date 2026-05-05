@@ -317,7 +317,7 @@ async function fetchActiveMerchants() {
 
     merchants.push({
       recordId: record.id,
-      name: fields.Name || record.id,
+      name: fields["Store Name"] || record.id,
       shopifyDomain,
       shopifyToken
     });
