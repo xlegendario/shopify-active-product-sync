@@ -36,6 +36,11 @@ const RETAILED_API_BASE =
 const RETAILED_API_KEY = process.env.RETAILED_API_KEY || "";
 const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || "15000", 10);
 
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
 let isSyncRunning = false;
 let activeSyncStartedAt = null;
 
@@ -44,6 +49,8 @@ function assertEnv() {
 
   if (!AIRTABLE_TOKEN) missing.push("AIRTABLE_TOKEN");
   if (!AIRTABLE_BASE_ID) missing.push("AIRTABLE_BASE_ID");
+  if (!SUPABASE_URL) missing.push("SUPABASE_URL");
+  if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
 
   if (missing.length > 0) {
     throw new Error(`Missing environment variables: ${missing.join(", ")}`);
@@ -497,6 +504,120 @@ function buildStockxName(retailed) {
     .trim();
 }
 
+function calculateMatchRisk({ sku, shopifyProductName, stockxProductName }) {
+  function clean(str) {
+    return String(str || "")
+      .toLowerCase()
+      .replace(/[\(\)\[\]'"]/g, "")
+      .replace(/\bwomens\b/g, "w")
+      .replace(/\bmen's\b/g, "m")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  if (!sku || !String(sku).trim()) return "High";
+
+  const productA = clean(shopifyProductName);
+  const productB = clean(stockxProductName);
+
+  if (!productA || !productB) return "High";
+
+  function levenshtein(a, b) {
+    const m = a.length;
+    const n = b.length;
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+
+    for (let i = 0; i <= m; i += 1) dp[i][0] = i;
+    for (let j = 0; j <= n; j += 1) dp[0][j] = j;
+
+    for (let i = 1; i <= m; i += 1) {
+      for (let j = 1; j <= n; j += 1) {
+        dp[i][j] = Math.min(
+          dp[i - 1][j] + 1,
+          dp[i][j - 1] + 1,
+          dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+        );
+      }
+    }
+
+    return dp[m][n];
+  }
+
+  const distance = levenshtein(productA, productB);
+
+  if (distance <= 5) return "Low";
+  if (distance <= 10) return "Medium";
+  return "High";
+}
+
+function mapToSupabaseStoreListing({
+  merchant,
+  syncId,
+  product,
+  variant,
+  retailed,
+  retailedStatus,
+  productSku
+}) {
+  const stockxProductName = buildStockxName(retailed);
+
+  const matchRiskLevel = calculateMatchRisk({
+    sku: productSku,
+    shopifyProductName: product.title || "",
+    stockxProductName
+  });
+
+  return {
+    merchant_record_id: merchant.recordId,
+    merchant_name: merchant.name,
+
+    shopify_product_id: String(product.legacyResourceId || getNumericId(product.id)),
+    shopify_variant_id: String(variant.legacyResourceId || getNumericId(variant.id)),
+    shopify_inventory_item_id: String(
+      variant.inventoryItem?.legacyResourceId || getNumericId(variant.inventoryItem?.id)
+    ),
+
+    shopify_product_name: product.title || "",
+    size: extractSize(variant.title),
+    sku: productSku || null,
+
+    stockx_product_name: stockxProductName || null,
+    brand: retailed?.brand || null,
+    picture_url: retailed?.image || null,
+
+    retailed_status: retailedStatus,
+    match_risk_level: matchRiskLevel,
+
+    status: "active",
+    last_seen_sync_id: syncId,
+    last_shopify_sync_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  };
+}
+
+async function upsertStoreListingsSupabase(rows) {
+  if (!rows.length) return [];
+
+  const upserted = [];
+
+  for (const chunk of chunkArray(rows, 500)) {
+    const { data, error } = await supabase
+      .from("store_listings")
+      .upsert(chunk, {
+        onConflict: "merchant_record_id,shopify_product_id,shopify_variant_id"
+      })
+      .select("id");
+
+    if (error) {
+      throw new Error(`Supabase upsert error: ${error.message}`);
+    }
+
+    upserted.push(...(data || []));
+  }
+
+  return upserted;
+}
+
 async function buildVariantRecordsMap({ merchant, product, variants }) {
   const productId = String(product.legacyResourceId || getNumericId(product.id));
 
@@ -767,6 +888,7 @@ async function syncMerchant(merchant, runId) {
   
       const recordsToCreate = [];
       const recordsToUpdate = [];
+      const supabaseRows = [];
       
       for (const variant of variants) {
         variantsProcessed += 1;
@@ -785,6 +907,18 @@ async function syncMerchant(merchant, runId) {
           existingRecord,
           enrich: !existingRecord || needsRetailedRetry
         });
+
+        supabaseRows.push(
+          mapToSupabaseStoreListing({
+            merchant,
+            syncId,
+            product: fullProduct,
+            variant,
+            retailed,
+            retailedStatus,
+            productSku: firstVariantSku
+          })
+        );
       
         if (mutation.action === "update") {
           recordsToUpdate.push({
@@ -795,6 +929,13 @@ async function syncMerchant(merchant, runId) {
           recordsToCreate.push(mutation.fields);
         }
       }
+      
+      const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
+
+      console.log("Supabase upsert completed", {
+        product: fullProduct.title,
+        rows: supabaseRecords.length
+      });
       
       const updatedRecords = await batchUpdateAirtableRecords(
         AIRTABLE_STORE_LISTINGS_TABLE_NAME,
@@ -1038,6 +1179,7 @@ app.get("/run-test", async (_req, res) => {
 
       const recordsToCreate = [];
       const recordsToUpdate = [];
+      const supabaseRows = [];
 
       for (const variant of variants) {
         variantsProcessed += 1;
@@ -1057,6 +1199,18 @@ app.get("/run-test", async (_req, res) => {
           enrich: !existingRecord || needsRetailedRetry
         });
 
+        supabaseRows.push(
+          mapToSupabaseStoreListing({
+            merchant,
+            syncId,
+            product: fullProduct,
+            variant,
+            retailed,
+            retailedStatus,
+            productSku: firstVariantSku
+          })
+        );
+
         console.log("TEST mutation:", {
           product: fullProduct.title,
           variant: variant.title,
@@ -1075,11 +1229,18 @@ app.get("/run-test", async (_req, res) => {
         }
       }
 
+      const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
+
+      console.log("TEST Supabase upsert completed", {
+        product: fullProduct.title,
+        rows: supabaseRecords.length
+      });
+      
       const updatedRecords = await batchUpdateAirtableRecords(
         AIRTABLE_STORE_LISTINGS_TABLE_NAME,
         recordsToUpdate
       );
-
+      
       const createdRecords = await batchCreateAirtableRecords(
         AIRTABLE_STORE_LISTINGS_TABLE_NAME,
         recordsToCreate
