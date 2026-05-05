@@ -11,5 +11,6 @@
   },
   "dependencies": {
     "express": "^4.21.2"
+    "@supabase/supabase-js": "^2.45.4"
   }
 }
