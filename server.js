@@ -18,6 +18,9 @@ const AIRTABLE_STORE_LISTINGS_TABLE_NAME =
 const AIRTABLE_SYNC_ERRORS_TABLE_NAME =
   process.env.AIRTABLE_SYNC_ERRORS_TABLE_NAME || "Sync Errors";
 
+const AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME =
+  process.env.AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME || "Risky Product Matches";
+
 const AIRTABLE_MERCHANT_ACTIVE_FIELD =
   process.env.AIRTABLE_MERCHANT_ACTIVE_FIELD || "Test Active?";
 
@@ -291,6 +294,122 @@ async function logSyncError({ merchant, syncId, product, error }) {
   } catch (logError) {
     console.error("Failed to log sync error:", logError);
   }
+}
+
+function getRiskIssue({ sku, retailedStatus, matchRiskLevel, pictureUrl }) {
+  const issueTypes = [];
+  const issueNotes = [];
+
+  if (!sku || !String(sku).trim()) {
+    issueTypes.push("Missing SKU");
+    issueNotes.push("SKU is missing.");
+  }
+
+  if (retailedStatus !== "ok") {
+    issueTypes.push(
+      retailedStatus === "not_found" ? "Retailed Not Found" : "Retailed Failed"
+    );
+    issueNotes.push(`Retailed status is ${retailedStatus}.`);
+  }
+
+  if (matchRiskLevel !== "Low") {
+    issueTypes.push(`${matchRiskLevel} Risk Match`);
+    issueNotes.push(`Match risk level is ${matchRiskLevel}.`);
+  }
+
+  if (!pictureUrl) {
+    issueTypes.push("Missing Image");
+    issueNotes.push("Retailed image is missing.");
+  }
+
+  return {
+    isRisky: issueTypes.length > 0,
+    issueTypes,
+    issueNotes: issueNotes.join(" ")
+  };
+}
+
+async function findRiskyProductMatch({ merchantRecordId, productId }) {
+  const formula = `AND(
+    {Merchant Record ID} = '${airtableEscape(merchantRecordId)}',
+    {Shopify Product ID} = '${airtableEscape(productId)}'
+  )`;
+
+  const records = await fetchAllAirtableRecords(
+    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+    formula
+  );
+
+  return records[0] || null;
+}
+
+async function upsertRiskyProductMatch({
+  merchant,
+  product,
+  productSku,
+  retailed,
+  retailedStatus,
+  matchRiskLevel
+}) {
+  const productId = String(product.legacyResourceId || getNumericId(product.id));
+  const stockxProductName = buildStockxName(retailed);
+  const pictureUrl = retailed?.image || "";
+
+  const riskIssue = getRiskIssue({
+    sku: productSku,
+    retailedStatus,
+    matchRiskLevel,
+    pictureUrl
+  });
+
+  if (!riskIssue.isRisky) {
+    return { action: "skipped" };
+  }
+
+  const fields = {
+    "Merchant Record ID": merchant.recordId,
+    "Shopify Product ID": productId,
+    "Shopify Product Name": product.title || "",
+    "StockX Product Name": stockxProductName,
+    "Brand": retailed?.brand || "",
+    "SKU": productSku || "",
+    "Match Risk Level": matchRiskLevel,
+    "Retailed Status": retailedStatus,
+    "Issue Type": riskIssue.issueTypes,
+    "Issue Notes": riskIssue.issueNotes,
+    "Correction Synced?": false
+  };
+
+  if (pictureUrl) {
+    fields.Picture = [
+      {
+        url: pictureUrl,
+        filename: `${stockxProductName || product.title || productId}.webp`
+      }
+    ];
+  }
+
+  const existing = await findRiskyProductMatch({
+    merchantRecordId: merchant.recordId,
+    productId
+  });
+
+  if (existing) {
+    await updateAirtableRecord(
+      AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+      existing.id,
+      fields
+    );
+
+    return { action: "updated", recordId: existing.id };
+  }
+
+  const created = await createAirtableRecord(
+    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+    fields
+  );
+
+  return { action: "created", recordId: created.id };
 }
 
 async function fetchActiveMerchants() {
@@ -837,7 +956,9 @@ async function syncMerchant(merchant, runId) {
   let created = 0;
   let updated = 0;
   let retailedMisses = 0;
-
+  let riskyCreated = 0;
+  let riskyUpdated = 0;
+  
   let failedProducts = 0;
 
   for (const product of products) {
@@ -879,10 +1000,10 @@ async function syncMerchant(merchant, runId) {
   
       let retailed = null;
       let retailedStatus = "ok";
-  
+      
       if (!allVariantsExist || needsRetailedRetry) {
         retailed = await searchRetailed(retailedQuery);
-  
+      
         if (!retailedQuery) {
           retailedStatus = "not_found";
           retailedMisses += 1;
@@ -891,7 +1012,27 @@ async function syncMerchant(merchant, runId) {
           retailedMisses += 1;
         }
       }
-  
+      
+      const stockxProductName = buildStockxName(retailed);
+      
+      const productMatchRiskLevel = calculateMatchRisk({
+        sku: firstVariantSku,
+        shopifyProductName: fullProduct.title || "",
+        stockxProductName
+      });
+      
+      const riskyResult = await upsertRiskyProductMatch({
+        merchant,
+        product: fullProduct,
+        productSku: firstVariantSku,
+        retailed,
+        retailedStatus,
+        matchRiskLevel: productMatchRiskLevel
+      });
+      
+      if (riskyResult.action === "created") riskyCreated += 1;
+      if (riskyResult.action === "updated") riskyUpdated += 1;
+      
       const recordsToCreate = [];
       const recordsToUpdate = [];
       const supabaseRows = [];
@@ -995,6 +1136,8 @@ async function syncMerchant(merchant, runId) {
     updated,
     deactivated,
     retailedMisses,
+    riskyCreated,
+    riskyUpdated,
     failedProducts
   });
 
@@ -1013,6 +1156,8 @@ async function syncMerchant(merchant, runId) {
     updated,
     deactivated,
     retailedMisses,
+    riskyCreated,
+    riskyUpdated,
     failedProducts
   };
 }
