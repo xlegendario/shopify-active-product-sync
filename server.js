@@ -211,75 +211,6 @@ function chunkArray(array, size) {
   return chunks;
 }
 
-async function batchCreateAirtableRecords(tableName, records) {
-  if (!records.length) return [];
-
-  const table = encodeURIComponent(tableName);
-  const created = [];
-
-  for (const chunk of chunkArray(records, 10)) {
-    const result = await airtableRequest(table, {
-      method: "POST",
-      body: JSON.stringify({
-        records: chunk.map((fields) => ({ fields }))
-      })
-    });
-
-    created.push(...(result.records || []));
-    await sleep(220);
-  }
-
-  return created;
-}
-
-async function batchUpdateAirtableRecords(tableName, records) {
-  if (!records.length) return [];
-
-  const table = encodeURIComponent(tableName);
-  const updated = [];
-
-  for (const chunk of chunkArray(records, 10)) {
-    const result = await airtableRequest(table, {
-      method: "PATCH",
-      body: JSON.stringify({
-        records: chunk.map((record) => ({
-          id: record.id,
-          fields: record.fields
-        }))
-      })
-    });
-
-    updated.push(...(result.records || []));
-    await sleep(220);
-  }
-
-  return updated;
-}
-
-async function batchDeleteAirtableRecords(tableName, recordIds) {
-  if (!recordIds.length) return [];
-
-  const table = encodeURIComponent(tableName);
-  const deleted = [];
-
-  for (const chunk of chunkArray(recordIds, 10)) {
-    const params = new URLSearchParams();
-
-    for (const id of chunk) {
-      params.append("records[]", id);
-    }
-
-    const result = await airtableRequest(`${table}?${params.toString()}`, {
-      method: "DELETE"
-    });
-
-    deleted.push(...(result.records || []));
-    await sleep(220);
-  }
-
-  return deleted;
-}
-
 async function logSyncError({ merchant, syncId, product, error }) {
   try {
     await createAirtableRecord(AIRTABLE_SYNC_ERRORS_TABLE_NAME, {
@@ -288,7 +219,6 @@ async function logSyncError({ merchant, syncId, product, error }) {
       "Shopify Product ID": String(product?.legacyResourceId || getNumericId(product?.id)),
       "Shopify Product Name": product?.title || "",
       "Error Message": error instanceof Error ? error.message : String(error),
-      "Created At": new Date().toISOString(),
       "Resolved?": false
     });
   } catch (logError) {
@@ -743,95 +673,26 @@ async function upsertStoreListingsSupabase(rows) {
   return upserted;
 }
 
-async function buildVariantRecordsMap({ merchant, product, variants }) {
-  const productId = String(product.legacyResourceId || getNumericId(product.id));
+async function deactivateOldListingsSupabase(merchant, syncId) {
+  const { data, error } = await supabase
+    .from("store_listings")
+    .update({
+      status: "inactive",
+      updated_at: new Date().toISOString()
+    })
+    .eq("merchant_record_id", merchant.recordId)
+    .eq("status", "active")
+    .neq("last_seen_sync_id", syncId)
+    .select("id");
 
-  const variantIds = [...new Set(
-    variants.map((variant) =>
-      String(variant.legacyResourceId || getNumericId(variant.id))
-    )
-  )];
-
-  if (!variantIds.length) return new Map();
-
-  const variantConditions = variantIds
-    .map((variantId) => `{Shopify Variant ID} = '${airtableEscape(variantId)}'`)
-    .join(",");
-
-  const formula = `AND(
-    {Merchant Record ID} = '${airtableEscape(merchant.recordId)}',
-    {Shopify Product ID} = '${airtableEscape(productId)}',
-    OR(${variantConditions})
-  )`;
-
-  const records = await fetchAllAirtableRecords(
-    AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-    formula
-  );
-
-  const recordsByVariantId = new Map();
-
-  for (const variantId of variantIds) {
-    recordsByVariantId.set(variantId, {
-      primary: null,
-      duplicates: []
-    });
+  if (error) {
+    throw new Error(`Supabase inactive cleanup error: ${error.message}`);
   }
 
-  for (const record of records) {
-    const variantId = String(record.fields?.["Shopify Variant ID"] || "");
-    if (!variantId) continue;
-
-    const group = recordsByVariantId.get(variantId) || {
-      primary: null,
-      duplicates: []
-    };
-
-    if (!group.primary) {
-      group.primary = record;
-    } else {
-      group.duplicates.push(record);
-    }
-
-    recordsByVariantId.set(variantId, group);
-  }
-
-  return recordsByVariantId;
+  return data?.length || 0;
 }
 
-async function deleteDuplicateStoreListings(existingByVariantId) {
-  const duplicateIds = [];
 
-  for (const [, group] of existingByVariantId.entries()) {
-    for (const duplicate of group.duplicates || []) {
-      duplicateIds.push(duplicate.id);
-    }
-  }
-
-  if (!duplicateIds.length) return 0;
-
-  console.warn("Deleting duplicate Store Listings", {
-    count: duplicateIds.length
-  });
-
-  const deleted = await batchDeleteAirtableRecords(
-    AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-    duplicateIds
-  );
-
-  return deleted.length;
-}
-
-async function findStoreListing({ merchantRecordId, productId, variantId }) {
-  const formula = `AND(
-    {Merchant Record ID} = '${airtableEscape(merchantRecordId)}',
-    {Shopify Product ID} = '${airtableEscape(productId)}',
-    {Shopify Variant ID} = '${airtableEscape(variantId)}'
-  )`;
-
-  const records = await fetchAllAirtableRecords(AIRTABLE_STORE_LISTINGS_TABLE_NAME, formula);
-  return records[0] || null;
-}
 
 function extractSize(value) {
   const text = String(value || "");
@@ -841,102 +702,6 @@ function extractSize(value) {
   if (!match) return "";
 
   return match[0].replace(",", ".");
-}
-
-function buildStoreListingMutation({
-  merchant,
-  syncId,
-  product,
-  variant,
-  retailed,
-  retailedStatus,
-  productSku,
-  existingRecord = null,
-  enrich = false
-}) {
-  const now = new Date().toISOString();
-
-  const productId = String(product.legacyResourceId || getNumericId(product.id));
-  const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-  const inventoryItemId = String(
-    variant.inventoryItem?.legacyResourceId || getNumericId(variant.inventoryItem?.id)
-  );
-
-  const fields = {
-    "Client": [merchant.recordId],
-    "Merchant Record ID": merchant.recordId,
-
-    "Shopify Product ID": productId,
-    "Shopify Variant ID": variantId,
-    "Shopify Inventory Item ID": inventoryItemId,
-
-    "Shopify Product Name": product.title || "",
-    "Size": extractSize(variant.title),
-
-    ...(productSku ? { "SKU": productSku } : {}),
-    
-    "Last Seen Sync ID": syncId,
-    "Last Shopify Sync At": now,
-    "Status": "active"
-  };
-
-  const shouldEnrich =
-    enrich ||
-    !existingRecord ||
-    ["failed", "not_found"].includes(existingRecord?.fields?.["Retailed Status"]);
-
-  if (shouldEnrich) {
-    const stockxProductName = buildStockxName(retailed);
-
-    fields["StockX Product Name"] = stockxProductName;
-    fields["Brand"] = retailed?.brand || "";
-    fields["Retailed Status"] = retailedStatus;
-
-    if (retailed?.image) {
-      fields.Picture = [
-        {
-          url: retailed.image,
-          filename: `${stockxProductName || product.title || variantId}.webp`
-        }
-      ];
-    }
-  }
-
-  if (existingRecord) {
-    return {
-      action: "update",
-      id: existingRecord.id,
-      fields
-    };
-  }
-
-  return {
-    action: "create",
-    fields
-  };
-}
-
-async function deactivateOldListings(merchant, syncId) {
-  const formula = `AND(
-    {Merchant Record ID} = '${airtableEscape(merchant.recordId)}',
-    {Status} = 'active',
-    OR(
-      {Last Seen Sync ID} = BLANK(),
-      {Last Seen Sync ID} != '${airtableEscape(syncId)}'
-    )
-  )`;
-
-  const records = await fetchAllAirtableRecords(AIRTABLE_STORE_LISTINGS_TABLE_NAME, formula);
-
-  for (const record of records) {
-    await updateAirtableRecord(AIRTABLE_STORE_LISTINGS_TABLE_NAME, record.id, {
-      "Status": "inactive"
-    });
-
-    await sleep(220);
-  }
-
-  return records.length;
 }
 
 async function syncMerchant(merchant, runId) {
@@ -967,60 +732,31 @@ async function syncMerchant(merchant, runId) {
   
       const fullProduct = product;
       const variants = fullProduct.variants.edges.map((edge) => edge.node);
-      
+  
       const firstVariantSku = variants[0]?.sku || "";
       const retailedQuery = firstVariantSku || fullProduct.title;
-
-      const existingByVariantId = await buildVariantRecordsMap({
-        merchant,
-        product: fullProduct,
-        variants
-      });
-        
-      const duplicatesDeleted = await deleteDuplicateStoreListings(existingByVariantId);
-
-      if (duplicatesDeleted > 0) {
-        console.warn("Deleted duplicate Store Listings for product", {
-          productId: fullProduct.legacyResourceId,
-          productTitle: fullProduct.title,
-          duplicatesDeleted
-        });
-      }
-  
-      const allVariantsExist = variants.every((variant) => {
-        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        return Boolean(existingByVariantId.get(variantId)?.primary);
-      });
-  
-      const needsRetailedRetry = variants.some((variant) => {
-        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existing = existingByVariantId.get(variantId)?.primary;
-        return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
-      });
   
       let retailed = null;
       let retailedStatus = "ok";
-      
-      if (!allVariantsExist || needsRetailedRetry) {
-        retailed = await searchRetailed(retailedQuery);
-      
-        if (!retailedQuery) {
-          retailedStatus = "not_found";
-          retailedMisses += 1;
-        } else if (!retailed) {
-          retailedStatus = "failed";
-          retailedMisses += 1;
-        }
+  
+      retailed = await searchRetailed(retailedQuery);
+  
+      if (!retailedQuery) {
+        retailedStatus = "not_found";
+        retailedMisses += 1;
+      } else if (!retailed) {
+        retailedStatus = "failed";
+        retailedMisses += 1;
       }
-      
+  
       const stockxProductName = buildStockxName(retailed);
-      
+  
       const productMatchRiskLevel = calculateMatchRisk({
         sku: firstVariantSku,
         shopifyProductName: fullProduct.title || "",
         stockxProductName
       });
-      
+  
       const riskyResult = await upsertRiskyProductMatch({
         merchant,
         product: fullProduct,
@@ -1029,32 +765,15 @@ async function syncMerchant(merchant, runId) {
         retailedStatus,
         matchRiskLevel: productMatchRiskLevel
       });
-      
+  
       if (riskyResult.action === "created") riskyCreated += 1;
       if (riskyResult.action === "updated") riskyUpdated += 1;
-      
-      const recordsToCreate = [];
-      const recordsToUpdate = [];
+  
       const supabaseRows = [];
-      
+  
       for (const variant of variants) {
         variantsProcessed += 1;
-      
-        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existingRecord = existingByVariantId.get(variantId)?.primary || null;
-      
-        const mutation = buildStoreListingMutation({
-          merchant,
-          syncId,
-          product: fullProduct,
-          variant,
-          retailed,
-          retailedStatus,
-          productSku: firstVariantSku,
-          existingRecord,
-          enrich: !existingRecord || needsRetailedRetry
-        });
-
+  
         supabaseRows.push(
           mapToSupabaseStoreListing({
             merchant,
@@ -1066,36 +785,18 @@ async function syncMerchant(merchant, runId) {
             productSku: firstVariantSku
           })
         );
-      
-        if (mutation.action === "update") {
-          recordsToUpdate.push({
-            id: mutation.id,
-            fields: mutation.fields
-          });
-        } else {
-          recordsToCreate.push(mutation.fields);
-        }
       }
-      
+  
       const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
-
+  
+      updated += supabaseRecords.length;
+  
       console.log("Supabase upsert completed", {
         product: fullProduct.title,
-        rows: supabaseRecords.length
+        rows: supabaseRecords.length,
+        retailedStatus,
+        matchRiskLevel: productMatchRiskLevel
       });
-      
-      const updatedRecords = await batchUpdateAirtableRecords(
-        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-        recordsToUpdate
-      );
-      
-      const createdRecords = await batchCreateAirtableRecords(
-        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-        recordsToCreate
-      );
-      
-      updated += updatedRecords.length;
-      created += createdRecords.length;
     } catch (error) {
       failedProducts += 1;
   
@@ -1118,9 +819,9 @@ async function syncMerchant(merchant, runId) {
   let deactivated = 0;
 
   if (failedProducts === 0) {
-    deactivated = await deactivateOldListings(merchant, syncId);
+    deactivated = await deactivateOldListingsSupabase(merchant, syncId);
   } else {
-    console.warn("Skipping inactive cleanup because products failed", {
+    console.warn("Skipping Supabase inactive cleanup because products failed", {
       merchantRecordId: merchant.recordId,
       syncId,
       failedProducts
@@ -1291,53 +992,35 @@ app.get("/run-test", async (_req, res) => {
     let updated = 0;
     let duplicatesDeletedTotal = 0;
 
+    let riskyCreated = 0;
+    let riskyUpdated = 0;
+    
     for (const product of testProducts) {
       const fullProduct = product;
       const variants = fullProduct.variants.edges.map((e) => e.node);
-
+    
       const firstVariantSku = variants[0]?.sku || "";
       const retailedQuery = firstVariantSku || fullProduct.title;
-
-      const existingByVariantId = await buildVariantRecordsMap({
-        merchant,
-        product: fullProduct,
-        variants
-      });
-
-      const duplicatesDeleted = await deleteDuplicateStoreListings(existingByVariantId);
-      duplicatesDeletedTotal += duplicatesDeleted;
-
-      const allVariantsExist = variants.every((variant) => {
-        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        return Boolean(existingByVariantId.get(variantId)?.primary);
-      });
-
-      const needsRetailedRetry = variants.some((variant) => {
-        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existing = existingByVariantId.get(variantId)?.primary;
-        return ["failed", "not_found"].includes(existing?.fields?.["Retailed Status"]);
-      });
-
+    
       let retailed = null;
       let retailedStatus = "ok";
-      
-      // In test mode always fetch Retailed so Supabase + Risky Product Matches are tested properly
+    
       retailed = await searchRetailed(retailedQuery);
-      
+    
       if (!retailedQuery) {
         retailedStatus = "not_found";
       } else if (!retailed) {
         retailedStatus = "failed";
       }
-      
+    
       const stockxProductName = buildStockxName(retailed);
-      
+    
       const productMatchRiskLevel = calculateMatchRisk({
         sku: firstVariantSku,
         shopifyProductName: fullProduct.title || "",
         stockxProductName
       });
-      
+    
       const riskyResult = await upsertRiskyProductMatch({
         merchant,
         product: fullProduct,
@@ -1346,37 +1029,15 @@ app.get("/run-test", async (_req, res) => {
         retailedStatus,
         matchRiskLevel: productMatchRiskLevel
       });
-      
-      console.log("TEST risky product match result:", {
-        product: fullProduct.title,
-        action: riskyResult.action,
-        recordId: riskyResult.recordId || null,
-        matchRiskLevel: productMatchRiskLevel,
-        retailedStatus
-      });
-      
-      const recordsToCreate = [];
-      const recordsToUpdate = [];
+    
+      if (riskyResult.action === "created") riskyCreated += 1;
+      if (riskyResult.action === "updated") riskyUpdated += 1;
+    
       const supabaseRows = [];
-
+    
       for (const variant of variants) {
         variantsProcessed += 1;
-
-        const variantId = String(variant.legacyResourceId || getNumericId(variant.id));
-        const existingRecord = existingByVariantId.get(variantId)?.primary || null;
-
-        const mutation = buildStoreListingMutation({
-          merchant,
-          syncId,
-          product: fullProduct,
-          variant,
-          retailed,
-          retailedStatus,
-          productSku: firstVariantSku,
-          existingRecord,
-          enrich: !existingRecord || needsRetailedRetry
-        });
-
+    
         supabaseRows.push(
           mapToSupabaseStoreListing({
             merchant,
@@ -1388,53 +1049,20 @@ app.get("/run-test", async (_req, res) => {
             productSku: firstVariantSku
           })
         );
-
-        console.log("TEST mutation:", {
-          product: fullProduct.title,
-          variant: variant.title,
-          sku: firstVariantSku,
-          action: mutation.action,
-          recordId: mutation.id || null
-        });
-
-        if (mutation.action === "update") {
-          recordsToUpdate.push({
-            id: mutation.id,
-            fields: mutation.fields
-          });
-        } else {
-          recordsToCreate.push(mutation.fields);
-        }
       }
-
+    
       const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
-
-      console.log("TEST Supabase upsert completed", {
+    
+      updated += supabaseRecords.length;
+    
+      console.log("TEST Supabase product completed", {
         product: fullProduct.title,
-        rows: supabaseRecords.length
-      });
-      
-      const updatedRecords = await batchUpdateAirtableRecords(
-        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-        recordsToUpdate
-      );
-      
-      const createdRecords = await batchCreateAirtableRecords(
-        AIRTABLE_STORE_LISTINGS_TABLE_NAME,
-        recordsToCreate
-      );
-
-      updated += updatedRecords.length;
-      created += createdRecords.length;
-
-      console.log("TEST batch result:", {
-        product: fullProduct.title,
-        updated: updatedRecords.length,
-        created: createdRecords.length,
-        duplicatesDeleted
+        rows: supabaseRecords.length,
+        retailedStatus,
+        matchRiskLevel: productMatchRiskLevel,
+        riskyAction: riskyResult.action
       });
     }
-
     await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
       "Last Sync ID": syncId,
       "Last Shopify Sync At": new Date().toISOString()
@@ -1448,9 +1076,10 @@ app.get("/run-test", async (_req, res) => {
       variantsProcessed,
       created,
       updated,
-      duplicatesDeleted: duplicatesDeletedTotal
+      duplicatesDeleted: duplicatesDeletedTotal,
+      riskyCreated,
+      riskyUpdated
     });
-
   } catch (error) {
     console.error("Test run error:", error);
 
