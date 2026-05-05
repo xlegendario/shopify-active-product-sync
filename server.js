@@ -1002,7 +1002,7 @@ app.get("/run-test", async (_req, res) => {
 
     const products = await fetchActiveProducts(merchant);
     const testProducts = products.slice(0, 5);
-
+    
     const existingRiskyRecords = await fetchAllAirtableRecords(
       AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
       `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
@@ -1016,21 +1016,7 @@ app.get("/run-test", async (_req, res) => {
         riskyMap.set(String(productId), record);
       }
     }
-
-    const existingRiskyRecords = await fetchAllAirtableRecords(
-      AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
-      `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
-    );
     
-    const riskyMap = new Map();
-    
-    for (const record of existingRiskyRecords) {
-      const productId = record.fields["Shopify Product ID"];
-      if (productId) {
-        riskyMap.set(String(productId), record);
-      }
-    }
-
     let variantsProcessed = 0;
     let created = 0;
     let updated = 0;
