@@ -1320,14 +1320,41 @@ app.get("/run-test", async (_req, res) => {
 
       let retailed = null;
       let retailedStatus = "ok";
-
-      if (!allVariantsExist || needsRetailedRetry) {
-        retailed = await searchRetailed(retailedQuery);
-
-        if (!retailedQuery) retailedStatus = "not_found";
-        else if (!retailed) retailedStatus = "failed";
+      
+      // In test mode always fetch Retailed so Supabase + Risky Product Matches are tested properly
+      retailed = await searchRetailed(retailedQuery);
+      
+      if (!retailedQuery) {
+        retailedStatus = "not_found";
+      } else if (!retailed) {
+        retailedStatus = "failed";
       }
-
+      
+      const stockxProductName = buildStockxName(retailed);
+      
+      const productMatchRiskLevel = calculateMatchRisk({
+        sku: firstVariantSku,
+        shopifyProductName: fullProduct.title || "",
+        stockxProductName
+      });
+      
+      const riskyResult = await upsertRiskyProductMatch({
+        merchant,
+        product: fullProduct,
+        productSku: firstVariantSku,
+        retailed,
+        retailedStatus,
+        matchRiskLevel: productMatchRiskLevel
+      });
+      
+      console.log("TEST risky product match result:", {
+        product: fullProduct.title,
+        action: riskyResult.action,
+        recordId: riskyResult.recordId || null,
+        matchRiskLevel: productMatchRiskLevel,
+        retailedStatus
+      });
+      
       const recordsToCreate = [];
       const recordsToUpdate = [];
       const supabaseRows = [];
