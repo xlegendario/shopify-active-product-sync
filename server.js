@@ -39,6 +39,12 @@ const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || "15000", 10);
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
+console.log("SUPABASE CONFIG", {
+  url: SUPABASE_URL,
+  hasKey: Boolean(SUPABASE_SERVICE_ROLE_KEY),
+  keyPrefix: SUPABASE_SERVICE_ROLE_KEY.slice(0, 10)
+});
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 let isSyncRunning = false;
