@@ -1125,6 +1125,27 @@ app.get("/run-test", async (_req, res) => {
   }
 });
 
+app.get("/apply-risky-corrections", async (_req, res) => {
+  try {
+    assertEnv();
+
+    const correctedRows = await applyPendingRiskyCorrections();
+
+    res.json({
+      success: true,
+      message: "Pending risky corrections applied",
+      correctedRows
+    });
+  } catch (error) {
+    console.error("Apply risky corrections error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
