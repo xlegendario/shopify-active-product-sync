@@ -298,6 +298,7 @@ async function upsertRiskyProductMatch({
   }
 
   const fields = {
+    "Client": [merchant.recordId],
     "Merchant Record ID": merchant.recordId,
     "Shopify Product ID": productId,
     "Shopify Product Name": product.title || "",
