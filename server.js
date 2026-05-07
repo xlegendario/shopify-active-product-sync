@@ -564,13 +564,38 @@ function buildStockxName(retailed) {
 
 function calculateMatchRisk({ sku, shopifyProductName, stockxProductName }) {
   function clean(str) {
-    return String(str || "")
-      .toLowerCase()
-      .replace(/[\(\)\[\]'"]/g, "")
-      .replace(/\bwomens\b/g, "w")
-      .replace(/\bmen's\b/g, "m")
-      .replace(/\s+/g, " ")
-      .trim();
+      return (str || "")
+          .toLowerCase()
+  
+          // remove brackets / quotes
+          .replace(/[\(\)\[\]'"]/g, "")
+  
+          // normalize gender tags
+          .replace(/\bwomens\b/g, "w")
+          .replace(/\bwomen\b/g, "w")
+          .replace(/\bmens\b/g, "m")
+          .replace(/\bmen\b/g, "m")
+  
+          // remove common sneaker noise words
+          .replace(/\bnike air\b/g, "")
+          .replace(/\bair jordan\b/g, "jordan")
+          .replace(/\bretro\b/g, "")
+          .replace(/\bog\b/g, "")
+          .replace(/\bgs\b/g, "")
+          .replace(/\bps\b/g, "")
+          .replace(/\btd\b/g, "")
+          .replace(/\bse\b/g, "")
+          .replace(/\bess\b/g, "")
+          .replace(/\bprm\b/g, "")
+          .replace(/\bsp\b/g, "")
+  
+          // remove punctuation leftovers
+          .replace(/[-_/]/g, " ")
+  
+          // collapse spaces
+          .replace(/\s+/g, " ")
+  
+          .trim();
   }
 
   if (!sku || !String(sku).trim()) return "High";
