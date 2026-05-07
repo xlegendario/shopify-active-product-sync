@@ -1087,6 +1087,7 @@ app.get("/run-test", async (_req, res) => {
 
     let riskyCreated = 0;
     let riskyUpdated = 0;
+    let retailedMisses = 0;
     
     for (const product of testProducts) {
       const fullProduct = product;
