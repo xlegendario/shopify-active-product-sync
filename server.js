@@ -724,6 +724,24 @@ function extractSize(value) {
   return match[0].replace(",", ".");
 }
 
+async function fetchExistingSupabaseProduct({ merchant, product }) {
+  const productId = String(product.legacyResourceId || getNumericId(product.id));
+
+  const { data, error } = await supabase
+    .from("store_listings")
+    .select("stockx_product_name, brand, picture_url, retailed_status, match_risk_level")
+    .eq("merchant_record_id", merchant.recordId)
+    .eq("shopify_product_id", productId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Supabase existing product lookup error: ${error.message}`);
+  }
+
+  return data || null;
+}
+
 async function syncMerchant(merchant, runId) {
   const syncId = `${runId}_${merchant.recordId}`;
 
@@ -771,15 +789,41 @@ async function syncMerchant(merchant, runId) {
   
       let retailed = null;
       let retailedStatus = "ok";
-  
-      retailed = await searchRetailed(retailedQuery);
-  
-      if (!retailedQuery) {
-        retailedStatus = "not_found";
-        retailedMisses += 1;
-      } else if (!retailed) {
-        retailedStatus = "failed";
-        retailedMisses += 1;
+      
+      const existingSupabaseProduct = await fetchExistingSupabaseProduct({
+        merchant,
+        product: fullProduct
+      });
+      
+      const canSkipRetailed =
+        existingSupabaseProduct &&
+        existingSupabaseProduct.retailed_status === "ok" &&
+        existingSupabaseProduct.stockx_product_name &&
+        existingSupabaseProduct.picture_url;
+      
+      if (canSkipRetailed) {
+        retailed = {
+          name: existingSupabaseProduct.stockx_product_name,
+          colorway: "",
+          brand: existingSupabaseProduct.brand || "",
+          image: existingSupabaseProduct.picture_url || ""
+        };
+      
+        retailedStatus = "ok";
+      
+        console.log("Skipping Retailed lookup, using Supabase cache", {
+          product: fullProduct.title
+        });
+      } else {
+        retailed = await searchRetailed(retailedQuery);
+      
+        if (!retailedQuery) {
+          retailedStatus = "not_found";
+          retailedMisses += 1;
+        } else if (!retailed) {
+          retailedStatus = "failed";
+          retailedMisses += 1;
+        }
       }
   
       const stockxProductName = buildStockxName(retailed);
@@ -1053,13 +1097,41 @@ app.get("/run-test", async (_req, res) => {
     
       let retailed = null;
       let retailedStatus = "ok";
-    
-      retailed = await searchRetailed(retailedQuery);
-    
-      if (!retailedQuery) {
-        retailedStatus = "not_found";
-      } else if (!retailed) {
-        retailedStatus = "failed";
+      
+      const existingSupabaseProduct = await fetchExistingSupabaseProduct({
+        merchant,
+        product: fullProduct
+      });
+      
+      const canSkipRetailed =
+        existingSupabaseProduct &&
+        existingSupabaseProduct.retailed_status === "ok" &&
+        existingSupabaseProduct.stockx_product_name &&
+        existingSupabaseProduct.picture_url;
+      
+      if (canSkipRetailed) {
+        retailed = {
+          name: existingSupabaseProduct.stockx_product_name,
+          colorway: "",
+          brand: existingSupabaseProduct.brand || "",
+          image: existingSupabaseProduct.picture_url || ""
+        };
+      
+        retailedStatus = "ok";
+      
+        console.log("Skipping Retailed lookup, using Supabase cache", {
+          product: fullProduct.title
+        });
+      } else {
+        retailed = await searchRetailed(retailedQuery);
+      
+        if (!retailedQuery) {
+          retailedStatus = "not_found";
+          retailedMisses += 1;
+        } else if (!retailed) {
+          retailedStatus = "failed";
+          retailedMisses += 1;
+        }
       }
     
       const stockxProductName = buildStockxName(retailed);
