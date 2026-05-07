@@ -230,9 +230,16 @@ function getRiskIssue({ sku, retailedStatus, matchRiskLevel, pictureUrl }) {
   const issueTypes = [];
   const issueNotes = [];
 
-  if (!sku || !String(sku).trim()) {
+  const hasSku = Boolean(sku && String(sku).trim());
+
+  if (!hasSku) {
     issueTypes.push("Missing SKU");
     issueNotes.push("SKU is missing.");
+
+    if (matchRiskLevel !== "Low") {
+      issueTypes.push(`${matchRiskLevel} Risk Match`);
+      issueNotes.push(`Match risk level is ${matchRiskLevel}.`);
+    }
   }
 
   if (retailedStatus !== "ok") {
@@ -240,11 +247,6 @@ function getRiskIssue({ sku, retailedStatus, matchRiskLevel, pictureUrl }) {
       retailedStatus === "not_found" ? "Retailed Not Found" : "Retailed Failed"
     );
     issueNotes.push(`Retailed status is ${retailedStatus}.`);
-  }
-
-  if (matchRiskLevel !== "Low") {
-    issueTypes.push(`${matchRiskLevel} Risk Match`);
-    issueNotes.push(`Match risk level is ${matchRiskLevel}.`);
   }
 
   if (!pictureUrl) {
@@ -598,7 +600,7 @@ function calculateMatchRisk({ sku, shopifyProductName, stockxProductName }) {
           .trim();
   }
 
-  if (!sku || !String(sku).trim()) return "High";
+  if (sku && String(sku).trim()) return "Low";
 
   const productA = clean(shopifyProductName);
   const productB = clean(stockxProductName);
