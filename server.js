@@ -564,45 +564,34 @@ function buildStockxName(retailed) {
     .trim();
 }
 
-function calculateMatchRisk({ sku, shopifyProductName, stockxProductName }) {
+function calculateMatchRisk({ sku, shopifyProductName, stockxProductName, brand }) {
   function clean(str) {
-      return (str || "")
-          .toLowerCase()
-  
-          // remove brackets / quotes
-          .replace(/[\(\)\[\]'"]/g, "")
-  
-          // normalize gender tags
-          .replace(/\bwomens\b/g, "w")
-          .replace(/\bwomen\b/g, "w")
-          .replace(/\bmens\b/g, "m")
-          .replace(/\bmen\b/g, "m")
-  
-          // remove common sneaker noise words
-          .replace(/\bnike air\b/g, "")
-          .replace(/\bair jordan\b/g, "jordan")
-          .replace(/\bretro\b/g, "")
-          .replace(/\bog\b/g, "")
-          .replace(/\bgs\b/g, "")
-          .replace(/\bps\b/g, "")
-          .replace(/\btd\b/g, "")
-          .replace(/\bse\b/g, "")
-          .replace(/\bess\b/g, "")
-          .replace(/\bprm\b/g, "")
-          .replace(/\bsp\b/g, "")
-  
-          // remove punctuation leftovers
-          .replace(/[-_/]/g, " ")
-  
-          // collapse spaces
-          .replace(/\s+/g, " ")
-  
-          .trim();
+    return String(str || "")
+      .toLowerCase()
+      .replace(/[\(\)\[\]'"]/g, "")
+      .replace(/\bwomens\b/g, "w")
+      .replace(/\bmen's\b/g, "m")
+      .replace(/\bnike air\b/g, "")
+      .replace(/\bair jordan\b/g, "jordan")
+      .replace(/\bretro\b/g, "")
+      .replace(/[-_/]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
-  if (sku && String(sku).trim()) return "Low";
+  const hasSku = Boolean(sku && String(sku).trim());
+  const cleanedShopifyName = clean(shopifyProductName);
+  const cleanedBrand = clean(brand);
 
-  const productA = clean(shopifyProductName);
+  if (hasSku) {
+    if (cleanedBrand && !cleanedShopifyName.includes(cleanedBrand)) {
+      return "High";
+    }
+
+    return "Low";
+  }
+
+  const productA = cleanedShopifyName;
   const productB = clean(stockxProductName);
 
   if (!productA || !productB) return "High";
@@ -649,7 +638,8 @@ function mapToSupabaseStoreListing({
   const matchRiskLevel = calculateMatchRisk({
     sku: productSku,
     shopifyProductName: product.title || "",
-    stockxProductName
+    stockxProductName,
+    brand: retailed?.brand || ""
   });
 
   return {
@@ -797,7 +787,8 @@ async function syncMerchant(merchant, runId) {
       const productMatchRiskLevel = calculateMatchRisk({
         sku: firstVariantSku,
         shopifyProductName: fullProduct.title || "",
-        stockxProductName
+        stockxProductName,
+        brand: retailed?.brand || ""
       });
   
       const riskyResult = await upsertRiskyProductMatch({
@@ -1076,7 +1067,8 @@ app.get("/run-test", async (_req, res) => {
       const productMatchRiskLevel = calculateMatchRisk({
         sku: firstVariantSku,
         shopifyProductName: fullProduct.title || "",
-        stockxProductName
+        stockxProductName,
+        brand: retailed?.brand || ""
       });
     
       const riskyResult = await upsertRiskyProductMatch({
