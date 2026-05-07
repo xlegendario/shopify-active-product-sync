@@ -1150,6 +1150,90 @@ app.get("/run-test", async (_req, res) => {
   }
 });
 
+async function applyPendingRiskyCorrections() {
+  const formula = `AND(
+    {Match Risk Level} = 'Low',
+    OR(
+      {Correction Synced?} = FALSE(),
+      {Correction Synced?} = BLANK()
+    )
+  )`;
+
+  const records = await fetchAllAirtableRecords(
+    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+    formula
+  );
+
+  console.log("Pending risky corrections:", records.length);
+
+  let updatedRows = 0;
+
+  for (const record of records) {
+    const fields = record.fields || {};
+
+    const merchantRecordId = fields["Merchant Record ID"];
+    const shopifyProductId = String(fields["Shopify Product ID"] || "");
+
+    if (!merchantRecordId || !shopifyProductId) continue;
+
+    const pictureUrl =
+      Array.isArray(fields.Picture) && fields.Picture[0]
+        ? fields.Picture[0].url
+        : "";
+
+    const updateFields = {
+      match_risk_level: "Low",
+      retailed_status: "ok",
+      updated_at: new Date().toISOString()
+    };
+
+    if (fields["StockX Product Name"]) {
+      updateFields.stockx_product_name = fields["StockX Product Name"];
+    }
+
+    if (fields.Brand) {
+      updateFields.brand = fields.Brand;
+    }
+
+    if (fields.SKU) {
+      updateFields.sku = fields.SKU;
+    }
+
+    if (pictureUrl) {
+      updateFields.picture_url = pictureUrl;
+    }
+
+    const { data, error } = await supabase
+      .from("store_listings")
+      .update(updateFields)
+      .eq("merchant_record_id", merchantRecordId)
+      .eq("shopify_product_id", shopifyProductId)
+      .select("id");
+
+    if (error) {
+      throw new Error(`Supabase correction update error: ${error.message}`);
+    }
+
+    updatedRows += data?.length || 0;
+
+    await updateAirtableRecord(
+      AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+      record.id,
+      {
+        "Correction Synced?": true,
+        "Last Sent To Supabase At": new Date().toISOString()
+      }
+    );
+
+    console.log("Applied risky correction", {
+      productId: shopifyProductId,
+      updated: data?.length || 0
+    });
+  }
+
+  return updatedRows;
+}
+
 app.get("/apply-risky-corrections", async (_req, res) => {
   try {
     assertEnv();
