@@ -307,6 +307,7 @@ async function upsertRiskyProductMatch({
     "StockX Product Name": stockxProductName,
     "Brand": retailed?.brand || "",
     "SKU": productSku || "",
+    "SKU (Soft)": !productSku && retailed?.sku ? retailed.sku : "",
     "Match Risk Level": matchRiskLevel,
     "Retailed Status": retailedStatus,
     "Issue Type": riskIssue.issueTypes,
@@ -540,6 +541,7 @@ async function searchRetailed(query) {
     if (!first) return null;
 
     return {
+      sku: first.sku || "",
       name: first.name || "",
       colorway: first.colorway || "",
       brand: first.brand || "",
@@ -1214,6 +1216,8 @@ async function applyPendingRiskyCorrections() {
 
     if (fields.SKU) {
       updateFields.sku = fields.SKU;
+    } else if (fields["SKU (Soft)"]) {
+      updateFields.sku = fields["SKU (Soft)"];
     }
 
     if (pictureUrl) {
