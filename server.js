@@ -564,64 +564,14 @@ function buildStockxName(retailed) {
     .trim();
 }
 
-function calculateMatchRisk({ sku, shopifyProductName, stockxProductName, brand }) {
-  function clean(str) {
-    return String(str || "")
-      .toLowerCase()
-      .replace(/[\(\)\[\]'"]/g, "")
-      .replace(/\bwomens\b/g, "w")
-      .replace(/\bmen's\b/g, "m")
-      .replace(/\bnike air\b/g, "")
-      .replace(/\bair jordan\b/g, "jordan")
-      .replace(/\bretro\b/g, "")
-      .replace(/[-_/]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
+function calculateMatchRisk({ sku }) {
   const hasSku = Boolean(sku && String(sku).trim());
-  const cleanedShopifyName = clean(shopifyProductName);
-  const cleanedBrand = clean(brand);
 
-  if (hasSku) {
-    if (cleanedBrand && !cleanedShopifyName.includes(cleanedBrand)) {
-      return "High";
-    }
-
-    return "Low";
+  if (!hasSku) {
+    return "High";
   }
 
-  const productA = cleanedShopifyName;
-  const productB = clean(stockxProductName);
-
-  if (!productA || !productB) return "High";
-
-  function levenshtein(a, b) {
-    const m = a.length;
-    const n = b.length;
-    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-
-    for (let i = 0; i <= m; i += 1) dp[i][0] = i;
-    for (let j = 0; j <= n; j += 1) dp[0][j] = j;
-
-    for (let i = 1; i <= m; i += 1) {
-      for (let j = 1; j <= n; j += 1) {
-        dp[i][j] = Math.min(
-          dp[i - 1][j] + 1,
-          dp[i][j - 1] + 1,
-          dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
-        );
-      }
-    }
-
-    return dp[m][n];
-  }
-
-  const distance = levenshtein(productA, productB);
-
-  if (distance <= 5) return "Low";
-  if (distance <= 10) return "Medium";
-  return "High";
+  return "Low";
 }
 
 function mapToSupabaseStoreListing({
