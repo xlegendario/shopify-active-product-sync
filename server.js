@@ -625,24 +625,22 @@ function mapToSupabaseStoreListing({
 async function upsertStoreListingsSupabase(rows) {
   if (!rows.length) return [];
 
-  const upserted = [];
+  let affected = 0;
 
   for (const chunk of chunkArray(rows, 500)) {
-    const { data, error } = await supabase
-      .from("store_listings")
-      .upsert(chunk, {
-        onConflict: "merchant_record_id,shopify_product_id,shopify_variant_id"
-      })
-      .select("id");
+    const { error } = await supabase.rpc(
+      "upsert_store_listings_keep_sku",
+      { rows: chunk }
+    );
 
     if (error) {
       throw new Error(`Supabase upsert error: ${error.message}`);
     }
 
-    upserted.push(...(data || []));
+    affected += chunk.length;
   }
 
-  return upserted;
+  return Array.from({ length: affected }, (_, i) => ({ id: i }));
 }
 
 async function deactivateOldListingsSupabase(merchant, syncId) {
