@@ -30,6 +30,15 @@ const AIRTABLE_SHOPIFY_URL_FIELD =
 const AIRTABLE_SHOPIFY_TOKEN_FIELD =
   process.env.AIRTABLE_SHOPIFY_TOKEN_FIELD || "Shopify Token";
 
+const AIRTABLE_SHOPIFY_LOCATION_ID_FIELD =
+  process.env.AIRTABLE_SHOPIFY_LOCATION_ID_FIELD || "Shopify Location ID";
+
+const AIRTABLE_STOCK_SYNC_FIELD =
+  process.env.AIRTABLE_STOCK_SYNC_FIELD || "Stock Sync?";
+
+const AIRTABLE_STOCK_LEVELS_TABLE_NAME =
+  process.env.AIRTABLE_STOCK_LEVELS_TABLE_NAME || "Stock Levels";
+
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
 
@@ -407,6 +416,252 @@ async function shopifyGraphQL(merchant, query, variables = {}) {
   }
 
   return data;
+}
+
+function toShopifyGid(type, id) {
+  const cleanId = String(id || "").trim();
+
+  if (!cleanId) return "";
+
+  if (cleanId.startsWith("gid://shopify/")) {
+    return cleanId;
+  }
+
+  return `gid://shopify/${type}/${cleanId}`;
+}
+
+function normalizeStockKey(sku, size) {
+  return `${String(sku || "").trim().toUpperCase()}|||${String(size || "").trim().toUpperCase()}`;
+}
+
+function numberFromAirtable(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function fetchStockSyncMerchants() {
+  const formula = `{${AIRTABLE_STOCK_SYNC_FIELD}} = 1`;
+
+  const records = await fetchAllAirtableRecords(
+    AIRTABLE_MERCHANTS_TABLE_NAME,
+    formula
+  );
+
+  const merchants = [];
+
+  for (const record of records) {
+    const fields = record.fields || {};
+
+    const rawShopifyUrl = fields[AIRTABLE_SHOPIFY_URL_FIELD];
+    const shopifyToken = fields[AIRTABLE_SHOPIFY_TOKEN_FIELD];
+    const shopifyDomain = normalizeShopifyDomain(rawShopifyUrl);
+    const locationId = String(fields[AIRTABLE_SHOPIFY_LOCATION_ID_FIELD] || "").trim();
+    const storeName = String(fields["Store Name"] || "").trim();
+
+    if (!shopifyDomain || !shopifyToken || !locationId || !storeName) {
+      console.warn("Skipping stock sync merchant missing required fields", {
+        recordId: record.id,
+        storeName,
+        hasShopifyDomain: Boolean(shopifyDomain),
+        hasToken: Boolean(shopifyToken),
+        hasLocationId: Boolean(locationId)
+      });
+      continue;
+    }
+
+    merchants.push({
+      recordId: record.id,
+      name: storeName,
+      shopifyDomain,
+      shopifyToken,
+      locationId,
+      locationGid: toShopifyGid("Location", locationId)
+    });
+  }
+
+  return merchants;
+}
+
+async function fetchStockLevelRows() {
+  const records = await fetchAllAirtableRecords(
+    AIRTABLE_STOCK_LEVELS_TABLE_NAME
+  );
+
+  return records
+    .map((record) => {
+      const fields = record.fields || {};
+
+      return {
+        recordId: record.id,
+        sku: String(fields["SKU"] || "").trim().toUpperCase(),
+        size: String(fields["Size"] || "").trim(),
+        stockLevel: numberFromAirtable(fields["Stock Level"])
+      };
+    })
+    .filter((row) => row.sku && row.size);
+}
+
+async function fetchAllStoreListingsForMerchant(merchantName) {
+  const allRows = [];
+  const pageSize = 1000;
+
+  for (let from = 0; ; from += pageSize) {
+    const to = from + pageSize - 1;
+
+    const { data, error } = await supabase
+      .from("store_listings")
+      .select(`
+        id,
+        merchant_name,
+        sku,
+        size,
+        shopify_variant_id,
+        shopify_inventory_item_id,
+        status
+      `)
+      .eq("merchant_name", merchantName)
+      .eq("status", "active")
+      .not("sku", "is", null)
+      .not("shopify_inventory_item_id", "is", null)
+      .range(from, to);
+
+    if (error) {
+      throw new Error(`Supabase store_listings lookup error: ${error.message}`);
+    }
+
+    allRows.push(...(data || []));
+
+    if (!data || data.length < pageSize) {
+      break;
+    }
+  }
+
+  return allRows;
+}
+
+async function shopifyInventoryItemUpdateTracked(merchant, inventoryItemGid) {
+  const mutation = `
+    mutation InventoryItemUpdate($id: ID!) {
+      inventoryItemUpdate(input: {
+        id: $id,
+        tracked: true
+      }) {
+        inventoryItem {
+          id
+          tracked
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(merchant, mutation, {
+    id: inventoryItemGid
+  });
+
+  const errors =
+    result.data?.inventoryItemUpdate?.userErrors || [];
+
+  if (errors.length) {
+    throw new Error(`inventoryItemUpdate errors: ${JSON.stringify(errors)}`);
+  }
+
+  return result.data.inventoryItemUpdate.inventoryItem;
+}
+
+async function shopifyInventoryActivate(merchant, inventoryItemGid, available) {
+  const mutation = `
+    mutation ActivateInventoryItem(
+      $inventoryItemId: ID!,
+      $locationId: ID!,
+      $available: Int
+    ) {
+      inventoryActivate(
+        inventoryItemId: $inventoryItemId,
+        locationId: $locationId,
+        available: $available
+      ) {
+        inventoryLevel {
+          id
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(merchant, mutation, {
+    inventoryItemId: inventoryItemGid,
+    locationId: merchant.locationGid,
+    available
+  });
+
+  const errors =
+    result.data?.inventoryActivate?.userErrors || [];
+
+  if (errors.length) {
+    const message = JSON.stringify(errors);
+
+    if (
+      message.toLowerCase().includes("already") ||
+      message.toLowerCase().includes("active")
+    ) {
+      return {
+        alreadyActive: true
+      };
+    }
+
+    throw new Error(`inventoryActivate errors: ${message}`);
+  }
+
+  return {
+    alreadyActive: false
+  };
+}
+
+async function shopifyInventorySetQuantities(merchant, quantities) {
+  if (!quantities.length) {
+    return null;
+  }
+
+  const mutation = `
+    mutation InventorySetQuantities($input: InventorySetQuantitiesInput!) {
+      inventorySetQuantities(input: $input) {
+        inventoryAdjustmentGroup {
+          createdAt
+          reason
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(merchant, mutation, {
+    input: {
+      name: "available",
+      reason: "correction",
+      ignoreCompareQuantity: true,
+      quantities
+    }
+  });
+
+  const errors =
+    result.data?.inventorySetQuantities?.userErrors || [];
+
+  if (errors.length) {
+    throw new Error(`inventorySetQuantities errors: ${JSON.stringify(errors)}`);
+  }
+
+  return result.data.inventorySetQuantities.inventoryAdjustmentGroup;
 }
 
 async function fetchActiveProducts(merchant) {
@@ -912,6 +1167,194 @@ async function syncAllMerchants() {
   };
 }
 
+async function pushStockLevelsToShopify({
+  dryRun = false,
+  activateInventory = true,
+  setTracked = true
+} = {}) {
+  assertEnv();
+
+  const runId = `stock_push_${new Date().toISOString()}`;
+  const merchants = await fetchStockSyncMerchants();
+  const stockLevelRows = await fetchStockLevelRows();
+
+  const stockMap = new Map();
+
+  for (const stock of stockLevelRows) {
+    stockMap.set(
+      normalizeStockKey(stock.sku, stock.size),
+      stock
+    );
+  }
+
+  const results = [];
+
+  for (const merchant of merchants) {
+    console.log("Starting stock level push merchant", {
+      merchant: merchant.name,
+      recordId: merchant.recordId,
+      dryRun
+    });
+
+    const listings = await fetchAllStoreListingsForMerchant(merchant.name);
+
+    const updates = [];
+
+    for (const listing of listings) {
+      const key = normalizeStockKey(listing.sku, listing.size);
+      const stock = stockMap.get(key);
+
+      if (!stock) continue;
+
+      const inventoryItemId = String(listing.shopify_inventory_item_id || "").trim();
+
+      if (!inventoryItemId) continue;
+
+      updates.push({
+        listing_id: listing.id,
+        sku: listing.sku,
+        size: listing.size,
+        shopify_variant_id: listing.shopify_variant_id,
+        shopify_inventory_item_id: inventoryItemId,
+        inventoryItemGid: toShopifyGid("InventoryItem", inventoryItemId),
+        available: Math.max(0, Math.floor(Number(stock.stockLevel || 0)))
+      });
+    }
+
+    if (dryRun) {
+      results.push({
+        merchantRecordId: merchant.recordId,
+        merchantName: merchant.name,
+        listingsScanned: listings.length,
+        updatesFound: updates.length,
+        sample: updates.slice(0, 10).map((item) => ({
+          sku: item.sku,
+          size: item.size,
+          available: item.available,
+          shopify_inventory_item_id: item.shopify_inventory_item_id
+        }))
+      });
+
+      continue;
+    }
+
+    let trackedUpdated = 0;
+    let activated = 0;
+    let setQuantity = 0;
+    let failed = 0;
+    const errors = [];
+
+    const uniqueByInventoryItem = new Map();
+
+    for (const update of updates) {
+      uniqueByInventoryItem.set(update.shopify_inventory_item_id, update);
+    }
+
+    if (setTracked || activateInventory) {
+      for (const update of uniqueByInventoryItem.values()) {
+        try {
+          if (setTracked) {
+            await shopifyInventoryItemUpdateTracked(
+              merchant,
+              update.inventoryItemGid
+            );
+
+            trackedUpdated += 1;
+          }
+
+          if (activateInventory) {
+            await shopifyInventoryActivate(
+              merchant,
+              update.inventoryItemGid,
+              update.available
+            );
+
+            activated += 1;
+          }
+        } catch (error) {
+          failed += 1;
+
+          errors.push({
+            sku: update.sku,
+            size: update.size,
+            inventory_item_id: update.shopify_inventory_item_id,
+            stage: "activate_or_track",
+            error: error.message
+          });
+
+          console.error("Stock push activate/track failed", {
+            merchant: merchant.name,
+            update,
+            error: error.message
+          });
+        }
+
+        await sleep(150);
+      }
+    }
+
+    const quantityInputs = updates.map((update) => ({
+      inventoryItemId: update.inventoryItemGid,
+      locationId: merchant.locationGid,
+      name: "available",
+      quantity: update.available
+    }));
+
+    for (const chunk of chunkArray(quantityInputs, 100)) {
+      try {
+        await shopifyInventorySetQuantities(merchant, chunk);
+
+        setQuantity += chunk.length;
+      } catch (error) {
+        failed += chunk.length;
+
+        errors.push({
+          stage: "set_quantities",
+          count: chunk.length,
+          error: error.message
+        });
+
+        console.error("Stock push set quantities failed", {
+          merchant: merchant.name,
+          count: chunk.length,
+          error: error.message
+        });
+      }
+
+      await sleep(500);
+    }
+
+    results.push({
+      merchantRecordId: merchant.recordId,
+      merchantName: merchant.name,
+      listingsScanned: listings.length,
+      updatesFound: updates.length,
+      uniqueInventoryItems: uniqueByInventoryItem.size,
+      trackedUpdated,
+      activated,
+      setQuantity,
+      failed,
+      errors: errors.slice(0, 25)
+    });
+
+    await updateAirtableRecord(
+      AIRTABLE_MERCHANTS_TABLE_NAME,
+      merchant.recordId,
+      {
+        "Last Stock Push At": new Date().toISOString()
+      }
+    );
+  }
+
+  return {
+    runId,
+    dryRun,
+    merchantsProcessed: results.length,
+    stockLevelsScanned: stockLevelRows.length,
+    results
+  };
+}
+
 app.get("/", (_req, res) => {
   res.json({
     success: true,
@@ -1271,6 +1714,55 @@ app.get("/apply-risky-corrections", async (_req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+
+app.get("/run-stock-level-push", async (req, res) => {
+  if (isSyncRunning) {
+    return res.status(409).json({
+      success: false,
+      message: "Sync is already running",
+      activeSyncStartedAt
+    });
+  }
+
+  isSyncRunning = true;
+  activeSyncStartedAt = new Date().toISOString();
+
+  try {
+    const dryRun =
+      String(req.query.dry_run || "").toLowerCase() === "true" ||
+      String(req.query.dry_run || "") === "1";
+
+    const activateInventory =
+      String(req.query.activate || "true").toLowerCase() !== "false";
+
+    const setTracked =
+      String(req.query.tracked || "true").toLowerCase() !== "false";
+
+    const result = await pushStockLevelsToShopify({
+      dryRun,
+      activateInventory,
+      setTracked
+    });
+
+    res.json({
+      success: true,
+      message: dryRun
+        ? "Stock level push dry run completed"
+        : "Stock levels pushed to Shopify",
+      ...result
+    });
+  } catch (error) {
+    console.error("Stock level push error:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  } finally {
+    isSyncRunning = false;
+    activeSyncStartedAt = null;
   }
 });
 
