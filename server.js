@@ -34,7 +34,7 @@ const AIRTABLE_SHOPIFY_LOCATION_ID_FIELD =
   process.env.AIRTABLE_SHOPIFY_LOCATION_ID_FIELD || "Shopify Location ID";
 
 const AIRTABLE_STOCK_SYNC_FIELD =
-  process.env.AIRTABLE_STOCK_SYNC_FIELD || "Stock Sync?";
+  process.env.AIRTABLE_STOCK_SYNC_FIELD || "Sync Stock?";
 
 const AIRTABLE_STOCK_LEVELS_TABLE_NAME =
   process.env.AIRTABLE_STOCK_LEVELS_TABLE_NAME || "Stock Levels";
