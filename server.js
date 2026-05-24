@@ -1298,7 +1298,6 @@ async function pushStockLevelsToShopify({
     const quantityInputs = updates.map((update) => ({
       inventoryItemId: update.inventoryItemGid,
       locationId: merchant.locationGid,
-      name: "available",
       quantity: update.available
     }));
 
@@ -1338,14 +1337,6 @@ async function pushStockLevelsToShopify({
       failed,
       errors: errors.slice(0, 25)
     });
-
-    await updateAirtableRecord(
-      AIRTABLE_MERCHANTS_TABLE_NAME,
-      merchant.recordId,
-      {
-        "Last Stock Push At": new Date().toISOString()
-      }
-    );
   }
 
   return {
