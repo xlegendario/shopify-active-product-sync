@@ -543,10 +543,12 @@ async function fetchAllStoreListingsForMerchant(merchantName) {
 async function shopifyInventoryItemUpdateTracked(merchant, inventoryItemGid) {
   const mutation = `
     mutation InventoryItemUpdate($id: ID!) {
-      inventoryItemUpdate(input: {
+      inventoryItemUpdate(
         id: $id,
-        tracked: true
-      }) {
+        input: {
+          tracked: true
+        }
+      ) {
         inventoryItem {
           id
           tracked
