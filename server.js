@@ -1201,6 +1201,7 @@ async function pushStockLevelsToShopify({
     const listings = await fetchAllStoreListingsForMerchant(merchant.name);
 
     const updates = [];
+    const MAX_TEST_UPDATES = 10;
 
     for (const listing of listings) {
       const key = normalizeStockKey(listing.sku, listing.size);
@@ -1220,6 +1221,15 @@ async function pushStockLevelsToShopify({
         shopify_inventory_item_id: inventoryItemId,
         inventoryItemGid: toShopifyGid("InventoryItem", inventoryItemId),
         available: Math.max(0, Math.floor(Number(stock.stockLevel || 0)))
+      });
+    }
+    
+    if (!dryRun && MAX_TEST_UPDATES) {
+      updates.splice(MAX_TEST_UPDATES);
+    
+      console.log("TEST LIMIT ACTIVE", {
+        merchant: merchant.name,
+        updatesLimitedTo: updates.length
       });
     }
 
@@ -1253,7 +1263,17 @@ async function pushStockLevelsToShopify({
     }
 
     if (setTracked || activateInventory) {
+      console.log("Starting activate/tracked phase", {
+        merchant: merchant.name,
+        count: uniqueByInventoryItem.size
+      });
+    
       for (const update of uniqueByInventoryItem.values()) {
+        console.log("Activate/tracked item", {
+          sku: update.sku,
+          size: update.size,
+          inventoryItemId: update.shopify_inventory_item_id
+        });
         try {
           if (setTracked) {
             await shopifyInventoryItemUpdateTracked(
@@ -1301,7 +1321,16 @@ async function pushStockLevelsToShopify({
       quantity: update.available
     }));
 
+    console.log("Starting quantity phase", {
+      merchant: merchant.name,
+      count: quantityInputs.length
+    });
+    
     for (const chunk of chunkArray(quantityInputs, 100)) {
+      console.log("Sending quantity batch", {
+        merchant: merchant.name,
+        batchSize: chunk.length
+      });
       try {
         await shopifyInventorySetQuantities(merchant, chunk);
 
