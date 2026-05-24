@@ -1201,7 +1201,6 @@ async function pushStockLevelsToShopify({
     const listings = await fetchAllStoreListingsForMerchant(merchant.name);
 
     const updates = [];
-    const MAX_TEST_UPDATES = 10;
 
     for (const listing of listings) {
       const key = normalizeStockKey(listing.sku, listing.size);
@@ -1221,15 +1220,6 @@ async function pushStockLevelsToShopify({
         shopify_inventory_item_id: inventoryItemId,
         inventoryItemGid: toShopifyGid("InventoryItem", inventoryItemId),
         available: Math.max(0, Math.floor(Number(stock.stockLevel || 0)))
-      });
-    }
-    
-    if (!dryRun && MAX_TEST_UPDATES) {
-      updates.splice(MAX_TEST_UPDATES);
-    
-      console.log("TEST LIMIT ACTIVE", {
-        merchant: merchant.name,
-        updatesLimitedTo: updates.length
       });
     }
 
@@ -1335,6 +1325,11 @@ async function pushStockLevelsToShopify({
         await shopifyInventorySetQuantities(merchant, chunk);
 
         setQuantity += chunk.length;
+        console.log("Quantity batch success", {
+          merchant: merchant.name,
+          batchSize: chunk.length,
+          totalSetQuantity: setQuantity
+        });
       } catch (error) {
         failed += chunk.length;
 
