@@ -949,6 +949,28 @@ async function fetchExistingSupabaseProduct({ merchant, product }) {
   return data || null;
 }
 
+async function fetchExistingSupabaseSkuMaster(productSku) {
+  const sku = String(productSku || "").trim();
+
+  if (!sku) return null;
+
+  const { data, error } = await supabase
+    .from("store_listings")
+    .select("stockx_product_name, brand, picture_url, retailed_status")
+    .eq("sku", sku)
+    .eq("retailed_status", "ok")
+    .not("stockx_product_name", "is", null)
+    .not("picture_url", "is", null)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Supabase SKU master lookup error: ${error.message}`);
+  }
+
+  return data || null;
+}
+
 async function syncMerchant(merchant, runId) {
   const syncId = `${runId}_${merchant.recordId}`;
 
@@ -1002,13 +1024,13 @@ async function syncMerchant(merchant, runId) {
         product: fullProduct
       });
       
-      const canSkipRetailed =
+      const canSkipRetailedFromProduct =
         existingSupabaseProduct &&
         existingSupabaseProduct.retailed_status === "ok" &&
         existingSupabaseProduct.stockx_product_name &&
         existingSupabaseProduct.picture_url;
       
-      if (canSkipRetailed) {
+      if (canSkipRetailedFromProduct) {
         retailed = {
           name: existingSupabaseProduct.stockx_product_name,
           colorway: "",
@@ -1018,18 +1040,36 @@ async function syncMerchant(merchant, runId) {
       
         retailedStatus = "ok";
       
-        console.log("Skipping Retailed lookup, using Supabase cache", {
+        console.log("Skipping Retailed lookup, using same-store Supabase cache", {
           product: fullProduct.title
         });
       } else {
-        retailed = await searchRetailed(retailedQuery);
+        const existingSkuMaster = await fetchExistingSupabaseSkuMaster(firstVariantSku);
       
-        if (!retailedQuery) {
-          retailedStatus = "not_found";
-          retailedMisses += 1;
-        } else if (!retailed) {
-          retailedStatus = "failed";
-          retailedMisses += 1;
+        if (existingSkuMaster) {
+          retailed = {
+            name: existingSkuMaster.stockx_product_name,
+            colorway: "",
+            brand: existingSkuMaster.brand || "",
+            image: existingSkuMaster.picture_url || ""
+          };
+      
+          retailedStatus = "ok";
+      
+          console.log("Skipping Retailed lookup, using SKU master cache", {
+            product: fullProduct.title,
+            sku: firstVariantSku
+          });
+        } else {
+          retailed = await searchRetailed(retailedQuery);
+      
+          if (!retailedQuery) {
+            retailedStatus = "not_found";
+            retailedMisses += 1;
+          } else if (!retailed) {
+            retailedStatus = "failed";
+            retailedMisses += 1;
+          }
         }
       }
   
