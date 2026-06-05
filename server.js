@@ -1554,13 +1554,13 @@ app.get("/run-test", async (_req, res) => {
         product: fullProduct
       });
       
-      const canSkipRetailed =
+      const canSkipRetailedFromProduct =
         existingSupabaseProduct &&
         existingSupabaseProduct.retailed_status === "ok" &&
         existingSupabaseProduct.stockx_product_name &&
         existingSupabaseProduct.picture_url;
       
-      if (canSkipRetailed) {
+      if (canSkipRetailedFromProduct) {
         retailed = {
           name: existingSupabaseProduct.stockx_product_name,
           colorway: "",
@@ -1570,18 +1570,36 @@ app.get("/run-test", async (_req, res) => {
       
         retailedStatus = "ok";
       
-        console.log("Skipping Retailed lookup, using Supabase cache", {
+        console.log("Skipping Retailed lookup, using same-store Supabase cache", {
           product: fullProduct.title
         });
       } else {
-        retailed = await searchRetailed(retailedQuery);
+        const existingSkuMaster = await fetchExistingSupabaseSkuMaster(firstVariantSku);
       
-        if (!retailedQuery) {
-          retailedStatus = "not_found";
-          retailedMisses += 1;
-        } else if (!retailed) {
-          retailedStatus = "failed";
-          retailedMisses += 1;
+        if (existingSkuMaster) {
+          retailed = {
+            name: existingSkuMaster.stockx_product_name,
+            colorway: "",
+            brand: existingSkuMaster.brand || "",
+            image: existingSkuMaster.picture_url || ""
+          };
+      
+          retailedStatus = "ok";
+      
+          console.log("Skipping Retailed lookup, using SKU master cache", {
+            product: fullProduct.title,
+            sku: firstVariantSku
+          });
+        } else {
+          retailed = await searchRetailed(retailedQuery);
+      
+          if (!retailedQuery) {
+            retailedStatus = "not_found";
+            retailedMisses += 1;
+          } else if (!retailed) {
+            retailedStatus = "failed";
+            retailedMisses += 1;
+          }
         }
       }
     
