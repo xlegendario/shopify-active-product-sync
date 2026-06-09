@@ -305,6 +305,21 @@ async function upsertRiskyProductMatch({
   });
 
   if (!riskIssue.isRisky) {
+    const existing = riskyMap?.get(productId) || null;
+  
+    if (existing) {
+      await airtableRequest(
+        `${encodeURIComponent(AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME)}/${existing.id}`,
+        {
+          method: "DELETE"
+        }
+      );
+  
+      riskyMap.delete(productId);
+  
+      return { action: "deleted" };
+    }
+  
     return { action: "skipped" };
   }
 
