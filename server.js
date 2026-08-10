@@ -838,6 +838,45 @@ function buildStockxName(retailed) {
     .trim();
 }
 
+function normalizeMerchantVariantSku(merchant, sku, variant) {
+  const rawSku = String(sku || "").trim();
+
+  if (!rawSku) return "";
+
+  // Alleen voor deze specifieke store
+  if (merchant.name !== "LetzKick") {
+    return rawSku;
+  }
+
+  const sizeOption = variant?.selectedOptions?.find((option) =>
+    ["size", "maat"].includes(
+      String(option.name || "").trim().toLowerCase()
+    )
+  );
+
+  const size = String(
+    sizeOption?.value || variant?.title || ""
+  ).trim();
+
+  if (!size) return rawSku;
+
+  const possibleSizes = new Set([
+    size,
+    size.replace(",", "."),
+    size.replace(".", ",")
+  ]);
+
+  for (const possibleSize of possibleSizes) {
+    const suffix = `-${possibleSize}`;
+
+    if (rawSku.endsWith(suffix)) {
+      return rawSku.slice(0, -suffix.length).trim();
+    }
+  }
+
+  return rawSku;
+}
+
 function calculateMatchRisk({ sku }) {
   const hasSku = Boolean(sku && String(sku).trim());
 
@@ -1028,7 +1067,14 @@ async function syncMerchant(merchant, runId) {
       const fullProduct = product;
       const variants = fullProduct.variants.edges.map((edge) => edge.node);
   
-      const firstVariantSku = variants[0]?.sku || "";
+      const firstVariant = variants[0];
+
+      const firstVariantSku = normalizeMerchantVariantSku(
+        merchant,
+        firstVariant?.sku || "",
+        firstVariant
+      );
+      
       const retailedQuery = firstVariantSku || fullProduct.title;
   
       let retailed = null;
@@ -1558,7 +1604,14 @@ app.get("/run-test", async (_req, res) => {
       const fullProduct = product;
       const variants = fullProduct.variants.edges.map((e) => e.node);
     
-      const firstVariantSku = variants[0]?.sku || "";
+      const firstVariant = variants[0];
+
+      const firstVariantSku = normalizeMerchantVariantSku(
+        merchant,
+        firstVariant?.sku || "",
+        firstVariant
+      );
+      
       const retailedQuery = firstVariantSku || fullProduct.title;
     
       let retailed = null;
