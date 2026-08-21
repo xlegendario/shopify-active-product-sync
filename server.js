@@ -235,7 +235,7 @@ async function logSyncError({ merchant, syncId, product, error }) {
   }
 }
 
-function getRiskIssue({ sku, retailedStatus, matchRiskLevel, pictureUrl }) {
+function getRiskIssue({ sku, retailedStatus, matchRiskLevel, pictureUrl, stockxMatched }) {
   const issueTypes = [];
   const issueNotes = [];
 
@@ -249,6 +249,15 @@ function getRiskIssue({ sku, retailedStatus, matchRiskLevel, pictureUrl }) {
       issueTypes.push(`${matchRiskLevel} Risk Match`);
       issueNotes.push(`Match risk level is ${matchRiskLevel}.`);
     }
+  }
+
+  // NEW — er was geen enkele reden die "dit product staat niet in de
+  // catalogus" uitdrukte, want dat werd nooit vastgesteld. Producten met
+  // een SKU die nergens op slaat kwamen daardoor op Low en bleven
+  // onzichtbaar.
+  if (hasSku && stockxMatched === false) {
+    issueTypes.push("No StockX Match");
+    issueNotes.push("No exact StockX match for this SKU.");
   }
 
   if (retailedStatus !== "ok") {
@@ -291,6 +300,7 @@ async function upsertRiskyProductMatch({
   retailed,
   retailedStatus,
   matchRiskLevel,
+  stockxMatched,
   riskyMap
 }) {
   const productId = String(product.legacyResourceId || getNumericId(product.id));
@@ -301,7 +311,8 @@ async function upsertRiskyProductMatch({
     sku: productSku,
     retailedStatus,
     matchRiskLevel,
-    pictureUrl
+    pictureUrl,
+    stockxMatched
   });
 
   if (!riskIssue.isRisky) {
@@ -778,6 +789,75 @@ async function fetchProductVariants(merchant, productGid) {
   return result.data.product;
 }
 
+const KC_PORTAL_BASE_URL = process.env.KC_PORTAL_BASE_URL || "";
+const KC_PORTAL_SECRET = process.env.COUNTER_OFFERS_SECRET || "";
+
+// Binnen een ronde wordt elke SKU een keer opgezocht. Negen winkels delen
+// veel van hun catalogus: 318.000 actieve rijen gaan over 11.000 unieke
+// SKU's, dus zonder deze cache zou dezelfde vraag bijna dertig keer over de
+// lijn gaan.
+const skuResolveCache = new Map();
+
+function resetSkuResolveCache() {
+  skuResolveCache.clear();
+}
+
+/**
+ * Vraagt de portal wat een SKU is.
+ *
+ * De portal is de enige plek die een SKU Master mag aanmaken, en alleen bij
+ * een exacte StockX-match. Deze bot stelt dus geen identiteit meer vast,
+ * hij vraagt hem op.
+ *
+ * Geeft terug:
+ *   { ok: true,  product_name, brand, image }
+ *   { ok: false, reason: "not_found" }       de SKU bestaat niet
+ *   { ok: false, reason: "lookup_failed" }   storing, zegt niets over de SKU
+ *   { ok: false, reason: "not_configured" }  geen portal-url of geheim
+ */
+async function resolveSkuViaPortal(sku) {
+  const clean = String(sku || "").toUpperCase().trim();
+
+  if (!clean) return { ok: false, reason: "not_found" };
+  if (skuResolveCache.has(clean)) return skuResolveCache.get(clean);
+
+  if (!KC_PORTAL_BASE_URL || !KC_PORTAL_SECRET) {
+    return { ok: false, reason: "not_configured" };
+  }
+
+  let uitkomst;
+
+  try {
+    const response = await fetchWithRetry(
+      `${KC_PORTAL_BASE_URL.replace(/\/+$/, "")}/api/internal/resolve-sku`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-kc-secret": KC_PORTAL_SECRET
+        },
+        body: JSON.stringify({ sku: clean })
+      },
+      2
+    );
+
+    const data = await response.json();
+    const gevonden = data?.results?.[clean];
+
+    uitkomst = gevonden || { ok: false, reason: "lookup_failed" };
+  } catch (error) {
+    console.warn("resolve-sku call failed", { sku: clean, error: error.message });
+
+    // Een storing is geen bewijs dat de SKU niet bestaat, dus dit gaat
+    // bewust NIET in de cache: de volgende ronde probeert het opnieuw.
+    return { ok: false, reason: "lookup_failed" };
+  }
+
+  skuResolveCache.set(clean, uitkomst);
+
+  return uitkomst;
+}
+
 async function searchRetailed(query) {
   if (!query) return null;
 
@@ -877,12 +957,16 @@ function normalizeMerchantVariantSku(merchant, sku, variant) {
   return rawSku;
 }
 
-function calculateMatchRisk({ sku }) {
+function calculateMatchRisk({ sku, stockxMatched }) {
   const hasSku = Boolean(sku && String(sku).trim());
 
-  if (!hasSku) {
-    return "High";
-  }
+  if (!hasSku) return "High";
+
+  // GEWIJZIGD — hier stond alleen de vraag of het SKU-veld gevuld was, en
+  // alles met een SKU kwam op "Low" te staan. Dat las als "gecontroleerd"
+  // terwijl er nooit iets vergeleken was. Nu telt of de portal een exacte
+  // StockX-match vond.
+  if (!stockxMatched) return "High";
 
   return "Low";
 }
@@ -1079,65 +1163,64 @@ async function syncMerchant(merchant, runId) {
   
       let retailed = null;
       let retailedStatus = "ok";
-      
-      const existingSupabaseProduct = await fetchExistingSupabaseProduct({
-        merchant,
-        product: fullProduct
-      });
-      
-      const canSkipRetailedFromProduct =
-        existingSupabaseProduct &&
-        existingSupabaseProduct.retailed_status === "ok" &&
-        existingSupabaseProduct.stockx_product_name &&
-        existingSupabaseProduct.picture_url;
-      
-      if (canSkipRetailedFromProduct) {
+      let stockxMatched = false;
+
+      // GEWIJZIGD — hier stonden twee caches en een ongecontroleerde
+      // Retailed-zoekopdracht. De ene cache las uit store_listings van
+      // dezelfde winkel, de andere uit store_listings van een willekeurige
+      // andere winkel — ondanks zijn naam fetchExistingSupabaseSkuMaster.
+      // Een verkeerde match bij een van de negen winkels werd zo door alle
+      // andere overgenomen.
+      //
+      // Nu gaat het naar de portal, die SKU Master als bron gebruikt en
+      // alleen bij een exacte StockX-match iets vaststelt.
+      const opgelost = await resolveSkuViaPortal(firstVariantSku);
+
+      if (opgelost.ok) {
         retailed = {
-          name: existingSupabaseProduct.stockx_product_name,
+          name: opgelost.product_name,
           colorway: "",
-          brand: existingSupabaseProduct.brand || "",
-          image: existingSupabaseProduct.picture_url || ""
+          brand: opgelost.brand || "",
+          image: opgelost.image || ""
         };
-      
+
         retailedStatus = "ok";
-      
-        console.log("Skipping Retailed lookup, using same-store Supabase cache", {
-          product: fullProduct.title
-        });
-      } else {
-        const existingSkuMaster = await fetchExistingSupabaseSkuMaster(firstVariantSku);
-      
-        if (existingSkuMaster) {
-          retailed = {
-            name: existingSkuMaster.stockx_product_name,
-            colorway: "",
-            brand: existingSkuMaster.brand || "",
-            image: existingSkuMaster.picture_url || ""
-          };
-      
-          retailedStatus = "ok";
-      
-          console.log("Skipping Retailed lookup, using SKU master cache", {
-            product: fullProduct.title,
-            sku: firstVariantSku
-          });
-        } else {
-          retailed = await searchRetailed(retailedQuery);
-      
-          if (!retailedQuery) {
-            retailedStatus = "not_found";
-            retailedMisses += 1;
-          } else if (!retailed) {
-            retailedStatus = "failed";
-            retailedMisses += 1;
-          }
+        stockxMatched = true;
+      } else if (opgelost.reason === "not_configured") {
+        // Terugval zodat een vergeten omgevingsvariabele de sync niet plat
+        // legt. Wel luidruchtig, want zolang dit gebeurt is er niets
+        // geverifieerd.
+        console.warn(
+          "KC_PORTAL_BASE_URL of COUNTER_OFFERS_SECRET ontbreekt — " +
+          "terug op de oude, ongecontroleerde Retailed-zoekopdracht",
+          { product: fullProduct.title }
+        );
+
+        retailed = await searchRetailed(retailedQuery);
+
+        if (!retailedQuery) {
+          retailedStatus = "not_found";
+          retailedMisses += 1;
+        } else if (!retailed) {
+          retailedStatus = "failed";
+          retailedMisses += 1;
         }
+
+        stockxMatched = Boolean(retailed);
+      } else {
+        // Geen exacte match, of de opzoeking mislukte. In beide gevallen
+        // geen naam en geen foto: liever leeg en zichtbaar als High dan een
+        // willekeurig ander model dat als waarheid doorreist.
+        retailed = null;
+        retailedStatus = opgelost.reason === "lookup_failed" ? "failed" : "not_found";
+        retailedMisses += 1;
       }
-  
+
       const stockxProductName = buildStockxName(retailed);
   
       const productMatchRiskLevel = calculateMatchRisk({
         sku: firstVariantSku,
+        stockxMatched,
         shopifyProductName: fullProduct.title || "",
         stockxProductName,
         brand: retailed?.brand || ""
@@ -1150,6 +1233,7 @@ async function syncMerchant(merchant, runId) {
         retailed,
         retailedStatus,
         matchRiskLevel: productMatchRiskLevel,
+        stockxMatched,
         riskyMap
       });
   
@@ -1251,6 +1335,10 @@ async function syncMerchant(merchant, runId) {
 }
 
 async function syncAllMerchants() {
+  // Een nieuwe ronde begint met een schone cache: een SKU die de vorige
+  // keer niet gevonden werd kan er inmiddels wel zijn.
+  resetSkuResolveCache();
+
   assertEnv();
 
   const runId = createSyncId();
@@ -1616,65 +1704,64 @@ app.get("/run-test", async (_req, res) => {
     
       let retailed = null;
       let retailedStatus = "ok";
-      
-      const existingSupabaseProduct = await fetchExistingSupabaseProduct({
-        merchant,
-        product: fullProduct
-      });
-      
-      const canSkipRetailedFromProduct =
-        existingSupabaseProduct &&
-        existingSupabaseProduct.retailed_status === "ok" &&
-        existingSupabaseProduct.stockx_product_name &&
-        existingSupabaseProduct.picture_url;
-      
-      if (canSkipRetailedFromProduct) {
+      let stockxMatched = false;
+
+      // GEWIJZIGD — hier stonden twee caches en een ongecontroleerde
+      // Retailed-zoekopdracht. De ene cache las uit store_listings van
+      // dezelfde winkel, de andere uit store_listings van een willekeurige
+      // andere winkel — ondanks zijn naam fetchExistingSupabaseSkuMaster.
+      // Een verkeerde match bij een van de negen winkels werd zo door alle
+      // andere overgenomen.
+      //
+      // Nu gaat het naar de portal, die SKU Master als bron gebruikt en
+      // alleen bij een exacte StockX-match iets vaststelt.
+      const opgelost = await resolveSkuViaPortal(firstVariantSku);
+
+      if (opgelost.ok) {
         retailed = {
-          name: existingSupabaseProduct.stockx_product_name,
+          name: opgelost.product_name,
           colorway: "",
-          brand: existingSupabaseProduct.brand || "",
-          image: existingSupabaseProduct.picture_url || ""
+          brand: opgelost.brand || "",
+          image: opgelost.image || ""
         };
-      
+
         retailedStatus = "ok";
-      
-        console.log("Skipping Retailed lookup, using same-store Supabase cache", {
-          product: fullProduct.title
-        });
-      } else {
-        const existingSkuMaster = await fetchExistingSupabaseSkuMaster(firstVariantSku);
-      
-        if (existingSkuMaster) {
-          retailed = {
-            name: existingSkuMaster.stockx_product_name,
-            colorway: "",
-            brand: existingSkuMaster.brand || "",
-            image: existingSkuMaster.picture_url || ""
-          };
-      
-          retailedStatus = "ok";
-      
-          console.log("Skipping Retailed lookup, using SKU master cache", {
-            product: fullProduct.title,
-            sku: firstVariantSku
-          });
-        } else {
-          retailed = await searchRetailed(retailedQuery);
-      
-          if (!retailedQuery) {
-            retailedStatus = "not_found";
-            retailedMisses += 1;
-          } else if (!retailed) {
-            retailedStatus = "failed";
-            retailedMisses += 1;
-          }
+        stockxMatched = true;
+      } else if (opgelost.reason === "not_configured") {
+        // Terugval zodat een vergeten omgevingsvariabele de sync niet plat
+        // legt. Wel luidruchtig, want zolang dit gebeurt is er niets
+        // geverifieerd.
+        console.warn(
+          "KC_PORTAL_BASE_URL of COUNTER_OFFERS_SECRET ontbreekt — " +
+          "terug op de oude, ongecontroleerde Retailed-zoekopdracht",
+          { product: fullProduct.title }
+        );
+
+        retailed = await searchRetailed(retailedQuery);
+
+        if (!retailedQuery) {
+          retailedStatus = "not_found";
+          retailedMisses += 1;
+        } else if (!retailed) {
+          retailedStatus = "failed";
+          retailedMisses += 1;
         }
+
+        stockxMatched = Boolean(retailed);
+      } else {
+        // Geen exacte match, of de opzoeking mislukte. In beide gevallen
+        // geen naam en geen foto: liever leeg en zichtbaar als High dan een
+        // willekeurig ander model dat als waarheid doorreist.
+        retailed = null;
+        retailedStatus = opgelost.reason === "lookup_failed" ? "failed" : "not_found";
+        retailedMisses += 1;
       }
-    
+
       const stockxProductName = buildStockxName(retailed);
     
       const productMatchRiskLevel = calculateMatchRisk({
         sku: firstVariantSku,
+        stockxMatched,
         shopifyProductName: fullProduct.title || "",
         stockxProductName,
         brand: retailed?.brand || ""
@@ -1687,6 +1774,7 @@ app.get("/run-test", async (_req, res) => {
         retailed,
         retailedStatus,
         matchRiskLevel: productMatchRiskLevel,
+        stockxMatched,
         riskyMap
       });
     
