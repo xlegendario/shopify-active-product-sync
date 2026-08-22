@@ -251,10 +251,9 @@ function getRiskIssue({ sku, retailedStatus, matchRiskLevel, pictureUrl, stockxM
     }
   }
 
-  // NEW — er was geen enkele reden die "dit product staat niet in de
-  // catalogus" uitdrukte, want dat werd nooit vastgesteld. Producten met
-  // een SKU die nergens op slaat kwamen daardoor op Low en bleven
-  // onzichtbaar.
+  // NEW — there was no reason expressing "this product is not in the
+  // catalog", because that was never established. Products with a SKU that
+  // means nothing therefore came out as Low and stayed invisible.
   if (hasSku && stockxMatched === false) {
     issueTypes.push("No StockX Match");
     issueNotes.push("No exact StockX match for this SKU.");
@@ -792,10 +791,9 @@ async function fetchProductVariants(merchant, productGid) {
 const KC_PORTAL_BASE_URL = process.env.KC_PORTAL_BASE_URL || "";
 const KC_PORTAL_SECRET = process.env.COUNTER_OFFERS_SECRET || "";
 
-// Binnen een ronde wordt elke SKU een keer opgezocht. Negen winkels delen
-// veel van hun catalogus: 318.000 actieve rijen gaan over 11.000 unieke
-// SKU's, dus zonder deze cache zou dezelfde vraag bijna dertig keer over de
-// lijn gaan.
+// Within one run each SKU is looked up once. Nine stores share much of
+// their catalog: 318,000 active rows cover 11,000 unique SKUs, so without
+// this cache the same question would go over the wire nearly thirty times.
 const skuResolveCache = new Map();
 
 function resetSkuResolveCache() {
@@ -803,17 +801,17 @@ function resetSkuResolveCache() {
 }
 
 /**
- * Vraagt de portal wat een SKU is.
+ * Asks the portal what a SKU is.
  *
- * De portal is de enige plek die een SKU Master mag aanmaken, en alleen bij
- * een exacte StockX-match. Deze bot stelt dus geen identiteit meer vast,
- * hij vraagt hem op.
+ * The portal is the only place allowed to create a SKU Master record, and
+ * only on an exact StockX match. This bot therefore no longer establishes
+ * identity itself; it asks for it.
  *
- * Geeft terug:
+ * Returns:
  *   { ok: true,  product_name, brand, image }
- *   { ok: false, reason: "not_found" }       de SKU bestaat niet
- *   { ok: false, reason: "lookup_failed" }   storing, zegt niets over de SKU
- *   { ok: false, reason: "not_configured" }  geen portal-url of geheim
+ *   { ok: false, reason: "not_found" }       the SKU does not exist
+ *   { ok: false, reason: "lookup_failed" }   an outage, says nothing about it
+ *   { ok: false, reason: "not_configured" }  no portal URL or secret
  */
 async function resolveSkuViaPortal(sku) {
   const clean = String(sku || "").toUpperCase().trim();
@@ -848,8 +846,8 @@ async function resolveSkuViaPortal(sku) {
   } catch (error) {
     console.warn("resolve-sku call failed", { sku: clean, error: error.message });
 
-    // Een storing is geen bewijs dat de SKU niet bestaat, dus dit gaat
-    // bewust NIET in de cache: de volgende ronde probeert het opnieuw.
+    // An outage is no proof the SKU does not exist, so this deliberately
+    // does NOT go into the cache: the next run tries again.
     return { ok: false, reason: "lookup_failed" };
   }
 
@@ -923,7 +921,7 @@ function normalizeMerchantVariantSku(merchant, sku, variant) {
 
   if (!rawSku) return "";
 
-  // Alleen voor deze specifieke store
+  // Only for this specific store
   if (merchant.name !== "LetzKick") {
     return rawSku;
   }
@@ -962,10 +960,10 @@ function calculateMatchRisk({ sku, stockxMatched }) {
 
   if (!hasSku) return "High";
 
-  // GEWIJZIGD — hier stond alleen de vraag of het SKU-veld gevuld was, en
-  // alles met een SKU kwam op "Low" te staan. Dat las als "gecontroleerd"
-  // terwijl er nooit iets vergeleken was. Nu telt of de portal een exacte
-  // StockX-match vond.
+  // CHANGED — this only asked whether the SKU field was filled in, so
+  // everything with a SKU came out as "Low". That read as "checked" while
+  // nothing had ever been compared. What counts now is whether the portal
+  // found an exact StockX match.
   if (!stockxMatched) return "High";
 
   return "Low";
@@ -1165,15 +1163,14 @@ async function syncMerchant(merchant, runId) {
       let retailedStatus = "ok";
       let stockxMatched = false;
 
-      // GEWIJZIGD — hier stonden twee caches en een ongecontroleerde
-      // Retailed-zoekopdracht. De ene cache las uit store_listings van
-      // dezelfde winkel, de andere uit store_listings van een willekeurige
-      // andere winkel — ondanks zijn naam fetchExistingSupabaseSkuMaster.
-      // Een verkeerde match bij een van de negen winkels werd zo door alle
-      // andere overgenomen.
+      // CHANGED — this held two caches and an unchecked Retailed
+      // search. One cache read from store_listings of the same store, the
+      // other from store_listings of any other store — despite its name,
+      // fetchExistingSupabaseSkuMaster. A wrong match at one of the nine
+      // stores was thereby inherited by all the others.
       //
-      // Nu gaat het naar de portal, die SKU Master als bron gebruikt en
-      // alleen bij een exacte StockX-match iets vaststelt.
+      // It now goes to the portal, which uses SKU Master as its source and
+      // only establishes anything on an exact StockX match.
       const opgelost = await resolveSkuViaPortal(firstVariantSku);
 
       if (opgelost.ok) {
@@ -1187,12 +1184,12 @@ async function syncMerchant(merchant, runId) {
         retailedStatus = "ok";
         stockxMatched = true;
       } else if (opgelost.reason === "not_configured") {
-        // Terugval zodat een vergeten omgevingsvariabele de sync niet plat
-        // legt. Wel luidruchtig, want zolang dit gebeurt is er niets
-        // geverifieerd.
+        // Fallback so a forgotten environment variable does not take the
+        // sync down. Loudly, though, because while this happens nothing is
+        // being verified.
         console.warn(
-          "KC_PORTAL_BASE_URL of COUNTER_OFFERS_SECRET ontbreekt — " +
-          "terug op de oude, ongecontroleerde Retailed-zoekopdracht",
+          "KC_PORTAL_BASE_URL or COUNTER_OFFERS_SECRET missing — " +
+          "falling back to the old, unverified Retailed search",
           { product: fullProduct.title }
         );
 
@@ -1208,9 +1205,9 @@ async function syncMerchant(merchant, runId) {
 
         stockxMatched = Boolean(retailed);
       } else {
-        // Geen exacte match, of de opzoeking mislukte. In beide gevallen
-        // geen naam en geen foto: liever leeg en zichtbaar als High dan een
-        // willekeurig ander model dat als waarheid doorreist.
+        // No exact match, or the lookup failed. Either way no name and no
+        // picture: better empty and visible as High than some other model
+        // travelling onward as fact.
         retailed = null;
         retailedStatus = opgelost.reason === "lookup_failed" ? "failed" : "not_found";
         retailedMisses += 1;
@@ -1335,8 +1332,8 @@ async function syncMerchant(merchant, runId) {
 }
 
 async function syncAllMerchants() {
-  // Een nieuwe ronde begint met een schone cache: een SKU die de vorige
-  // keer niet gevonden werd kan er inmiddels wel zijn.
+  // A new run starts with a clean cache: a SKU that was not found last
+  // time may exist by now.
   resetSkuResolveCache();
 
   assertEnv();
@@ -1706,15 +1703,14 @@ app.get("/run-test", async (_req, res) => {
       let retailedStatus = "ok";
       let stockxMatched = false;
 
-      // GEWIJZIGD — hier stonden twee caches en een ongecontroleerde
-      // Retailed-zoekopdracht. De ene cache las uit store_listings van
-      // dezelfde winkel, de andere uit store_listings van een willekeurige
-      // andere winkel — ondanks zijn naam fetchExistingSupabaseSkuMaster.
-      // Een verkeerde match bij een van de negen winkels werd zo door alle
-      // andere overgenomen.
+      // CHANGED — this held two caches and an unchecked Retailed
+      // search. One cache read from store_listings of the same store, the
+      // other from store_listings of any other store — despite its name,
+      // fetchExistingSupabaseSkuMaster. A wrong match at one of the nine
+      // stores was thereby inherited by all the others.
       //
-      // Nu gaat het naar de portal, die SKU Master als bron gebruikt en
-      // alleen bij een exacte StockX-match iets vaststelt.
+      // It now goes to the portal, which uses SKU Master as its source and
+      // only establishes anything on an exact StockX match.
       const opgelost = await resolveSkuViaPortal(firstVariantSku);
 
       if (opgelost.ok) {
@@ -1728,12 +1724,12 @@ app.get("/run-test", async (_req, res) => {
         retailedStatus = "ok";
         stockxMatched = true;
       } else if (opgelost.reason === "not_configured") {
-        // Terugval zodat een vergeten omgevingsvariabele de sync niet plat
-        // legt. Wel luidruchtig, want zolang dit gebeurt is er niets
-        // geverifieerd.
+        // Fallback so a forgotten environment variable does not take the
+        // sync down. Loudly, though, because while this happens nothing is
+        // being verified.
         console.warn(
-          "KC_PORTAL_BASE_URL of COUNTER_OFFERS_SECRET ontbreekt — " +
-          "terug op de oude, ongecontroleerde Retailed-zoekopdracht",
+          "KC_PORTAL_BASE_URL or COUNTER_OFFERS_SECRET missing — " +
+          "falling back to the old, unverified Retailed search",
           { product: fullProduct.title }
         );
 
@@ -1749,9 +1745,9 @@ app.get("/run-test", async (_req, res) => {
 
         stockxMatched = Boolean(retailed);
       } else {
-        // Geen exacte match, of de opzoeking mislukte. In beide gevallen
-        // geen naam en geen foto: liever leeg en zichtbaar als High dan een
-        // willekeurig ander model dat als waarheid doorreist.
+        // No exact match, or the lookup failed. Either way no name and no
+        // picture: better empty and visible as High than some other model
+        // travelling onward as fact.
         retailed = null;
         retailedStatus = opgelost.reason === "lookup_failed" ? "failed" : "not_found";
         retailedMisses += 1;
