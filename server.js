@@ -964,6 +964,30 @@ function calculateMatchRisk({ sku, stockxMatched }) {
   // everything with a SKU came out as "Low". That read as "checked" while
   // nothing had ever been compared. What counts now is whether the portal
   // found an exact StockX match.
+  //
+  // NEW — a caller that forgets the flag no longer passes silently.
+  //
+  // "not matched" and "never asked" are two different things, and this
+  // function used to answer "High" to both. One caller did forget it, and
+  // for days every listing it wrote came out High while its SKU resolved
+  // perfectly - 205,943 of them - which quietly stopped those orders from
+  // ever being allocated or reaching a seller.
+  //
+  // It still answers "High", because that is the safe direction: better a
+  // product held for review than a wrong match sold on. But it says so, and
+  // loudly, so the next missing argument is found in the log instead of in
+  // the data six days later.
+  if (typeof stockxMatched !== "boolean") {
+    console.error(
+      "[match-risk] stockxMatched missing — the caller did not say whether " +
+      "this SKU was matched. Treating as High, but this is a bug, not a " +
+      "verdict.",
+      { sku }
+    );
+
+    return "High";
+  }
+
   if (!stockxMatched) return "High";
 
   return "Low";
@@ -976,15 +1000,27 @@ function mapToSupabaseStoreListing({
   variant,
   retailed,
   retailedStatus,
-  productSku
+  productSku,
+  stockxMatched
 }) {
   const stockxProductName = buildStockxName(retailed);
 
+  // FIXED - stockxMatched was not passed in here, while calculateMatchRisk
+  // reads exactly two things: the sku and that flag. Undefined is falsy, so
+  // every listing written through this function came out "High" no matter
+  // how cleanly the SKU matched. 205,943 active listings with a perfectly
+  // good SKU were sitting on High because of it, and an order from such a
+  // listing inherits the level - which autoAllocateBestUnit refuses to
+  // touch, so it never allocates and never reaches a seller.
+  //
+  // The three arguments below it used to pass - shopifyProductName,
+  // stockxProductName and brand - were not read by that function at all.
+  // They are the fingerprint of the change that caused this: the signature
+  // was narrowed and this caller was never brought along. Removed, so the
+  // two now say the same thing.
   const matchRiskLevel = calculateMatchRisk({
     sku: productSku,
-    shopifyProductName: product.title || "",
-    stockxProductName,
-    brand: retailed?.brand || ""
+    stockxMatched
   });
 
   return {
@@ -1250,7 +1286,8 @@ async function syncMerchant(merchant, runId) {
             variant,
             retailed,
             retailedStatus,
-            productSku: firstVariantSku
+            productSku: firstVariantSku,
+            stockxMatched
           })
         );
       }
@@ -1790,7 +1827,8 @@ app.get("/run-test", async (_req, res) => {
             variant,
             retailed,
             retailedStatus,
-            productSku: firstVariantSku
+            productSku: firstVariantSku,
+            stockxMatched
           })
         );
       }
