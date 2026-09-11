@@ -78,7 +78,16 @@ const RETAILED_API_BASE =
   process.env.RETAILED_API_BASE || "https://app.retailed.io/api/v1/scraper/stockx/search";
 
 const RETAILED_API_KEY = process.env.RETAILED_API_KEY || "";
-const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || "15000", 10);
+/*
+ * How long a request may take before it is given up on.
+ *
+ * RAISED from 15 seconds, which was too tight for a loaded Airtable base and
+ * made things worse rather than safer: the answer was still coming, the
+ * abort threw it away, and the retry asked the same question again. Measured
+ * during the webhook storm, Airtable took 12 to 19 seconds for reads that
+ * normally take half a second.
+ */
+const HTTP_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || "30000", 10);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
@@ -1217,7 +1226,7 @@ async function fetchExistingSupabaseSkuMaster(productSku) {
  * Throws on failure. The caller decides whether that costs one product or
  * the whole store.
  */
-async function syncOneProduct({ merchant, syncId, product, riskyMap }) {
+async function syncOneProduct({ merchant, syncId, product, riskyMap, skipRiskyMatches = false }) {
   let variantsCounted = 0;
   let retailedMiss = 0;
 
@@ -1298,16 +1307,32 @@ async function syncOneProduct({ merchant, syncId, product, riskyMap }) {
     brand: retailed?.brand || ""
   });
 
-  const riskyResult = await upsertRiskyProductMatch({
-    merchant,
-    product: fullProduct,
-    productSku: firstVariantSku,
-    retailed,
-    retailedStatus,
-    matchRiskLevel: productMatchRiskLevel,
-    stockxMatched,
-    riskyMap
-  });
+  /*
+    The risky-match row, unless we are here because one product changed.
+
+    It is one Airtable read and often a write, per product. The nightly pass
+    can afford that because it is pacing itself through a whole catalogue.
+    The webhook path cannot: a store editing five hundred products sends five
+    hundred of these, and Airtable allows five requests a second across the
+    whole base - the portal included. That is what took the base from
+    answering in half a second to answering in nineteen, which timed out, which
+    retried, which made it worse.
+
+    Nothing is lost by skipping it here. The nightly pass walks every product
+    of every store and rebuilds these rows from scratch.
+  */
+  const riskyResult = skipRiskyMatches
+    ? { action: "skipped" }
+    : await upsertRiskyProductMatch({
+        merchant,
+        product: fullProduct,
+        productSku: firstVariantSku,
+        retailed,
+        retailedStatus,
+        matchRiskLevel: productMatchRiskLevel,
+        stockxMatched,
+        riskyMap
+      });
 
   const riskyAction = riskyResult.action;
 
@@ -2397,12 +2422,50 @@ function verifyWebhookSecret(given) {
   Answered from a fresh read rather than a cache, because a token that was
   just replaced has to take effect at once.
 */
+/*
+ * The merchant list, kept for a minute at a time.
+ *
+ * FIXED - this read Airtable fresh on every single webhook, with a comment
+ * saying a replaced token had to take effect at once. That reasoning holds
+ * for one webhook an hour and falls apart at the real rate: SOSU alone sent
+ * hundreds of products/update in a burst, each one asking Airtable for the
+ * same eleven rows. Airtable allows five requests a second per base, so the
+ * reads timed out, the handlers piled up waiting, and the service ran out of
+ * memory at 512MB.
+ *
+ * A minute is short enough that a new token is picked up while you are still
+ * looking at the screen, and long enough that a burst of five hundred costs
+ * one read instead of five hundred.
+ */
+const MERCHANT_CACHE_MS = Number(process.env.MERCHANT_CACHE_MS || 60000);
+
+let merchantCache = { at: 0, merchants: [], loading: null };
+
+async function cachedActiveMerchants() {
+  if (Date.now() - merchantCache.at < MERCHANT_CACHE_MS) return merchantCache.merchants;
+
+  // One read even when fifty callers arrive at once.
+  if (!merchantCache.loading) {
+    merchantCache.loading = fetchActiveMerchants()
+      .then((merchants) => {
+        merchantCache = { at: Date.now(), merchants, loading: null };
+        return merchants;
+      })
+      .catch((error) => {
+        merchantCache.loading = null;
+        throw error;
+      });
+  }
+
+  return merchantCache.loading;
+}
+
 async function findMerchantByDomain(domain) {
   const wanted = normalizeShopifyDomain(domain);
 
   if (!wanted) return null;
 
-  const merchants = await fetchActiveMerchants();
+  const merchants = await cachedActiveMerchants();
 
   return merchants.find((merchant) => merchant.shopifyDomain === wanted) || null;
 }
@@ -2489,9 +2552,7 @@ async function deactivateProductListings(merchant, productId) {
   Shopify gives five seconds and retries anything slower, so a slow portal
   lookup would otherwise turn one change into eight identical ones.
 */
-async function handleProductWebhook({ merchant, topic, payload }) {
-  const productId = String(payload?.id || "");
-
+async function handleProductWebhook({ merchant, topic, productId }) {
   if (!productId) return;
 
   /*
@@ -2549,27 +2610,20 @@ async function handleProductWebhook({ merchant, topic, payload }) {
   }
 
   /*
-    The risky-match rows for this one product only.
+    No Airtable at all on this path.
 
-    syncMerchant loads every risky row of the store up front because it is
-    about to walk the whole catalogue. Here one product changed, so one
-    lookup is enough.
+    This used to look the product's risky-match row up first, which is one
+    read per webhook. At the rate a busy store sends them that alone
+    saturated the base for every other service using it. The nightly pass
+    rebuilds those rows anyway.
   */
-  const riskyRecords = await fetchAllAirtableRecords(
-    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
-    `AND({Merchant Record ID} = '${airtableEscape(merchant.recordId)}', ` +
-      `{Shopify Product ID} = '${airtableEscape(productId)}')`
-  );
-
-  const riskyMap = new Map();
-
-  for (const record of riskyRecords) {
-    const id = record.fields["Shopify Product ID"];
-
-    if (id) riskyMap.set(id, record);
-  }
-
-  const outcome = await syncOneProduct({ merchant, syncId, product, riskyMap });
+  const outcome = await syncOneProduct({
+    merchant,
+    syncId,
+    product,
+    riskyMap: new Map(),
+    skipRiskyMatches: true
+  });
 
   console.log("WEBHOOK product synced", {
     merchant: merchant.name,
@@ -2588,7 +2642,80 @@ async function handleProductWebhook({ merchant, topic, payload }) {
   failing means the same product arriving again and again; the log is the
   place to see that, not the retry queue.
 */
-app.post("/webhooks/shopify/products/:secret", async (req, res) => {
+/* ------------------------------------------------------------------ *
+ * The queue
+ *
+ * FIXED - every arriving webhook started its own handler immediately, and a
+ * handler is four network calls deep: Airtable for the merchant, Airtable for
+ * the risky rows, the portal for the style code, Shopify for the product.
+ *
+ * That is fine one at a time and fatal in a burst. A store that edits five
+ * hundred products in a minute put five hundred of those in flight at once,
+ * each holding its payload and its half-finished promises in memory, all
+ * fighting for the same rate limits. Everything timed out, nothing finished,
+ * and the service died at 512MB.
+ *
+ * So the endpoint now only writes the change down and answers, and one
+ * worker walks the list. Two things fall out of that for free.
+ *
+ * The same product changed five times while it waited is one entry, because
+ * the list is keyed by shop and product: only the newest state matters, and
+ * it is read back from Shopify anyway.
+ *
+ * And the queue has a ceiling. Past it the oldest are dropped with a count in
+ * the log rather than eating the memory, because the nightly pass reads every
+ * store in full and will pick up whatever was lost.
+ * ------------------------------------------------------------------ */
+
+const WEBHOOK_QUEUE_MAX = Number(process.env.WEBHOOK_QUEUE_MAX || 5000);
+
+const webhookQueue = new Map();
+
+let webhookWorking = false;
+let webhookDropped = 0;
+let webhookDone = 0;
+let webhookFailed = 0;
+
+async function drainWebhookQueue() {
+  if (webhookWorking) return;
+
+  webhookWorking = true;
+
+  try {
+    while (webhookQueue.size) {
+      const [key, item] = webhookQueue.entries().next().value;
+
+      webhookQueue.delete(key);
+
+      try {
+        const merchant = await findMerchantByDomain(item.shop);
+
+        if (!merchant) {
+          console.warn("WEBHOOK for a shop we do not sync", { shop: item.shop, topic: item.topic });
+          continue;
+        }
+
+        await handleProductWebhook({ merchant, topic: item.topic, productId: item.productId });
+
+        webhookDone += 1;
+      } catch (error) {
+        webhookFailed += 1;
+
+        console.error("WEBHOOK failed", {
+          shop: item.shop,
+          topic: item.topic,
+          productId: item.productId,
+          waiting: webhookQueue.size,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  } finally {
+    webhookWorking = false;
+  }
+}
+
+app.post("/webhooks/shopify/products/:secret", (req, res) => {
   if (!verifyWebhookSecret(req.params.secret)) {
     console.warn("WEBHOOK rejected: wrong address", {
       shop: req.get("X-Shopify-Shop-Domain") || "",
@@ -2602,26 +2729,60 @@ app.post("/webhooks/shopify/products/:secret", async (req, res) => {
   const shop = req.get("X-Shopify-Shop-Domain") || "";
   const topic = req.get("X-Shopify-Topic") || "";
   const payload = req.body;
+  const productId = String(payload?.id || "");
 
   res.status(200).send("ok");
 
-  try {
-    const merchant = await findMerchantByDomain(shop);
+  if (!productId) return;
 
-    if (!merchant) {
-      console.warn("WEBHOOK for a shop we do not sync", { shop, topic });
-      return;
+  /*
+    Only the shop, the topic and the number are kept.
+
+    Never the payload. A Shopify product message runs to tens of kilobytes
+    and the handler reads the product back from Shopify anyway, so holding
+    five thousand of them would be hundreds of megabytes of something nobody
+    looks at - which is how the service died in the first place.
+
+    Only the newest state of a product is kept. Re-adding it also moves it to
+    the back of the list, which is right: a product still being edited should
+    not be read while the editing is going on.
+  */
+  const key = `${shop}|${productId}`;
+
+  webhookQueue.delete(key);
+  webhookQueue.set(key, { shop, topic, productId });
+
+  while (webhookQueue.size > WEBHOOK_QUEUE_MAX) {
+    const oldest = webhookQueue.keys().next().value;
+
+    webhookQueue.delete(oldest);
+    webhookDropped += 1;
+
+    if (webhookDropped % 250 === 1) {
+      console.warn("WEBHOOK queue full, dropping the oldest", {
+        max: WEBHOOK_QUEUE_MAX,
+        droppedSoFar: webhookDropped,
+        note: "the nightly catalogue pass reads every store in full and will catch these"
+      });
     }
-
-    await handleProductWebhook({ merchant, topic, payload });
-  } catch (error) {
-    console.error("WEBHOOK failed", {
-      shop,
-      topic,
-      productId: payload?.id,
-      error: error instanceof Error ? error.message : String(error)
-    });
   }
+
+  drainWebhookQueue();
+});
+
+/*
+ * What the queue is doing, for when the log is a wall of noise.
+ */
+app.get("/webhooks/status", (_req, res) => {
+  res.json({
+    waiting: webhookQueue.size,
+    working: webhookWorking,
+    done: webhookDone,
+    failed: webhookFailed,
+    dropped: webhookDropped,
+    queueMax: WEBHOOK_QUEUE_MAX,
+    merchantCacheAgeMs: merchantCache.at ? Date.now() - merchantCache.at : null
+  });
 });
 
 /*
