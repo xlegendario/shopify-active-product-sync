@@ -1,8 +1,30 @@
 import express from "express";
+import crypto from "node:crypto";
+import cron from "node-cron";
 import { createClient } from "@supabase/supabase-js";
 
+import { runConsignmentForAll } from "./consignmentRun.js";
+import { normalizeSize } from "./sizes.js";
+
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+
+/*
+  The parsed body for every route, plus the bytes it was parsed from.
+
+  Shopify signs the raw payload, so a webhook cannot be checked against
+  JSON.stringify of the parsed object - key order and number formatting are
+  not guaranteed to survive the round trip, and a single re-ordered key makes
+  a genuine webhook look forged. Capturing the buffer here leaves every
+  existing route untouched.
+*/
+app.use(
+  express.json({
+    limit: "2mb",
+    verify: (req, _res, buffer) => {
+      req.rawBody = buffer;
+    }
+  })
+);
 
 const PORT = process.env.PORT || 10000;
 
@@ -40,6 +62,23 @@ const AIRTABLE_STOCK_LEVELS_TABLE_NAME =
   process.env.AIRTABLE_STOCK_LEVELS_TABLE_NAME || "Stock Levels";
 
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
+
+/*
+  The app's client secret, which is what Shopify signs webhooks with.
+
+  The same value the onboarding service calls SHOPIFY_CLIENT_SECRET, because
+  it is the same app - the one the stores install. Without it the webhook
+  route refuses everything rather than trusting whoever calls it.
+*/
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || "";
+
+/*
+  The webhook's own base URL, which Shopify posts to.
+
+  Shopify has to be told this once per store, and it must be the public
+  address of this service - not localhost, and not the portal.
+*/
+const WEBHOOK_BASE_URL = (process.env.WEBHOOK_BASE_URL || "").replace(/\/$/, "");
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
 
 const RETAILED_API_BASE =
@@ -61,6 +100,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 let isSyncRunning = false;
 let activeSyncStartedAt = null;
+
+// The consignment push keeps its own, so the long catalogue pass cannot
+// swallow it.
+let isConsignmentRunning = false;
 
 function assertEnv() {
   const missing = [];
@@ -408,7 +451,15 @@ async function fetchActiveMerchants() {
       recordId: record.id,
       name: fields["Store Name"] || record.id,
       shopifyDomain,
-      shopifyToken
+      shopifyToken,
+
+      /*
+        The record as it stands, kept alongside the four things this file has
+        always used. The consignment push reads its margin settings, its
+        location and its three sync checkboxes from here rather than fetching
+        the same row again.
+      */
+      fields
     });
   }
 
@@ -1034,8 +1085,21 @@ function mapToSupabaseStoreListing({
     ),
 
     shopify_product_name: product.title || "",
-    size: extractSize(variant.title),
+    size: normalizeSize(variant.title),
     sku: productSku || null,
+
+    /*
+      The store's own SKU, kept beside the one we use.
+
+      The upsert never took theirs on an update, so a hand-made correction
+      would survive - and a store that corrected its own mistake would not.
+      We kept searching on the old code and shipped the wrong pair.
+
+      With this remembered, the two are different things: unchanged since
+      last run means the correction stands, changed means the store moved it
+      and theirs wins. See upsert_store_listings_keep_sku.
+    */
+    shopify_sku: productSku || null,
 
     stockx_product_name: stockxProductName || null,
     brand: retailed?.brand || null,
@@ -1093,15 +1157,19 @@ async function deactivateOldListingsSupabase(merchant, syncId) {
 
 
 
-function extractSize(value) {
-  const text = String(value || "");
+/*
+  NOTE - the size of a store_listings row is normalizeSize, shared with the
+  matching side in sizes.js.
 
-  const match = text.match(/\d+(?:[.,]\d+)?/);
+  This used to be a local extractSize that took the first number it could
+  find and nothing else. So "38 2/3" was written as "38", on top of the real
+  38, and every third size in the table was a lie: across FastCop and
+  Mentastore not one of 40.769 rows held a fraction while both shops plainly
+  sell them. "US 9" came out as "9", which is a different shoe.
 
-  if (!match) return "";
-
-  return match[0].replace(",", ".");
-}
+  Rows written before this stay wrong until their store comes round again in
+  the nightly pass.
+*/
 
 async function fetchExistingSupabaseProduct({ merchant, product }) {
   const productId = String(product.legacyResourceId || getNumericId(product.id));
@@ -1143,6 +1211,149 @@ async function fetchExistingSupabaseSkuMaster(productSku) {
   return data || null;
 }
 
+/*
+ * One product, all the way through: resolve its style code, judge the match,
+ * and write its variants into store_listings.
+ *
+ * Lifted out of syncMerchant's loop unchanged. The nightly pass over the
+ * whole catalogue and the webhook that fires when a single product changes
+ * have to reach the same rows, and the only way to be sure of that is for
+ * both to call this rather than each keeping its own copy - the one mistake
+ * this codebase keeps making.
+ *
+ * Throws on failure. The caller decides whether that costs one product or
+ * the whole store.
+ */
+async function syncOneProduct({ merchant, syncId, product, riskyMap }) {
+  let variantsCounted = 0;
+  let retailedMiss = 0;
+
+  const fullProduct = product;
+  const variants = fullProduct.variants.edges.map((edge) => edge.node);
+
+  const firstVariant = variants[0];
+
+  const firstVariantSku = normalizeMerchantVariantSku(
+    merchant,
+    firstVariant?.sku || "",
+    firstVariant
+  );
+
+  const retailedQuery = firstVariantSku || fullProduct.title;
+
+  let retailed = null;
+  let retailedStatus = "ok";
+  let stockxMatched = false;
+
+  // CHANGED — this held two caches and an unchecked Retailed
+  // search. One cache read from store_listings of the same store, the
+  // other from store_listings of any other store — despite its name,
+  // fetchExistingSupabaseSkuMaster. A wrong match at one of the nine
+  // stores was thereby inherited by all the others.
+  //
+  // It now goes to the portal, which uses SKU Master as its source and
+  // only establishes anything on an exact StockX match.
+  const opgelost = await resolveSkuViaPortal(firstVariantSku);
+
+  if (opgelost.ok) {
+    retailed = {
+      name: opgelost.product_name,
+      colorway: "",
+      brand: opgelost.brand || "",
+      image: opgelost.image || ""
+    };
+
+    retailedStatus = "ok";
+    stockxMatched = true;
+  } else if (opgelost.reason === "not_configured") {
+    // Fallback so a forgotten environment variable does not take the
+    // sync down. Loudly, though, because while this happens nothing is
+    // being verified.
+    console.warn(
+      "KC_PORTAL_BASE_URL or COUNTER_OFFERS_SECRET missing — " +
+      "falling back to the old, unverified Retailed search",
+      { product: fullProduct.title }
+    );
+
+    retailed = await searchRetailed(retailedQuery);
+
+    if (!retailedQuery) {
+      retailedStatus = "not_found";
+      retailedMiss = 1;
+    } else if (!retailed) {
+      retailedStatus = "failed";
+      retailedMiss = 1;
+    }
+
+    stockxMatched = Boolean(retailed);
+  } else {
+    // No exact match, or the lookup failed. Either way no name and no
+    // picture: better empty and visible as High than some other model
+    // travelling onward as fact.
+    retailed = null;
+    retailedStatus = opgelost.reason === "lookup_failed" ? "failed" : "not_found";
+    retailedMiss = 1;
+  }
+
+  const stockxProductName = buildStockxName(retailed);
+
+  const productMatchRiskLevel = calculateMatchRisk({
+    sku: firstVariantSku,
+    stockxMatched,
+    shopifyProductName: fullProduct.title || "",
+    stockxProductName,
+    brand: retailed?.brand || ""
+  });
+
+  const riskyResult = await upsertRiskyProductMatch({
+    merchant,
+    product: fullProduct,
+    productSku: firstVariantSku,
+    retailed,
+    retailedStatus,
+    matchRiskLevel: productMatchRiskLevel,
+    stockxMatched,
+    riskyMap
+  });
+
+  const riskyAction = riskyResult.action;
+
+  const supabaseRows = [];
+
+  for (const variant of variants) {
+    variantsCounted += 1;
+
+    supabaseRows.push(
+      mapToSupabaseStoreListing({
+        merchant,
+        syncId,
+        product: fullProduct,
+        variant,
+        retailed,
+        retailedStatus,
+        productSku: firstVariantSku,
+        stockxMatched
+      })
+    );
+  }
+
+  const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
+
+  console.log("Supabase upsert completed", {
+    product: fullProduct.title,
+    rows: supabaseRecords.length,
+    retailedStatus,
+    matchRiskLevel: productMatchRiskLevel
+  });
+
+  return {
+    variantsCounted,
+    retailedMiss,
+    riskyAction,
+    rowsUpserted: supabaseRecords.length
+  };
+}
+
 async function syncMerchant(merchant, runId) {
   const syncId = `${runId}_${merchant.recordId}`;
 
@@ -1181,127 +1392,15 @@ async function syncMerchant(merchant, runId) {
   for (const product of products) {
     try {
       productsProcessed += 1;
-  
-      const fullProduct = product;
-      const variants = fullProduct.variants.edges.map((edge) => edge.node);
-  
-      const firstVariant = variants[0];
 
-      const firstVariantSku = normalizeMerchantVariantSku(
-        merchant,
-        firstVariant?.sku || "",
-        firstVariant
-      );
-      
-      const retailedQuery = firstVariantSku || fullProduct.title;
-  
-      let retailed = null;
-      let retailedStatus = "ok";
-      let stockxMatched = false;
+      const outcome = await syncOneProduct({ merchant, syncId, product, riskyMap });
 
-      // CHANGED — this held two caches and an unchecked Retailed
-      // search. One cache read from store_listings of the same store, the
-      // other from store_listings of any other store — despite its name,
-      // fetchExistingSupabaseSkuMaster. A wrong match at one of the nine
-      // stores was thereby inherited by all the others.
-      //
-      // It now goes to the portal, which uses SKU Master as its source and
-      // only establishes anything on an exact StockX match.
-      const opgelost = await resolveSkuViaPortal(firstVariantSku);
+      variantsProcessed += outcome.variantsCounted;
+      retailedMisses += outcome.retailedMiss;
+      updated += outcome.rowsUpserted;
 
-      if (opgelost.ok) {
-        retailed = {
-          name: opgelost.product_name,
-          colorway: "",
-          brand: opgelost.brand || "",
-          image: opgelost.image || ""
-        };
-
-        retailedStatus = "ok";
-        stockxMatched = true;
-      } else if (opgelost.reason === "not_configured") {
-        // Fallback so a forgotten environment variable does not take the
-        // sync down. Loudly, though, because while this happens nothing is
-        // being verified.
-        console.warn(
-          "KC_PORTAL_BASE_URL or COUNTER_OFFERS_SECRET missing — " +
-          "falling back to the old, unverified Retailed search",
-          { product: fullProduct.title }
-        );
-
-        retailed = await searchRetailed(retailedQuery);
-
-        if (!retailedQuery) {
-          retailedStatus = "not_found";
-          retailedMisses += 1;
-        } else if (!retailed) {
-          retailedStatus = "failed";
-          retailedMisses += 1;
-        }
-
-        stockxMatched = Boolean(retailed);
-      } else {
-        // No exact match, or the lookup failed. Either way no name and no
-        // picture: better empty and visible as High than some other model
-        // travelling onward as fact.
-        retailed = null;
-        retailedStatus = opgelost.reason === "lookup_failed" ? "failed" : "not_found";
-        retailedMisses += 1;
-      }
-
-      const stockxProductName = buildStockxName(retailed);
-  
-      const productMatchRiskLevel = calculateMatchRisk({
-        sku: firstVariantSku,
-        stockxMatched,
-        shopifyProductName: fullProduct.title || "",
-        stockxProductName,
-        brand: retailed?.brand || ""
-      });
-  
-      const riskyResult = await upsertRiskyProductMatch({
-        merchant,
-        product: fullProduct,
-        productSku: firstVariantSku,
-        retailed,
-        retailedStatus,
-        matchRiskLevel: productMatchRiskLevel,
-        stockxMatched,
-        riskyMap
-      });
-  
-      if (riskyResult.action === "created") riskyCreated += 1;
-      if (riskyResult.action === "updated") riskyUpdated += 1;
-  
-      const supabaseRows = [];
-  
-      for (const variant of variants) {
-        variantsProcessed += 1;
-  
-        supabaseRows.push(
-          mapToSupabaseStoreListing({
-            merchant,
-            syncId,
-            product: fullProduct,
-            variant,
-            retailed,
-            retailedStatus,
-            productSku: firstVariantSku,
-            stockxMatched
-          })
-        );
-      }
-  
-      const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
-  
-      updated += supabaseRecords.length;
-  
-      console.log("Supabase upsert completed", {
-        product: fullProduct.title,
-        rows: supabaseRecords.length,
-        retailedStatus,
-        matchRiskLevel: productMatchRiskLevel
-      });
+      if (outcome.riskyAction === "created") riskyCreated += 1;
+      if (outcome.riskyAction === "updated") riskyUpdated += 1;
     } catch (error) {
       failedProducts += 1;
   
@@ -1368,7 +1467,27 @@ async function syncMerchant(merchant, runId) {
   };
 }
 
-async function syncAllMerchants() {
+/*
+ * The catalogue pass over every store.
+ *
+ * Called two ways, and the difference matters.
+ *
+ * /run asks for all of them and waits however long it takes. That is the
+ * button to press when something has to be right now.
+ *
+ * The nightly schedule asks for as many as fit in a budget, oldest first.
+ * It has to, because this is a full read: deactivation works by absence, so
+ * a store is only known to have lost a listing once we have seen everything
+ * it still has. Measured at 1.9 seconds a product, and the ten active stores
+ * hold some forty-four thousand between them, which is a day - not a night.
+ *
+ * So a night does what fits and the rest waits its turn, and the webhooks
+ * carry the hours in between. A store that was read last week is not stale
+ * in the meantime; it has been told us about every change as it happened.
+ * This pass is the reconciliation that catches what a webhook missed, not
+ * the way the data arrives.
+ */
+async function syncAllMerchants({ budgetMs = 0, maxMerchants = 0, oldestFirst = false } = {}) {
   // A new run starts with a clean cache: a SKU that was not found last
   // time may exist by now.
   resetSkuResolveCache();
@@ -1376,19 +1495,113 @@ async function syncAllMerchants() {
   assertEnv();
 
   const runId = createSyncId();
-  const merchants = await fetchActiveMerchants();
+  const startedAt = Date.now();
+
+  let merchants = await fetchActiveMerchants();
+
+  /*
+    Longest unseen goes first.
+
+    Read from the store's own Last Shopify Sync At, which syncMerchant
+    already writes, so the rotation needs nothing to remember and cannot
+    drift out of step with what actually happened. A store that has never
+    been read has no date and sorts to the very front.
+  */
+  if (oldestFirst) {
+    merchants = [...merchants].sort((a, b) => {
+      const left = Date.parse(a.fields?.["Last Shopify Sync At"] || "") || 0;
+      const right = Date.parse(b.fields?.["Last Shopify Sync At"] || "") || 0;
+
+      return left - right;
+    });
+  }
+
+  if (maxMerchants > 0) merchants = merchants.slice(0, maxMerchants);
 
   const results = [];
+  const failed = [];
+
+  /*
+    One store per turn, and one store's trouble stays that store's trouble.
+
+    This had no guard at all: syncMerchant threw and the whole run ended
+    there. With two shops that was survivable, because the one that broke was
+    usually the one being worked on. With twenty it means a single expired
+    token, a shop that is briefly down, or one 500 from Shopify silently costs
+    every store after it in the list a night's sync - and nobody notices,
+    because deactivation works by absence, so those stores simply keep
+    yesterday's listings and look fine.
+
+    A store that throws is recorded and skipped. Its store_listings are left
+    exactly as they were, which is the safe half of the trade: stale beats
+    wrongly emptied, and syncMerchant already refuses to deactivate when
+    products failed for the same reason.
+  */
+  const notReached = [];
 
   for (const merchant of merchants) {
-    const result = await syncMerchant(merchant, runId);
-    results.push(result);
+    /*
+      Stop before starting another store rather than in the middle of one.
+
+      A store cut off halfway has seen part of its catalogue, and
+      syncMerchant would then deactivate everything it did not reach. The
+      budget is therefore a gate on starting, never an interruption.
+    */
+    if (budgetMs > 0 && Date.now() - startedAt > budgetMs && results.length) {
+      notReached.push(merchant.name);
+      continue;
+    }
+
+    try {
+      const result = await syncMerchant(merchant, runId);
+      results.push(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      console.error("MERCHANT SYNC FAILED", {
+        merchantRecordId: merchant.recordId,
+        merchantName: merchant.name,
+        shopifyDomain: merchant.shopifyDomain,
+        runId,
+        error: message
+      });
+
+      failed.push({
+        merchantRecordId: merchant.recordId,
+        merchantName: merchant.name,
+        error: message
+      });
+
+      /*
+        Logged against a named pseudo-product rather than a blank one, so a
+        whole-store failure is legible in Sync Errors next to the per-product
+        rows instead of looking like a row that lost its product.
+      */
+      await logSyncError({
+        merchant,
+        syncId: `${runId}_${merchant.recordId}`,
+        product: { title: `(hele winkel) ${merchant.name}` },
+        error
+      });
+    }
+  }
+
+  if (notReached.length) {
+    console.log("OUT OF TIME, these stores wait for the next run", {
+      runId,
+      minutes: Math.round((Date.now() - startedAt) / 60000),
+      notReached
+    });
   }
 
   return {
     runId,
+    minutes: Math.round((Date.now() - startedAt) / 60000),
     merchantsSynced: results.length,
-    results
+    merchantsFailed: failed.length,
+    merchantsNotReached: notReached,
+    results,
+    failed
   };
 }
 
@@ -2030,6 +2243,652 @@ app.get("/run-stock-level-push", async (req, res) => {
     activeSyncStartedAt = null;
   }
 });
+
+/*
+ * The consignment push.
+ *
+ * Every store with Consignment Sync ticked gets our consignment stock, at
+ * the store's own selling price, on the Lojiq location in that store. What
+ * we no longer hold goes back to zero on that same location, which is the
+ * half the old scenario could not do.
+ *
+ * Dry by default. Add ?apply=1 to let it write.
+ *
+ * It borrows the same isSyncRunning latch as the product sync, because both
+ * talk to the same stores and the same Shopify budget, and two of them at
+ * once would only slow each other down.
+ */
+/*
+ * The consignment push itself.
+ *
+ * Separated from the route so the nightly clock and the URL run the same
+ * thing rather than two things that resemble each other.
+ */
+async function pushConsignment({ apply }) {
+  assertEnv();
+
+  const merchants = await fetchActiveMerchants();
+
+  return runConsignmentForAll({
+    merchants,
+
+    /*
+      Photographs come from the merchants who shoot their own stock, and
+      those are looked up by store name, so the whole active list goes in
+      rather than only the ones being written to.
+    */
+    photoSourceMerchants: merchants.map((merchant) => ({
+      name: merchant.name,
+      storeUrl: merchant.shopifyDomain,
+      token: merchant.shopifyToken
+    })),
+
+    /*
+      The modules in this branch expect a client that hands back the data and
+      throws on trouble. shopifyGraphQL already throws; this only peels off
+      the envelope.
+    */
+    graphqlFor: (merchant) => (query, variables) =>
+      shopifyGraphQL(merchant, query, variables).then((body) => body.data),
+
+    supabaseUrl: SUPABASE_URL,
+    supabaseKey: SUPABASE_SERVICE_ROLE_KEY,
+    apply,
+
+    onProgress: (step) => console.log("CONSIGNMENT PUSH", step)
+  });
+}
+
+/*
+ * Our consignment stock into every store that asked for it.
+ *
+ * Every store with Consignment Sync ticked gets our stock, at that store's
+ * own selling price, on the Lojiq location inside it. What we no longer hold
+ * goes back to zero on that same location.
+ *
+ * Dry by default. Add ?apply=1 to let it write.
+ *
+ * It has its own latch rather than sharing the catalogue pass's. They touch
+ * different things - this writes to stores, that reads from them - and the
+ * pass runs for hours, which would have swallowed every half-hourly push
+ * inside it.
+ */
+app.get("/run-consignment-push", async (req, res) => {
+  if (isConsignmentRunning) {
+    return res.status(409).json({
+      success: false,
+      message: "A consignment push is already running"
+    });
+  }
+
+  const apply = req.query.apply === "1" || req.query.apply === "true";
+
+  isConsignmentRunning = true;
+
+  try {
+    const result = await pushConsignment({ apply });
+
+    res.json({
+      success: true,
+      message: apply ? "Consignment push completed" : "Consignment push dry run completed",
+      ...result
+    });
+  } catch (error) {
+    console.error("Consignment push error:", error);
+
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    isConsignmentRunning = false;
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Webhooks
+ *
+ * The nightly pass reads every active product of every store, because
+ * deactivation works by absence: a listing is only known to be gone once a
+ * full pass has failed to see it. That is the right way to be certain, and
+ * it is the wrong way to be current - a price changed at nine in the morning
+ * waits until the small hours to reach us.
+ *
+ * Webhooks are the other half. Shopify tells us the moment a product is
+ * created, changed or deleted, and we redo that one product. The full pass
+ * stays exactly as it is, as the thing that catches whatever the webhooks
+ * missed - a delivery that failed while we were deploying, a change made
+ * while the app was uninstalled.
+ *
+ * Deliberately narrow: one product per call, the same syncOneProduct the
+ * nightly pass runs, no second copy of the rule.
+ * ------------------------------------------------------------------ */
+
+const WEBHOOK_TOPICS = ["PRODUCTS_CREATE", "PRODUCTS_UPDATE", "PRODUCTS_DELETE"];
+
+/*
+  Was this really Shopify?
+
+  Compared byte for byte in constant time. A plain === on secrets leaks their
+  contents through how long it takes to fail, and whoever can forge a
+  signature can write into store_listings.
+*/
+function verifyShopifyWebhook(req) {
+  if (!SHOPIFY_CLIENT_SECRET) return false;
+
+  const sent = String(req.get("X-Shopify-Hmac-Sha256") || "");
+
+  if (!sent || !req.rawBody) return false;
+
+  const expected = crypto
+    .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+    .update(req.rawBody)
+    .digest("base64");
+
+  const a = Buffer.from(sent, "utf8");
+  const b = Buffer.from(expected, "utf8");
+
+  if (a.length !== b.length) return false;
+
+  return crypto.timingSafeEqual(a, b);
+}
+
+/*
+  Which of our stores this shop is.
+
+  Only stores that are switched on, so a shop turned off in Merchants stops
+  writing here even if its webhook subscriptions outlive the decision.
+  Answered from a fresh read rather than a cache, because a token that was
+  just replaced has to take effect at once.
+*/
+async function findMerchantByDomain(domain) {
+  const wanted = normalizeShopifyDomain(domain);
+
+  if (!wanted) return null;
+
+  const merchants = await fetchActiveMerchants();
+
+  return merchants.find((merchant) => merchant.shopifyDomain === wanted) || null;
+}
+
+/*
+  The product again, in the shape the rest of this file speaks.
+
+  The webhook payload is the REST shape - option1, inventory_item_id, ids as
+  numbers - and mapToSupabaseStoreListing reads the GraphQL one. Translating
+  between them would be a second place where the same product is described,
+  and those two descriptions would drift. So it is asked again, once, and
+  everything downstream sees precisely what the nightly pass sees.
+*/
+async function fetchOneProduct(merchant, productId) {
+  const query = `
+    query GetProduct($id: ID!) {
+      product(id: $id) {
+        id
+        legacyResourceId
+        title
+        handle
+        status
+        variants(first: 250) {
+          edges {
+            node {
+              id
+              legacyResourceId
+              title
+              sku
+              price
+              inventoryQuantity
+              inventoryItem {
+                id
+                legacyResourceId
+              }
+              selectedOptions {
+                name
+                value
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(merchant, query, {
+    id: toShopifyGid("Product", productId)
+  });
+
+  return result.data?.product || null;
+}
+
+/*
+  Everything this store has for one Shopify product, switched off.
+
+  Used for a delete, and for an update that turns a product to draft or
+  archived - the nightly pass only reads status:active, so from its point of
+  view those are gone too. Rows are kept rather than removed, because an
+  order that came from one still points at it.
+*/
+async function deactivateProductListings(merchant, productId) {
+  const { data, error } = await supabase
+    .from("store_listings")
+    .update({
+      status: "inactive",
+      updated_at: new Date().toISOString()
+    })
+    .eq("merchant_record_id", merchant.recordId)
+    .eq("shopify_product_id", String(productId))
+    .eq("status", "active")
+    .select("id");
+
+  if (error) {
+    throw new Error(`Supabase webhook deactivate error: ${error.message}`);
+  }
+
+  return data?.length || 0;
+}
+
+/*
+  The work behind one webhook, run after the answer has already gone back.
+
+  Shopify gives five seconds and retries anything slower, so a slow portal
+  lookup would otherwise turn one change into eight identical ones.
+*/
+async function handleProductWebhook({ merchant, topic, payload }) {
+  const productId = String(payload?.id || "");
+
+  if (!productId) return;
+
+  /*
+    A sync id that says where the row came from.
+
+    It is deliberately not a run id. The nightly pass deactivates by "not
+    stamped with tonight's id", so a webhook-stamped row is picked up by the
+    next full pass and re-stamped - which is correct, since that pass sees it
+    anyway. What must never happen is a webhook borrowing a run's id, because
+    then a row nobody looked at would look inspected.
+  */
+  const syncId = `webhook_${new Date().toISOString()}_${merchant.recordId}`;
+
+  if (topic === "products/delete") {
+    const count = await deactivateProductListings(merchant, productId);
+
+    console.log("WEBHOOK product deleted", {
+      merchant: merchant.name,
+      productId,
+      deactivated: count
+    });
+
+    return;
+  }
+
+  const product = await fetchOneProduct(merchant, productId);
+
+  /*
+    Gone between the webhook and this read, or never visible to our token.
+    Treated as a delete, because from here it is indistinguishable from one.
+  */
+  if (!product) {
+    const count = await deactivateProductListings(merchant, productId);
+
+    console.log("WEBHOOK product not readable, treated as gone", {
+      merchant: merchant.name,
+      productId,
+      deactivated: count
+    });
+
+    return;
+  }
+
+  if (product.status !== "ACTIVE") {
+    const count = await deactivateProductListings(merchant, productId);
+
+    console.log("WEBHOOK product no longer active", {
+      merchant: merchant.name,
+      productId,
+      status: product.status,
+      deactivated: count
+    });
+
+    return;
+  }
+
+  /*
+    The risky-match rows for this one product only.
+
+    syncMerchant loads every risky row of the store up front because it is
+    about to walk the whole catalogue. Here one product changed, so one
+    lookup is enough.
+  */
+  const riskyRecords = await fetchAllAirtableRecords(
+    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+    `AND({Merchant Record ID} = '${airtableEscape(merchant.recordId)}', ` +
+      `{Shopify Product ID} = '${airtableEscape(productId)}')`
+  );
+
+  const riskyMap = new Map();
+
+  for (const record of riskyRecords) {
+    const id = record.fields["Shopify Product ID"];
+
+    if (id) riskyMap.set(id, record);
+  }
+
+  const outcome = await syncOneProduct({ merchant, syncId, product, riskyMap });
+
+  console.log("WEBHOOK product synced", {
+    merchant: merchant.name,
+    productId,
+    topic,
+    variants: outcome.variantsCounted,
+    rows: outcome.rowsUpserted
+  });
+}
+
+/*
+  The endpoint.
+
+  Answers 200 to anything it recognises, immediately, and does the work
+  after. A 500 makes Shopify retry, which for a store whose portal lookup is
+  failing means the same product arriving again and again; the log is the
+  place to see that, not the retry queue.
+*/
+app.post("/webhooks/shopify/products", async (req, res) => {
+  if (!verifyShopifyWebhook(req)) {
+    console.warn("WEBHOOK rejected: bad signature", {
+      shop: req.get("X-Shopify-Shop-Domain") || "",
+      topic: req.get("X-Shopify-Topic") || "",
+      configured: Boolean(SHOPIFY_CLIENT_SECRET)
+    });
+
+    return res.status(401).send("unauthorized");
+  }
+
+  const shop = req.get("X-Shopify-Shop-Domain") || "";
+  const topic = req.get("X-Shopify-Topic") || "";
+  const payload = req.body;
+
+  res.status(200).send("ok");
+
+  try {
+    const merchant = await findMerchantByDomain(shop);
+
+    if (!merchant) {
+      console.warn("WEBHOOK for a shop we do not sync", { shop, topic });
+      return;
+    }
+
+    await handleProductWebhook({ merchant, topic, payload });
+  } catch (error) {
+    console.error("WEBHOOK failed", {
+      shop,
+      topic,
+      productId: payload?.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+/*
+  Tell the stores where to send them.
+
+  Run once per store, and again whenever the address changes. Shopify treats
+  the same topic and address as one subscription, so running it twice does
+  not make two.
+*/
+async function registerWebhooksForMerchant(merchant) {
+  const address = `${WEBHOOK_BASE_URL}/webhooks/shopify/products`;
+
+  const existing = await shopifyGraphQL(
+    merchant,
+    `query {
+       webhookSubscriptions(first: 50) {
+         nodes {
+           id
+           topic
+           endpoint {
+             __typename
+             ... on WebhookHttpEndpoint { callbackUrl }
+           }
+         }
+       }
+     }`
+  );
+
+  const already = new Set(
+    (existing.data?.webhookSubscriptions?.nodes || [])
+      .filter((node) => node.endpoint?.callbackUrl === address)
+      .map((node) => node.topic)
+  );
+
+  const added = [];
+  const problems = [];
+
+  for (const topic of WEBHOOK_TOPICS) {
+    if (already.has(topic)) continue;
+
+    const result = await shopifyGraphQL(
+      merchant,
+      `mutation Subscribe($topic: WebhookSubscriptionTopic!, $url: URL!) {
+         webhookSubscriptionCreate(
+           topic: $topic
+           webhookSubscription: { callbackUrl: $url, format: JSON }
+         ) {
+           webhookSubscription { id }
+           userErrors { field message }
+         }
+       }`,
+      { topic, url: address }
+    );
+
+    const errors = result.data?.webhookSubscriptionCreate?.userErrors || [];
+
+    if (errors.length) {
+      problems.push({ topic, error: errors.map((e) => e.message).join("; ") });
+      continue;
+    }
+
+    added.push(topic);
+  }
+
+  return {
+    merchantName: merchant.name,
+    address,
+    alreadyThere: [...already],
+    added,
+    problems
+  };
+}
+
+app.get("/register-webhooks", async (_req, res) => {
+  if (!WEBHOOK_BASE_URL) {
+    return res.status(400).json({
+      success: false,
+      error: "WEBHOOK_BASE_URL is not set, so there is no address to register."
+    });
+  }
+
+  if (!SHOPIFY_CLIENT_SECRET) {
+    return res.status(400).json({
+      success: false,
+      error: "SHOPIFY_CLIENT_SECRET is not set, so arriving webhooks could not be checked."
+    });
+  }
+
+  try {
+    const merchants = await fetchActiveMerchants();
+    const results = [];
+
+    for (const merchant of merchants) {
+      try {
+        results.push(await registerWebhooksForMerchant(merchant));
+      } catch (error) {
+        results.push({
+          merchantName: merchant.name,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      address: `${WEBHOOK_BASE_URL}/webhooks/shopify/products`,
+      results
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The clock
+ *
+ * Two jobs on two very different rhythms, and the reason they differ is
+ * worth writing down.
+ *
+ * The consignment push is small and urgent. Stock moves all day: a consignor
+ * withdraws a pair, somebody else sends one in, a sale takes one away. Each
+ * round is two reads per store and a handful of writes, so it can afford to
+ * run every half hour, and the cost of being late is a pair for sale that we
+ * do not have.
+ *
+ * The catalogue pass is enormous and patient. It reads every active product
+ * of a store because deactivation works by absence, and at the measured pace
+ * the ten active stores are a day's work rather than a night's. So it runs
+ * at night, takes the stores it has not seen for longest, and stops when its
+ * budget is spent. The webhooks carry the hours in between, which is what
+ * makes that acceptable: a store tells us about a change as it happens, and
+ * this pass is the reconciliation that catches what a delivery missed.
+ *
+ * Nothing here starts unless SYNC_CRON_ENABLED is true, and the push writes
+ * nothing unless CONSIGNMENT_APPLY is true. Deploying this changes nothing
+ * on its own, which is the point: the schedules can be watched running dry
+ * against real stores before anything is allowed to touch them.
+ * ------------------------------------------------------------------ */
+
+const CRON_ENABLED = String(process.env.SYNC_CRON_ENABLED || "").toLowerCase() === "true";
+
+const CONSIGNMENT_APPLY =
+  String(process.env.CONSIGNMENT_APPLY || "").toLowerCase() === "true";
+
+/*
+ * How long a night's catalogue pass may take.
+ *
+ * Only checked before starting another store, never in the middle of one: a
+ * store read halfway would have everything it did not reach marked inactive.
+ * So the real end time is this plus however long the last store takes.
+ */
+const PRODUCT_BUDGET_MINUTES = Number(process.env.PRODUCT_SYNC_BUDGET_MINUTES || 300);
+
+const JOBS = {
+  consignment: {
+    schedule: process.env.CRON_CONSIGNMENT || "*/30 * * * *",
+    what: "our consignment stock into every store that asked for it",
+    run: () => pushConsignment({ apply: CONSIGNMENT_APPLY })
+  },
+
+  products: {
+    schedule: process.env.CRON_PRODUCTS || "0 1 * * *",
+    what: "the catalogue pass, longest-unseen stores first, within its budget",
+    run: () =>
+      syncAllMerchants({
+        oldestFirst: true,
+        budgetMs: PRODUCT_BUDGET_MINUTES * 60 * 1000
+      })
+  }
+};
+
+/*
+ * A job never runs twice at once.
+ *
+ * The half-hourly push against ten stores can outlast its half hour on the
+ * first run of a store, and two of them at the same time would each try to
+ * create the same products.
+ */
+const runningJobs = new Set();
+
+async function runJob(name, trigger) {
+  const job = JOBS[name];
+
+  if (!job) throw new Error(`Unknown job ${name}`);
+
+  if (runningJobs.has(name)) {
+    console.log(`SKIPPED ${name}: still running from a previous ${trigger}`);
+    return { skipped: true };
+  }
+
+  runningJobs.add(name);
+
+  const started = Date.now();
+
+  console.log(`START ${name} (${trigger}) - ${job.what}`);
+
+  try {
+    const result = await job.run();
+
+    console.log(`DONE ${name} in ${Math.round((Date.now() - started) / 1000)}s`);
+
+    return { ok: true, result };
+  } catch (error) {
+    /*
+      Never thrown back into the scheduler. An unhandled rejection there
+      takes the whole service down, and with it the webhooks - so one bad
+      night would also cost us every change the stores tried to tell us
+      about while it was gone.
+    */
+    console.error(`FAILED ${name}:`, error.message);
+
+    return { ok: false, error: error.message };
+  } finally {
+    runningJobs.delete(name);
+  }
+}
+
+/*
+ * Run one job now, without waiting for its hour.
+ *
+ * Behind the same secret the portal uses, because these write.
+ */
+app.post("/jobs/:job", async (req, res) => {
+  const secret = String(req.headers["x-kc-secret"] || "");
+
+  if (!KC_PORTAL_SECRET || secret !== KC_PORTAL_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  if (!JOBS[req.params.job]) {
+    return res.status(404).json({ error: `Unknown job ${req.params.job}` });
+  }
+
+  res.json(await runJob(req.params.job, "manual"));
+});
+
+app.get("/jobs", (_req, res) => {
+  res.json({
+    cronEnabled: CRON_ENABLED,
+    consignmentApply: CONSIGNMENT_APPLY,
+    productBudgetMinutes: PRODUCT_BUDGET_MINUTES,
+    timezone: process.env.TZ || "Europe/Amsterdam",
+    running: [...runningJobs],
+    jobs: Object.fromEntries(
+      Object.entries(JOBS).map(([name, job]) => [name, { schedule: job.schedule, what: job.what }])
+    )
+  });
+});
+
+if (CRON_ENABLED) {
+  for (const [name, job] of Object.entries(JOBS)) {
+    cron.schedule(job.schedule, () => runJob(name, "schedule"), {
+      timezone: process.env.TZ || "Europe/Amsterdam"
+    });
+
+    console.log(`SCHEDULED ${name}: ${job.schedule} - ${job.what}`);
+  }
+
+  console.log(
+    CONSIGNMENT_APPLY
+      ? "Consignment push WILL WRITE to stores"
+      : "Consignment push is DRY: it will decide everything and write nothing"
+  );
+} else {
+  console.log("SYNC_CRON_ENABLED is not true, so nothing is scheduled. Routes still work.");
+}
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

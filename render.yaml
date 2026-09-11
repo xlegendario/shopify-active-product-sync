@@ -1,0 +1,103 @@
+# Render Web Service: één always-on service met twee interne schedules.
+#
+# Bewust geen losse Render cron jobs. De twee rondes delen de Shopify rate
+# limit van dezelfde winkels, en de webhooks moeten sowieso in een service
+# staan die altijd luistert. Eén service met node-cron houdt dat bij elkaar.
+#
+# SYNC_CRON_ENABLED en CONSIGNMENT_APPLY staan bewust NIET in dit bestand,
+# maar in het dashboard. Een waarde hier zou ze bij elke push terugzetten.
+# Zolang SYNC_CRON_ENABLED niet op true staat wordt er niets ingepland en
+# verandert deploy van dit bestand niets aan het gedrag.
+#
+# De volgorde om aan te zetten:
+#   1. deployen, niets staat aan, routes werken met de hand
+#   2. SYNC_CRON_ENABLED=true, de consignment push draait droog op schema
+#   3. een nacht meekijken in de logs
+#   4. CONSIGNMENT_APPLY=true, nu schrijft hij echt naar de winkels
+services:
+  - type: web
+    name: shopify-active-product-sync
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: TZ
+        value: Europe/Amsterdam
+
+      # De schakelaar voor de klok. Uit betekent: niets wordt ingepland, de
+      # routes blijven gewoon met de hand aan te roepen.
+      - key: SYNC_CRON_ENABLED
+        sync: false
+
+      # De schakelaar voor het schrijven. Uit betekent: de consignment push
+      # beslist alles, leest alles, en schrijft niets naar de winkels.
+      - key: CONSIGNMENT_APPLY
+        sync: false
+
+      # Elke dertig minuten onze voorraad naar de winkels. Twee reads en een
+      # handvol writes per winkel, dus dit mag vaak.
+      - key: CRON_CONSIGNMENT
+        value: '*/30 * * * *'
+
+      # Eén uur 's nachts de catalogusronde, langst-niet-geziene winkels
+      # eerst. Die ronde leest alles van een winkel, want uitschakelen werkt
+      # op afwezigheid.
+      - key: CRON_PRODUCTS
+        value: '0 1 * * *'
+
+      # Hoeveel minuten die nachtronde mag kosten. Gemeten op 1,9 seconde per
+      # product, en de tien actieve winkels hebben er samen zo'n 44.000, dus
+      # alles in één nacht kan niet. Vijf uur is wat past; wat niet gehaald
+      # wordt staat morgen vooraan. De webhooks dekken de tussenliggende uren
+      # af, dus een winkel die even wacht loopt niet achter.
+      - key: PRODUCT_SYNC_BUDGET_MINUTES
+        value: '300'
+
+      # Welke winkels meedoen. Active? zijn er tien, Test Active? twee.
+      - key: AIRTABLE_MERCHANT_ACTIVE_FIELD
+        value: 'Active?'
+
+      - key: SHOPIFY_API_VERSION
+        value: '2026-01'
+
+      - key: KC_PORTAL_BASE_URL
+        value: https://kickz-caviar-portal.onrender.com
+
+      # Het publieke adres van deze service zelf, waar Shopify zijn webhooks
+      # heen stuurt. Invullen met de eigen Render URL en daarna één keer
+      # /register-webhooks aanroepen.
+      - key: WEBHOOK_BASE_URL
+        sync: false
+
+      # Waar de productfoto's vandaan komen, op volgorde. De eerste winkel
+      # die het paar heeft wint, zodat de plank één huisstijl houdt.
+      - key: PHOTO_SOURCE_MERCHANTS
+        value: SOSU KICKS S.R.L.,ALC SELECT STORE SL,SneakerAsk
+
+      # Secrets: in het Render dashboard invullen, niet hier.
+      #
+      # SHOPIFY_CLIENT_SECRET is dezelfde waarde als bij de onboarding
+      # service. Zonder die waarde weigert het webhook-eindpunt alles, want
+      # dan kan het niet nagaan of een bericht echt van Shopify komt.
+      - key: SHOPIFY_CLIENT_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: AIRTABLE_TOKEN
+        sync: false
+      - key: AIRTABLE_BASE_ID
+        sync: false
+      - key: COUNTER_OFFERS_SECRET
+        sync: false
+      - key: STOCKX_API_KEY
+        sync: false
+      - key: STOCKX_CLIENT_ID
+        sync: false
+      - key: STOCKX_CLIENT_SECRET
+        sync: false
+      - key: STOCKX_REFRESH_TOKEN
+        sync: false
