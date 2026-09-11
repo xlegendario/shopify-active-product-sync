@@ -55,6 +55,23 @@ function stripEuWords(part) {
 }
 
 /*
+ * One spelling for a half size.
+ *
+ * A half is written both ways in the wild - "42.5" and "42 1/2" - and they
+ * are the same shoe. Measured in Airtable's Stock Levels: 2.158 rows use the
+ * dot and 61 use the fraction, and 39 shoes exist under both at once with
+ * their stock split across the two rows, so neither row tells the truth.
+ *
+ * The dot wins because that is what our own consignment stock uses.
+ *
+ * Thirds keep their fraction. "38 2/3" has no decimal anybody writes, and
+ * turning it into 38.67 would only invent a third spelling.
+ */
+function canonicalHalf(size) {
+  return size.replace(/^(\d+)\s*1\/2$/, "$1.5");
+}
+
+/*
  * A European size, or the label unchanged when there is no reading of it.
  *
  * Used both when writing a row to store_listings and when matching our
@@ -81,14 +98,14 @@ export function normalizeSize(value) {
   if (tagged) {
     const stripped = stripEuWords(tagged);
 
-    if (stripped) return stripped;
+    if (stripped) return canonicalHalf(stripped);
   }
 
   // Nothing said at all: a bare number is read as European, which is what
   // every store that writes only a number means.
   const bare = parts.find((part) => !OTHER_SCALE.test(part) && /\d/.test(part));
 
-  if (bare) return stripEuWords(bare) || bare;
+  if (bare) return canonicalHalf(stripEuWords(bare) || bare);
 
   /*
     Only another scale, or no number anywhere. Returned as it stands: a

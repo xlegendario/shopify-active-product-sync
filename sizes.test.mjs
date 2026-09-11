@@ -21,12 +21,6 @@ test("a comma is a decimal point", () => {
   assert.equal(normalizeSize("EU 42,5"), "42.5");
 });
 
-test("thirds survive whole", () => {
-  assert.equal(normalizeSize("38 2/3"), "38 2/3");
-  assert.equal(normalizeSize("42 1/2"), "42 1/2");
-  assert.equal(normalizeSize("40 1/3"), "40 1/3");
-});
-
 test("the European word in front is dropped", () => {
   for (const label of ["EU 42", "EU42", "eu 42", "EUR 42", "EURO 42", "Maat 42", "Size 42", "Talla 42", "Taglia 42"]) {
     assert.equal(normalizeSize(label), "42", `${label} should read as 42`);
@@ -72,6 +66,21 @@ test("nothing in, nothing out", () => {
   assert.equal(normalizeSize(""), "");
   assert.equal(normalizeSize(null), "");
   assert.equal(normalizeSize(undefined), "");
+});
+
+test("a half is written one way, whichever way the store wrote it", () => {
+  // 2.158 rows in Stock Levels use the dot and 61 use the fraction, and 39
+  // shoes sat under both at once with their stock split over two rows.
+  assert.equal(normalizeSize("42 1/2"), "42.5");
+  assert.equal(normalizeSize("EU 42 1/2"), "42.5");
+  assert.equal(normalizeSize("42 1/2 EU"), "42.5");
+  assert.equal(normalizeSize("42 1/2 EU - 9 US"), "42.5");
+});
+
+test("thirds keep their fraction", () => {
+  // Nobody writes 38.67, so a decimal here would only be a third spelling.
+  assert.equal(normalizeSize("38 2/3"), "38 2/3");
+  assert.equal(normalizeSize("40 1/3"), "40 1/3");
 });
 
 test("a real 38 and a 38 2/3 stay two different sizes", () => {
