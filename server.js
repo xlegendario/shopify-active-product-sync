@@ -47,6 +47,9 @@ const AIRTABLE_STOCK_LEVELS_TABLE_NAME =
 
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 
+// How often a throttled call may wait and ask again before giving up.
+const SHOPIFY_THROTTLE_RETRIES = Number(process.env.SHOPIFY_THROTTLE_RETRIES || 8);
+
 /*
   The secret in the webhook address itself.
 
@@ -468,7 +471,25 @@ async function fetchActiveMerchants() {
   return merchants;
 }
 
-async function shopifyGraphQL(merchant, query, variables = {}) {
+/*
+ * Shopify, at the pace Shopify allows.
+ *
+ * FIXED - a throttle was treated as a failure, and that cost a whole store.
+ *
+ * Shopify's GraphQL runs on a leaky bucket: every answer says how much
+ * budget is left and how fast it refills, and asking past empty comes back
+ * as a 200 with "Throttled" among the errors. This threw on any error at
+ * all, so the store's run ended there.
+ *
+ * It was invisible until UNION: 13.323 inventory levels on our location is
+ * 54 pages in a row, which empties the bucket every time. Five of six stores
+ * were updated for hours while UNION quietly failed on every single run.
+ *
+ * Now a throttle is what it actually is - a wait. The budget in the answer
+ * says how long, so this waits exactly that and asks again instead of
+ * guessing at a delay.
+ */
+async function shopifyGraphQL(merchant, query, variables = {}, attempt = 0) {
   const url = `https://${merchant.shopifyDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
   const response = await fetchWithRetry(url, {
@@ -487,6 +508,36 @@ async function shopifyGraphQL(merchant, query, variables = {}) {
     data = JSON.parse(text);
   } catch {
     throw new Error(`Shopify non-JSON response from ${merchant.shopifyDomain}: ${text.slice(0, 500)}`);
+  }
+
+  const throttled = (data.errors || []).some((e) =>
+    String(e?.message || "").toLowerCase().includes("throttl")
+  );
+
+  if (throttled && attempt < SHOPIFY_THROTTLE_RETRIES) {
+    const status = data?.extensions?.cost?.throttleStatus;
+
+    /*
+      Enough budget to get through the next page, worked out from what the
+      shop just told us rather than from a number somebody picked. Falls back
+      to two seconds when the answer carries no budget at all.
+    */
+    const needed = status
+      ? Math.ceil(((status.maximumAvailable / 2 - status.currentlyAvailable) / status.restoreRate) * 1000)
+      : 2000;
+
+    const wait = Math.min(Math.max(needed, 1000), 10000);
+
+    console.warn("Shopify throttled, waiting", {
+      merchant: merchant.name,
+      waitMs: wait,
+      attempt: attempt + 1,
+      budgetLeft: status?.currentlyAvailable
+    });
+
+    await sleep(wait);
+
+    return shopifyGraphQL(merchant, query, variables, attempt + 1);
   }
 
   if (!response.ok || data.errors) {
