@@ -25,7 +25,7 @@ import { planListings, indexCurrentListings } from "./listingPlan.js";
 import { ladderFor } from "./sizeLadders.js";
 import { createStockxClient } from "./stockxSizes.js";
 import { photoSources, photosForSkus, photosFor } from "./storePhotos.js";
-import { createShopifyWriter, applyPlan } from "./shopifyWriter.js";
+import { createShopifyWriter, applyPlan, productImageUrl } from "./shopifyWriter.js";
 import { readStoreState, readOurLocationStock, readFlagSetting } from "./storeState.js";
 
 /*
@@ -379,4 +379,153 @@ export async function runConsignmentForAll({
     apply,
     results
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * Pictures for products that were born without any
+ *
+ * A product gets its photographs when it is made and never again, so a pair
+ * nobody had a picture of that day keeps a blank card for good - even once a
+ * source store starts carrying it. Twenty-seven of UNION's first seven
+ * hundred landed that way, and seven of those had a picture within the hour
+ * once more stores were asked.
+ *
+ * Nothing has to look for pictures here: the consignment run asks for all of
+ * them every half hour, and the library re-asks whatever nobody had once a
+ * day. All that is missing is hanging what was found onto the products that
+ * are still empty, which is what this does.
+ *
+ * Only ever adds. A product with one picture already is left alone, because
+ * a second set from another shop beside the first looks worse than either.
+ * ------------------------------------------------------------------ */
+
+const BLANK_PRODUCTS = `
+  query Blank($cursor: String) {
+    products(first: 250, after: $cursor, query: "status:active") {
+      nodes {
+        id
+        title
+        media(first: 1) { nodes { id } }
+        variants(first: 1) { nodes { sku } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
+const ADD_MEDIA = `
+  mutation add($id: ID!, $media: [CreateMediaInput!]!) {
+    productCreateMedia(productId: $id, media: $media) {
+      media { id }
+      mediaUserErrors { field message }
+    }
+  }
+`;
+
+export async function backfillPhotosForMerchant({ merchant, graphql, photos, apply = false }) {
+  const fields = merchant.fields || {};
+
+  const base = { merchantRecordId: merchant.recordId, merchantName: merchant.name };
+
+  if (!fields["Consignment Sync?"]) return { ...base, skipped: "Consignment Sync is off" };
+
+  const blank = [];
+
+  let cursor = null;
+
+  for (;;) {
+    const data = await graphql(BLANK_PRODUCTS, { cursor });
+
+    for (const product of data?.products?.nodes || []) {
+      if (product.media.nodes.length) continue;
+
+      const sku = String(product.variants.nodes[0]?.sku || "").trim().toUpperCase();
+
+      if (sku) blank.push({ id: product.id, sku, title: product.title });
+    }
+
+    if (!data?.products?.pageInfo?.hasNextPage) break;
+
+    cursor = data.products.pageInfo.endCursor;
+  }
+
+  const fillable = blank
+    .map((item) => ({ ...item, urls: photosFor(photos, item.sku) }))
+    .filter((item) => item.urls.length);
+
+  if (!apply) {
+    return { ...base, dryRun: true, blank: blank.length, fillable: fillable.length };
+  }
+
+  let filled = 0;
+  const problems = [];
+
+  for (const item of fillable) {
+    try {
+      const data = await graphql(ADD_MEDIA, {
+        id: item.id,
+        media: item.urls.map((url) => ({
+          originalSource: productImageUrl(url),
+          mediaContentType: "IMAGE"
+        }))
+      });
+
+      const errors = data?.productCreateMedia?.mediaUserErrors || [];
+
+      if (errors.length) {
+        problems.push({ sku: item.sku, error: errors.map((e) => e.message).join("; ") });
+        continue;
+      }
+
+      filled += 1;
+    } catch (error) {
+      problems.push({ sku: item.sku, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  return {
+    ...base,
+    dryRun: false,
+    blank: blank.length,
+    fillable: fillable.length,
+    filled,
+    problems: problems.slice(0, 10)
+  };
+}
+
+export async function backfillPhotosForAll({
+  merchants,
+  photoSourceMerchants,
+  graphqlFor,
+  supabaseUrl,
+  supabaseKey,
+  apply = false
+}) {
+  const wanted = merchants.filter((m) => Boolean(m.fields?.["Consignment Sync?"]));
+
+  if (!wanted.length) return { merchants: 0, results: [] };
+
+  const stock = await fetchConsignmentStock({ supabaseUrl, supabaseKey });
+
+  const skus = [...new Set(stock.map((row) => String(row.sku || "").trim().toUpperCase()))].filter(Boolean);
+
+  const { photos } = await photosForSkus(skus, { sources: photoSources(photoSourceMerchants) });
+
+  const results = [];
+
+  for (const merchant of wanted) {
+    try {
+      results.push(
+        await backfillPhotosForMerchant({ merchant, graphql: graphqlFor(merchant), photos, apply })
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      console.error("PHOTO BACKFILL FAILED", { merchantName: merchant.name, error: message });
+
+      results.push({ merchantName: merchant.name, error: message });
+    }
+  }
+
+  return { merchants: wanted.length, apply, results };
 }

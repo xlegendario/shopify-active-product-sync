@@ -17,15 +17,24 @@ const ONLINE_STORE = "Online Store";
  * ------------------------------------------------------------------ */
 
 /*
- * A StockX image at a usable size.
+ * The picture URL as Shopify will be handed it.
  *
- * Kept only as the last resort. What SKU Master holds is a thumbnail, and
- * asking for it larger makes it bigger rather than sharper - fine in a table
- * row, wrong on a product page. Real photographs come from storePhotos.js,
- * borrowed from the merchants who do photograph their stock.
+ * WARNING - the padding here does nothing, and it was measured rather than
+ * read: fit, bg, w and h are imgix parameters, and cdn.shopify.com ignores
+ * any parameter it does not know. A 1080x1080 square comes back 1080x1080
+ * square however politely we ask for 1200x900 on white.
  *
- * A pair without any picture still gets a page. A shop with a missing image
- * is a shop; a shop missing the shoe is not.
+ * It is kept because it costs nothing and a source that does understand them
+ * would be served correctly. What it must NOT be taken for is a guarantee
+ * that every picture arrives the same shape. They do not: most are 1.67
+ * wide, a few are square and a few are twice as wide as they are tall, and
+ * in a card with a fixed frame that is the difference between a shoe sitting
+ * neatly in the middle and one filling the whole tile.
+ *
+ * Shopify's own width/height/crop parameters cannot fix it either. They crop
+ * instead of padding and never enlarge, so a small square stays a square.
+ * Evening that out belongs in the storefront's theme, where one fixed ratio
+ * with the image contained on white settles every product at once.
  */
 export function productImageUrl(pictureUrl, { width = 1200, height = 900 } = {}) {
   const raw = String(pictureUrl || "").trim();

@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import cron from "node-cron";
 import { createClient } from "@supabase/supabase-js";
 
-import { runConsignmentForAll } from "./consignmentRun.js";
+import { runConsignmentForAll, backfillPhotosForAll } from "./consignmentRun.js";
 import { normalizeSize } from "./sizes.js";
 
 const app = express();
@@ -2257,12 +2257,12 @@ app.get("/run-stock-level-push", async (req, res) => {
  * Separated from the route so the nightly clock and the URL run the same
  * thing rather than two things that resemble each other.
  */
-async function pushConsignment({ apply }) {
+async function consignmentInputs() {
   assertEnv();
 
   const merchants = await fetchActiveMerchants();
 
-  return runConsignmentForAll({
+  return {
     merchants,
 
     /*
@@ -2285,11 +2285,27 @@ async function pushConsignment({ apply }) {
       shopifyGraphQL(merchant, query, variables).then((body) => body.data),
 
     supabaseUrl: SUPABASE_URL,
-    supabaseKey: SUPABASE_SERVICE_ROLE_KEY,
-    apply,
+    supabaseKey: SUPABASE_SERVICE_ROLE_KEY
+  };
+}
 
+async function pushConsignment({ apply }) {
+  return runConsignmentForAll({
+    ...(await consignmentInputs()),
+    apply,
     onProgress: (step) => console.log("CONSIGNMENT PUSH", step)
   });
+}
+
+/*
+ * Pictures onto products that were created before anyone had one.
+ *
+ * Separate from the push because it is a repair, not the daily work, and
+ * because it walks a store's whole catalogue where the push only looks at
+ * our own shelf.
+ */
+async function backfillPhotos({ apply }) {
+  return backfillPhotosForAll({ ...(await consignmentInputs()), apply });
 }
 
 /*
@@ -2764,6 +2780,18 @@ const JOBS = {
     schedule: process.env.CRON_CONSIGNMENT || "*/30 * * * *",
     what: "our consignment stock into every store that asked for it",
     run: () => pushConsignment({ apply: CONSIGNMENT_APPLY })
+  },
+
+  photos: {
+    /*
+      Weekly, at an hour nothing else runs. A picture appearing for a pair
+      nobody had is rare, and the library already re-asks for those daily by
+      itself - this only hangs what it found onto the products that are
+      still blank.
+    */
+    schedule: process.env.CRON_PHOTOS || "0 5 * * 1",
+    what: "pictures onto products that were created without any",
+    run: () => backfillPhotos({ apply: CONSIGNMENT_APPLY })
   },
 
   products: {
