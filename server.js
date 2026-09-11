@@ -2721,15 +2721,31 @@ const WEBHOOK_QUEUE_MAX = Number(process.env.WEBHOOK_QUEUE_MAX || 5000);
 
 const webhookQueue = new Map();
 
-let webhookWorking = false;
+/*
+ * How many at a time.
+ *
+ * One was not enough, measured on the real rate: arrivals ran at about 340 a
+ * minute and one worker managed 155, so the queue grew two to one and would
+ * have started dropping within twenty minutes.
+ *
+ * Each item is waiting on the network, not on this machine - a style code
+ * from the portal, a product from Shopify, a write to Supabase - so four in
+ * parallel is four times the work and no more CPU. Deliberately not higher:
+ * the point of a queue is to have a ceiling, and Airtable is no longer on
+ * this path so the only limits left are per-store ones that spread out by
+ * themselves.
+ */
+const WEBHOOK_WORKERS = Number(process.env.WEBHOOK_WORKERS || 4);
+
+let webhookWorkers = 0;
 let webhookDropped = 0;
 let webhookDone = 0;
 let webhookFailed = 0;
 
 async function drainWebhookQueue() {
-  if (webhookWorking) return;
+  if (webhookWorkers >= WEBHOOK_WORKERS) return;
 
-  webhookWorking = true;
+  webhookWorkers += 1;
 
   try {
     while (webhookQueue.size) {
@@ -2761,7 +2777,7 @@ async function drainWebhookQueue() {
       }
     }
   } finally {
-    webhookWorking = false;
+    webhookWorkers -= 1;
   }
 }
 
@@ -2817,7 +2833,10 @@ app.post("/webhooks/shopify/products/:secret", (req, res) => {
     }
   }
 
-  drainWebhookQueue();
+  // Start er een bij zolang er ruimte is; een lopende werker pakt de rest.
+  while (webhookWorkers < WEBHOOK_WORKERS && webhookQueue.size > webhookWorkers) {
+    drainWebhookQueue();
+  }
 });
 
 /*
@@ -2826,7 +2845,8 @@ app.post("/webhooks/shopify/products/:secret", (req, res) => {
 app.get("/webhooks/status", (_req, res) => {
   res.json({
     waiting: webhookQueue.size,
-    working: webhookWorking,
+    workers: webhookWorkers,
+    workerMax: WEBHOOK_WORKERS,
     done: webhookDone,
     failed: webhookFailed,
     dropped: webhookDropped,
