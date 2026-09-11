@@ -2314,12 +2314,62 @@ async function consignmentInputs() {
   };
 }
 
+/*
+ * Why a pair did not make it, in words rather than in a key.
+ */
+const REJECTION_WORDS = {
+  margin_too_thin: "de prijs van de winkel laat te weinig marge over",
+  no_price_in_store: "de winkel verkoopt dit paar niet",
+  no_margin_method_configured: "deze winkel heeft geen margeregel ingevuld",
+  no_vat_rate_configured: "deze winkel heeft geen btw-tarief ingevuld"
+};
+
+/*
+ * The outcome, written back onto the merchant.
+ *
+ * The numbers existed only in the log, which scrolls. They belong on the row
+ * the settings live on, so "how much of our stock does this store actually
+ * take" is a column instead of a question.
+ *
+ * Six writes every half hour, and never on the webhook path - that is the one
+ * that has to stay clear of Airtable.
+ */
+async function recordConsignmentOutcome(results) {
+  for (const result of results || []) {
+    if (!result?.merchantRecordId || result.skipped || result.error) continue;
+
+    const reasons = Object.entries(result.rejectedReasons || {})
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, count]) => `${count}x ${REJECTION_WORDS[reason] || reason}`)
+      .join("\n");
+
+    try {
+      await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, result.merchantRecordId, {
+        "Consignment Listed": Number(result.wanted || 0),
+        "Consignment Rejected": Number(result.rejected || 0),
+        "Consignment Last Run": new Date().toISOString(),
+        "Consignment Detail": reasons || "alles kwam door de poort"
+      });
+    } catch (error) {
+      // Never worth failing a finished run over: the stock is already right.
+      console.warn("Could not write the consignment outcome back", {
+        merchant: result.merchantName,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+}
+
 async function pushConsignment({ apply }) {
-  return runConsignmentForAll({
+  const result = await runConsignmentForAll({
     ...(await consignmentInputs()),
     apply,
     onProgress: (step) => console.log("CONSIGNMENT PUSH", step)
   });
+
+  await recordConsignmentOutcome(result.results);
+
+  return result;
 }
 
 /*
