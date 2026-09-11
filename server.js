@@ -8,23 +8,7 @@ import { normalizeSize } from "./sizes.js";
 
 const app = express();
 
-/*
-  The parsed body for every route, plus the bytes it was parsed from.
-
-  Shopify signs the raw payload, so a webhook cannot be checked against
-  JSON.stringify of the parsed object - key order and number formatting are
-  not guaranteed to survive the round trip, and a single re-ordered key makes
-  a genuine webhook look forged. Capturing the buffer here leaves every
-  existing route untouched.
-*/
-app.use(
-  express.json({
-    limit: "2mb",
-    verify: (req, _res, buffer) => {
-      req.rawBody = buffer;
-    }
-  })
-);
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 10000;
 
@@ -64,20 +48,29 @@ const AIRTABLE_STOCK_LEVELS_TABLE_NAME =
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
 
 /*
-  The app's client secret, which is what Shopify signs webhooks with.
+  The secret in the webhook address itself.
 
-  The same value the onboarding service calls SHOPIFY_CLIENT_SECRET, because
-  it is the same app - the one the stores install. Without it the webhook
-  route refuses everything rather than trusting whoever calls it.
+  CHANGED from the app's client secret, which cannot work here.
+
+  Shopify signs a webhook with the secret of the app that created the
+  subscription, and there is no single app: a custom app belongs to one
+  store, so seven distribution links are seven apps with seven secrets, and
+  the five stores that built the app inside their own admin have secrets we
+  will never hold. One SHOPIFY_CLIENT_SECRET could therefore verify exactly
+  one store and would silently reject the other eleven.
+
+  So the address carries the proof instead. Each store is registered at
+  .../webhooks/shopify/products/<secret>, an address only Shopify and this
+  service know, and an arriving call has to name it. One value, every store,
+  nothing to collect from a Partner dashboard.
+
+  It is weaker than a signature per message, and that is affordable here
+  because a webhook is only ever a hint: nothing is written from what it
+  says. The product is read back from Shopify with our own token first, and
+  a delete is confirmed against Shopify before anything is switched off.
 */
-const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || "";
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 
-/*
-  The webhook's own base URL, which Shopify posts to.
-
-  Shopify has to be told this once per store, and it must be the public
-  address of this service - not localhost, and not the portal.
-*/
 const WEBHOOK_BASE_URL = (process.env.WEBHOOK_BASE_URL || "").replace(/\/$/, "");
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "100", 10);
 
@@ -2364,26 +2357,16 @@ app.get("/run-consignment-push", async (req, res) => {
 const WEBHOOK_TOPICS = ["PRODUCTS_CREATE", "PRODUCTS_UPDATE", "PRODUCTS_DELETE"];
 
 /*
-  Was this really Shopify?
+  Did this arrive at the address only Shopify was given?
 
-  Compared byte for byte in constant time. A plain === on secrets leaks their
-  contents through how long it takes to fail, and whoever can forge a
-  signature can write into store_listings.
+  Compared byte for byte in constant time. A plain === on a secret leaks its
+  contents through how long it takes to fail.
 */
-function verifyShopifyWebhook(req) {
-  if (!SHOPIFY_CLIENT_SECRET) return false;
+function verifyWebhookSecret(given) {
+  if (!WEBHOOK_SECRET) return false;
 
-  const sent = String(req.get("X-Shopify-Hmac-Sha256") || "");
-
-  if (!sent || !req.rawBody) return false;
-
-  const expected = crypto
-    .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
-    .update(req.rawBody)
-    .digest("base64");
-
-  const a = Buffer.from(sent, "utf8");
-  const b = Buffer.from(expected, "utf8");
+  const a = Buffer.from(String(given || ""), "utf8");
+  const b = Buffer.from(WEBHOOK_SECRET, "utf8");
 
   if (a.length !== b.length) return false;
 
@@ -2506,18 +2489,18 @@ async function handleProductWebhook({ merchant, topic, payload }) {
   */
   const syncId = `webhook_${new Date().toISOString()}_${merchant.recordId}`;
 
-  if (topic === "products/delete") {
-    const count = await deactivateProductListings(merchant, productId);
+  /*
+    Every topic, delete included, is checked against Shopify before anything
+    is switched off.
 
-    console.log("WEBHOOK product deleted", {
-      merchant: merchant.name,
-      productId,
-      deactivated: count
-    });
+    A delete used to be taken at its word, which was the one thing a forged
+    call could have done damage with: name a product id and its listings go
+    dark. Now the answer comes from Shopify with our own token, so a call
+    that claims a deletion that did not happen changes nothing.
 
-    return;
-  }
-
+    It also covers the honest case of a webhook arriving twice, or late,
+    after the product came back.
+  */
   const product = await fetchOneProduct(merchant, productId);
 
   /*
@@ -2589,12 +2572,12 @@ async function handleProductWebhook({ merchant, topic, payload }) {
   failing means the same product arriving again and again; the log is the
   place to see that, not the retry queue.
 */
-app.post("/webhooks/shopify/products", async (req, res) => {
-  if (!verifyShopifyWebhook(req)) {
-    console.warn("WEBHOOK rejected: bad signature", {
+app.post("/webhooks/shopify/products/:secret", async (req, res) => {
+  if (!verifyWebhookSecret(req.params.secret)) {
+    console.warn("WEBHOOK rejected: wrong address", {
       shop: req.get("X-Shopify-Shop-Domain") || "",
       topic: req.get("X-Shopify-Topic") || "",
-      configured: Boolean(SHOPIFY_CLIENT_SECRET)
+      configured: Boolean(WEBHOOK_SECRET)
     });
 
     return res.status(401).send("unauthorized");
@@ -2633,7 +2616,7 @@ app.post("/webhooks/shopify/products", async (req, res) => {
   not make two.
 */
 async function registerWebhooksForMerchant(merchant) {
-  const address = `${WEBHOOK_BASE_URL}/webhooks/shopify/products`;
+  const address = `${WEBHOOK_BASE_URL}/webhooks/shopify/products/${WEBHOOK_SECRET}`;
 
   const existing = await shopifyGraphQL(
     merchant,
@@ -2704,10 +2687,10 @@ app.get("/register-webhooks", async (_req, res) => {
     });
   }
 
-  if (!SHOPIFY_CLIENT_SECRET) {
+  if (!WEBHOOK_SECRET) {
     return res.status(400).json({
       success: false,
-      error: "SHOPIFY_CLIENT_SECRET is not set, so arriving webhooks could not be checked."
+      error: "WEBHOOK_SECRET is not set, so arriving webhooks could not be told apart from anyone else's."
     });
   }
 
@@ -2726,11 +2709,11 @@ app.get("/register-webhooks", async (_req, res) => {
       }
     }
 
-    res.json({
-      success: true,
-      address: `${WEBHOOK_BASE_URL}/webhooks/shopify/products`,
-      results
-    });
+    /*
+      The address is deliberately not echoed back. It carries the secret, and
+      an answer gets pasted into a chat window without thinking twice.
+    */
+    res.json({ success: true, results: results.map(({ address, ...rest }) => rest) });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }

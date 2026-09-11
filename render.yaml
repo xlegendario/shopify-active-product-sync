@@ -78,10 +78,19 @@ services:
 
       # Secrets: in het Render dashboard invullen, niet hier.
       #
-      # SHOPIFY_CLIENT_SECRET is dezelfde waarde als bij de onboarding
-      # service. Zonder die waarde weigert het webhook-eindpunt alles, want
-      # dan kan het niet nagaan of een bericht echt van Shopify komt.
-      - key: SHOPIFY_CLIENT_SECRET
+      # WEBHOOK_SECRET is een willekeurige waarde die jij verzint. Hij komt
+      # in het webhook-adres te staan, en een binnenkomende melding moet dat
+      # adres noemen om binnen te komen.
+      #
+      # Bewust GEEN client secret van een Shopify-app. Een custom app hoort
+      # bij een winkel, dus twaalf winkels zijn twaalf apps met twaalf
+      # secrets, en van de vijf die de app in hun eigen admin maakten hebben
+      # we er sowieso geen. Een adres dat alleen Shopify en wij kennen werkt
+      # voor alle twaalf en hoeft nergens opgehaald te worden.
+      #
+      # Genereer hem met:
+      #   node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+      - key: WEBHOOK_SECRET
         sync: false
       - key: SUPABASE_URL
         sync: false
