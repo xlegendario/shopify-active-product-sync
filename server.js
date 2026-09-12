@@ -2884,7 +2884,7 @@ app.post("/webhooks/shopify/products/:secret", (req, res) => {
     }
   }
 
-  // Start er een bij zolang er ruimte is; een lopende werker pakt de rest.
+  // Start another while there is room; a running worker picks up the rest.
   while (webhookWorkers < WEBHOOK_WORKERS && webhookQueue.size > webhookWorkers) {
     drainWebhookQueue();
   }
