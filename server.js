@@ -1189,23 +1189,76 @@ async function upsertStoreListingsSupabase(rows) {
   return Array.from({ length: affected }, (_, i) => ({ id: i }));
 }
 
-async function deactivateOldListingsSupabase(merchant, syncId) {
-  const { data, error } = await supabase
-    .from("store_listings")
-    .update({
-      status: "inactive",
-      updated_at: new Date().toISOString()
-    })
-    .eq("merchant_record_id", merchant.recordId)
-    .eq("status", "active")
-    .neq("last_seen_sync_id", syncId)
-    .select("id");
+/*
+ * Switch off what this pass did not see - by time, and in small bites.
+ *
+ * FIXED - two faults, the first hiding the second.
+ *
+ * It was one UPDATE over every row of the store, filtered on "not stamped
+ * with tonight's sync id". Supabase cancels a statement after eight seconds,
+ * and on a store of any size that read alone took longer: 27 seconds for
+ * DripOrDrop, far more for SOSU's 272.000 rows. So the store failed at the
+ * very last step, after hours of reading, kept its old Last Shopify Sync At,
+ * went to the front of the queue again and failed again the next night. Nine
+ * of eleven stores had not completed a pass in days, DripOrDrop not since May.
+ *
+ * And the filter itself was wrong. A webhook arriving during the pass
+ * re-stamps a product the pass had already read with its own webhook id, so
+ * the cleanup would have switched that live product off. The timeout was the
+ * only thing stopping it, and on SOSU a pass takes eight hours.
+ *
+ * Now: a row survives when anything touched it after the pass started - the
+ * pass itself or a webhook, both write last_shopify_sync_at. Read through the
+ * index on (merchant_record_id, status, last_shopify_sync_at), a few hundred
+ * ids at a time, each update well inside the limit however big the store.
+ * The update repeats the condition, so a webhook landing between the read
+ * and the write still wins.
+ */
+const CLEANUP_BATCH = 500;
 
-  if (error) {
-    throw new Error(`Supabase inactive cleanup error: ${error.message}`);
+// A minute of slack for rows written in the same instant the pass began.
+const CLEANUP_SAFETY_MS = 60 * 1000;
+
+async function deactivateOldListingsSupabase(merchant, passStartedAt) {
+  const cutoff = new Date(passStartedAt - CLEANUP_SAFETY_MS).toISOString();
+  let total = 0;
+
+  for (;;) {
+    const { data: stale, error: readError } = await supabase
+      .from("store_listings")
+      .select("id")
+      .eq("merchant_record_id", merchant.recordId)
+      .eq("status", "active")
+      .lt("last_shopify_sync_at", cutoff)
+      .limit(CLEANUP_BATCH);
+
+    if (readError) {
+      throw new Error(`Supabase inactive cleanup error: ${readError.message}`);
+    }
+
+    if (!stale?.length) break;
+
+    const { data: switchedOff, error: writeError } = await supabase
+      .from("store_listings")
+      .update({
+        status: "inactive",
+        updated_at: new Date().toISOString()
+      })
+      .in("id", stale.map((row) => row.id))
+      .eq("status", "active")
+      .lt("last_shopify_sync_at", cutoff)
+      .select("id");
+
+    if (writeError) {
+      throw new Error(`Supabase inactive cleanup error: ${writeError.message}`);
+    }
+
+    total += switchedOff?.length || 0;
+
+    if (stale.length < CLEANUP_BATCH) break;
   }
 
-  return data?.length || 0;
+  return total;
 }
 
 
@@ -1426,6 +1479,9 @@ async function syncOneProduct({ merchant, syncId, product, riskyMap, skipRiskyMa
 async function syncMerchant(merchant, runId) {
   const syncId = `${runId}_${merchant.recordId}`;
 
+  // Before the first read: anything written after this was seen.
+  const passStartedAt = Date.now();
+
   console.log("Syncing merchant", {
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
@@ -1492,7 +1548,7 @@ async function syncMerchant(merchant, runId) {
   let deactivated = 0;
 
   if (failedProducts === 0) {
-    deactivated = await deactivateOldListingsSupabase(merchant, syncId);
+    deactivated = await deactivateOldListingsSupabase(merchant, passStartedAt);
   } else {
     console.warn("Skipping Supabase inactive cleanup because products failed", {
       merchantRecordId: merchant.recordId,
