@@ -316,10 +316,27 @@ export async function readStoreState(graphql, { locationId, includeCatalogue = n
       keep its hands off their prices. Keyed by variant id because that is
       what a plan entry carries.
     */
-    theirStock: new Map(
-      [...catalogue, ...ours]
-        .filter((row) => row.otherStock > 0)
-        .map((row) => [row.variantId, row.otherStock])
-    )
+    /*
+      FIXED - our own stock counted as theirs.
+
+      A catalogue row carries the store-wide quantity, and that includes what
+      we hold on our location. It was filtered and put in the map before the
+      location rows, and a location row with nothing elsewhere was filtered
+      out before it could correct it. So every variant we stock at a store
+      with a second location read as the store's own, and its price was never
+      set: UNION kept the price a page was created at (Maison Mihara at 248
+      against 188 for a 126 ask) on all 1.939 pairs it lists from us.
+
+      Now a variant with a level on our location is judged by that row alone
+      - the store-wide quantity minus ours - and the catalogue figure only
+      speaks for variants we do not stock.
+    */
+    theirStock: (() => {
+      const other = new Map(catalogue.map((row) => [row.variantId, row.otherStock]));
+
+      for (const row of ours) other.set(row.variantId, row.otherStock);
+
+      return new Map([...other].filter(([, amount]) => amount > 0));
+    })()
   };
 }
