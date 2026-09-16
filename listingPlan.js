@@ -201,6 +201,13 @@ export function planListings({
         setPrices.push({
           sku,
           size: listing.size,
+          /*
+            FIXED - missing, so the writer sent its "DRY" placeholder as the
+            product and Shopify refused every price update. The refusal is
+            kept as a problem rather than thrown, so nothing looked wrong:
+            no price was ever changed by this push.
+          */
+          productId: product.productId,
           variantId: variant.variantId,
           from: variant.price,
           to: listing.sellingPrice
