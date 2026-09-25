@@ -38,7 +38,7 @@ export async function fetchConsignmentStock({ supabaseUrl, supabaseKey }) {
   const rows = [];
 
   for (let from = 0; ; from += 1000) {
-    const page = await fetch(
+    const response = await fetch(
       `${supabaseUrl}/rest/v1/consignment_inventory` +
         `?select=id,sku,size,vat_type,selling_price_suggested,quantity,seller_id,` +
         `seller_record_id,brand,product_name&quantity=gt.0`,
@@ -49,9 +49,27 @@ export async function fetchConsignmentStock({ supabaseUrl, supabaseKey }) {
           Range: `${from}-${from + 999}`
         }
       }
-    ).then((r) => r.json());
+    );
 
-    if (!Array.isArray(page) || !page.length) break;
+    const page = await response.json().catch(() => null);
+
+    /*
+      A database that is down has to sound like a database that is down.
+
+      This read treated anything that was not an array as "no more rows" and
+      handed back what it had - which for a 503 on the first page is an empty
+      shelf. The push then concluded that nothing belonged in any store any
+      more and set every quantity to zero, in every shop, on 25-09-2026 while
+      Supabase was unreachable.
+    */
+    if (!response.ok || !Array.isArray(page)) {
+      throw new Error(
+        `Consignment stock could not be read (${response.status}): ` +
+        `${JSON.stringify(page).slice(0, 150)}`
+      );
+    }
+
+    if (!page.length) break;
 
     rows.push(...page);
 
@@ -332,6 +350,16 @@ export async function runConsignmentForAll({
 
   const stock = await fetchConsignmentStock({ supabaseUrl, supabaseKey });
 
+  /*
+    An empty shelf is never a fact worth acting on. We always hold stock, so
+    nothing to list means something went wrong upstream - and acting on it
+    would clear every store. Stopping here costs one run; the next one half
+    an hour later puts it right.
+  */
+  if (!stock.length) {
+    return { merchants: 0, results: [], message: "Consignment stock came back empty - nothing was touched" };
+  }
+
   const skus = [...new Set(stock.map((row) => String(row.sku || "").trim().toUpperCase()))]
     .filter(Boolean)
     .sort();
@@ -506,6 +534,16 @@ export async function backfillPhotosForAll({
   if (!wanted.length) return { merchants: 0, results: [] };
 
   const stock = await fetchConsignmentStock({ supabaseUrl, supabaseKey });
+
+  /*
+    An empty shelf is never a fact worth acting on. We always hold stock, so
+    nothing to list means something went wrong upstream - and acting on it
+    would clear every store. Stopping here costs one run; the next one half
+    an hour later puts it right.
+  */
+  if (!stock.length) {
+    return { merchants: 0, results: [], message: "Consignment stock came back empty - nothing was touched" };
+  }
 
   const skus = [...new Set(stock.map((row) => String(row.sku || "").trim().toUpperCase()))].filter(Boolean);
 
