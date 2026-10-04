@@ -377,18 +377,33 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
         */
         inventoryPolicy: "DENY",
         /*
-          FIXED - this said name and quantity, which is the shape
-          inventorySetQuantities takes. On a variant the field is an
-          InventoryLevelInput and wants availableQuantity, and Shopify
-          refused the whole batch over it: the product was created with its
-          options and photographs and then stood there with one variant.
+          Only the sizes we actually hold get a level at our location.
 
-          Two shapes for the same idea, one per mutation. Worth the note,
-          because reading either one alone gives no hint the other differs.
+          The field shape is worth a note: on a variant this is an
+          InventoryLevelInput wanting availableQuantity, while
+          inventorySetQuantities takes name and quantity. Two shapes for one
+          idea, and reading either alone gives no hint the other differs.
+
+          FIXED - this passed a level for every size in the ladder, zero
+          included. A level is what puts a variant on our shelf, so a page
+          with 27 sizes of which we hold three put 27 rows there. For a
+          store whose whole catalogue we built that is the difference
+          between four thousand rows and twenty-eight thousand.
+
+          And the push reads our location in full before it decides
+          anything, so past a certain size it cannot: UNION Amsterdam
+          stopped syncing on 28-09-2026 because reading 27.881 rows runs
+          out of Shopify's rate limit, which killed the run that would have
+          cleaned them up. A shop too big to read is a shop that can never
+          get smaller.
+
+          A size we do not hold needs no level: plan.activate connects a
+          variant the moment stock for it arrives, which is the one place
+          that should ever put something on our shelf.
         */
-        inventoryQuantities: [
-          { locationId: locationGid, availableQuantity: held ? held.quantity : 0 }
-        ]
+        ...(held && held.quantity > 0
+          ? { inventoryQuantities: [{ locationId: locationGid, availableQuantity: held.quantity }] }
+          : {})
       };
     });
 
