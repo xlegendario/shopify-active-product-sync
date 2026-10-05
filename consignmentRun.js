@@ -282,6 +282,108 @@ async function rememberShopPrices({ merchantRecordId, pairs, supabaseUrl, supaba
 }
 
 /*
+ * A page we just built, written into the catalogue mirror straight away.
+ *
+ * store_listings is our copy of what a shop sells, and the pricing screen in
+ * the store portal reads it. It is filled by the nightly catalogue pass, so
+ * a product this run created was invisible on that screen until the small
+ * hours - a store could not name a price for a shoe on the day it arrived.
+ *
+ * Only for the pages this run touched, which on almost every run is none.
+ * The twelve Fear of God styles that prompted this were one afternoon's
+ * work; the usual number is zero and then this costs nothing.
+ *
+ * Read back from the shop rather than assembled from the plan: the ids, the
+ * title and the image are Shopify's answer, which is what the nightly pass
+ * would have written too. One wrong guess here is a row that never matches
+ * anything again.
+ */
+const PAGE_BY_SKU = `
+  query paginaBijSku($q: String!) {
+    products(first: 3, query: $q) {
+      nodes {
+        id
+        title
+        vendor
+        status
+        featuredImage { url }
+        variants(first: 100) {
+          nodes { id title sku inventoryItem { id } }
+        }
+      }
+    }
+  }
+`;
+
+export async function mirrorPages({ graphql, merchant, skus, supabaseUrl, supabaseKey }) {
+  if (!skus.length || !supabaseUrl || !supabaseKey) return 0;
+
+  const rows = [];
+  const now = new Date().toISOString();
+
+  for (const sku of skus) {
+    const data = await graphql(PAGE_BY_SKU, { q: `sku:${sku}` }).catch(() => null);
+
+    const page = (data?.products?.nodes || []).find((product) =>
+      (product.variants?.nodes || []).some((variant) => normalizeSku(variant.sku) === sku)
+    );
+
+    if (!page) continue;
+
+    for (const variant of page.variants?.nodes || []) {
+      if (normalizeSku(variant.sku) !== sku) continue;
+
+      rows.push({
+        merchant_record_id: merchant.recordId,
+        merchant_name: merchant.name,
+        shopify_product_id: String(page.id).split("/").pop(),
+        shopify_variant_id: String(variant.id).split("/").pop(),
+        shopify_inventory_item_id: variant.inventoryItem?.id
+          ? String(variant.inventoryItem.id).split("/").pop()
+          : null,
+        shopify_product_name: page.title,
+        shopify_sku: variant.sku,
+        sku,
+        size: sizeKey(variant.title),
+        brand: page.vendor || null,
+        picture_url: page.featuredImage?.url || null,
+        status: page.status === "ACTIVE" ? "active" : String(page.status || "").toLowerCase(),
+        last_shopify_sync_at: now,
+        updated_at: now
+      });
+    }
+  }
+
+  if (!rows.length) return 0;
+
+  /*
+    On the variant, which is what the table is unique on. A row the nightly
+    pass already wrote is updated rather than doubled.
+  */
+  const response = await fetch(
+    `${String(supabaseUrl).replace(/[/]+$/, "")}/rest/v1/store_listings?on_conflict=merchant_record_id,shopify_product_id,shopify_variant_id`,
+    {
+      method: "POST",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: "Bearer " + supabaseKey,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=minimal"
+      },
+      body: JSON.stringify(rows)
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+
+    throw new Error("pages not mirrored (" + response.status + "): " + body.slice(0, 150));
+  }
+
+  return rows.length;
+}
+
+/*
  * Which pair carries which price once this run has landed.
  *
  * Starts at what the shop asks today and is overruled by what we are about
@@ -418,29 +520,6 @@ export async function runConsignmentForMerchant({
     (change) => change.to > 0 && !state.ourVariantIds.has(change.variantId)
   );
 
-  /*
-    The shelf as the pricing screen will show it.
-
-    After the plan, so a price we are about to set is the price the store
-    sees, and only on a real run - a dry run that writes to the database is
-    not a dry run.
-
-    Never allowed to hold up the push: a price nobody stored is a stale
-    number on a screen, not a pair in the wrong place.
-  */
-  const prices = apply && priceSync
-    ? await rememberShopPrices({
-        merchantRecordId: merchant.recordId,
-        pairs: pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices }),
-        supabaseUrl,
-        supabaseKey
-      }).catch((err) => {
-        console.error("CONSIGNMENT PRICES NOT STORED", { merchant: merchant.name, error: err.message });
-
-        return { written: 0, cleared: 0, added: 0 };
-      })
-    : { written: 0, cleared: 0, added: 0 };
-
   const counts = {
     onOurLocation: state.ourRows,
     storeCatalogueRows: state.catalogueRows,
@@ -456,10 +535,7 @@ export async function runConsignmentForMerchant({
       return seen;
     }, {}),
     activate: plan.activate.length,
-    pricesLeftAlone: pricesLeftAlone.length,
-    pricesRemembered: prices.written,
-    pricesAdded: prices.added,
-    pricesCleared: prices.cleared
+    pricesLeftAlone: pricesLeftAlone.length
   };
 
   if (!apply) {
@@ -467,6 +543,10 @@ export async function runConsignmentForMerchant({
       ...base,
       dryRun: true,
       ...counts,
+      pagesMirrored: 0,
+      pricesRemembered: 0,
+      pricesAdded: 0,
+      pricesCleared: 0,
       setFlags: flagChangesFor(afterPlan(state.rows, plan), flag).length
     };
   }
@@ -478,6 +558,45 @@ export async function runConsignmentForMerchant({
   );
 
   const report = await applyPlan(plan, writer, { photosBySku });
+
+  /*
+    A page we just built belongs in the catalogue mirror now, not after the
+    nightly pass: the pricing screen reads that mirror, and a store that
+    cannot name a price for a shoe on the day it arrives has a screen that
+    is always a day behind.
+
+    Never allowed to hold up the push. A row that did not land is a shoe
+    missing from a screen until tonight, which is where we were anyway.
+  */
+  const touched = [...new Set([
+    ...plan.createProducts.map((entry) => entry.sku),
+    ...plan.addSizes.map((entry) => entry.sku)
+  ])];
+
+  const pagesMirrored = touched.length
+    ? await mirrorPages({ graphql, merchant, skus: touched, supabaseUrl, supabaseKey }).catch((err) => {
+        console.error("CONSIGNMENT PAGES NOT MIRRORED", { merchant: merchant.name, error: err.message });
+
+        return 0;
+      })
+    : 0;
+
+  /*
+    And then the prices, which need those rows to exist - which is why this
+    sits after the writing rather than beside the plan.
+  */
+  const prices = priceSync
+    ? await rememberShopPrices({
+        merchantRecordId: merchant.recordId,
+        pairs: pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices }),
+        supabaseUrl,
+        supabaseKey
+      }).catch((err) => {
+        console.error("CONSIGNMENT PRICES NOT STORED", { merchant: merchant.name, error: err.message });
+
+        return { written: 0, cleared: 0, added: 0 };
+      })
+    : { written: 0, cleared: 0, added: 0 };
 
   /*
     The flag, set from what the store ended up with rather than from what we
@@ -499,6 +618,10 @@ export async function runConsignmentForMerchant({
     ...base,
     dryRun: false,
     ...counts,
+    pagesMirrored,
+    pricesRemembered: prices.written,
+    pricesAdded: prices.added,
+    pricesCleared: prices.cleared,
     setFlags: flagsSet,
     done: report.done.length,
     problems: report.problems.slice(0, 10)
