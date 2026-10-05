@@ -327,16 +327,49 @@ export function parseEuSize(value) {
   return Number.isFinite(plain) ? plain : null;
 }
 
+/*
+ * A clothing size has no number, but it does have an order.
+ *
+ * FIXED - these fell through parseEuSize as unreadable and were left in the
+ * order they arrived, which is the order Supabase happened to return the
+ * stock in. The first twelve Fear of God pages went into UNION reading
+ * "XXS / XS / S / XL / M / XXL / L". Nobody buys from a size list they have
+ * to read twice.
+ *
+ * Only the two scales we actually sell. A size that is neither a number nor
+ * one of these still goes to the end rather than being guessed at.
+ */
+const CLOTHING_LADDER = [
+  "XXXS", "XXS", "XS", "S", "S/M", "M", "M/L", "L", "L/XL", "XL", "XXL", "XXXL"
+];
+
+export function clothingRank(value) {
+  const clean = String(value ?? "").toUpperCase().replace(/s+/g, "");
+  const at = CLOTHING_LADDER.indexOf(clean);
+
+  return at === -1 ? null : at;
+}
+
 // Ascending, with anything unreadable left at the end rather than dropped.
 export function sortEuSizes(sizes) {
   return [...(sizes || [])].sort((a, b) => {
     const left = parseEuSize(a);
     const right = parseEuSize(b);
 
-    if (left === null && right === null) return 0;
-    if (left === null) return 1;
-    if (right === null) return -1;
+    if (left !== null && right !== null) return left - right;
 
-    return left - right;
+    // Numbers first, then clothing: a page never carries both, so this only
+    // has to be consistent rather than clever.
+    if (left !== null) return -1;
+    if (right !== null) return 1;
+
+    const leftRank = clothingRank(a);
+    const rightRank = clothingRank(b);
+
+    if (leftRank !== null && rightRank !== null) return leftRank - rightRank;
+    if (leftRank !== null) return -1;
+    if (rightRank !== null) return 1;
+
+    return 0;
   });
 }
