@@ -239,31 +239,46 @@ export async function customPricesFor(merchantRecordId, { supabaseUrl, supabaseK
  * numbers and there is nothing on that screen to decide.
  */
 async function rememberShopPrices({ merchantRecordId, pairs, supabaseUrl, supabaseKey }) {
-  const none = { written: 0, cleared: 0 };
+  const total = { written: 0, cleared: 0, added: 0 };
 
-  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return none;
+  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return total;
 
   const base = String(supabaseUrl).replace(/[/]+$/, "");
 
-  const response = await fetch(base + "/rest/v1/rpc/remember_shop_prices", {
-    method: "POST",
-    headers: {
-      apikey: supabaseKey,
-      Authorization: "Bearer " + supabaseKey,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ p_merchant: merchantRecordId, p_pairs: pairs })
-  });
+  /*
+    In helpings. A statement's timeout is armed before the call begins, so
+    raising it from inside does nothing: the database does at most a
+    thousand rows per call and says whether more is waiting. A shop whose
+    shelf is new takes four or five of these; one that is already right
+    takes one, and that one is a couple of hundred milliseconds.
+  */
+  for (let round = 0; round < 25; round += 1) {
+    const response = await fetch(base + "/rest/v1/rpc/remember_shop_prices", {
+      method: "POST",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: "Bearer " + supabaseKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ p_merchant: merchantRecordId, p_pairs: pairs })
+    });
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
 
-    throw new Error("prices not stored (" + response.status + "): " + body.slice(0, 150));
+      throw new Error("prices not stored (" + response.status + "): " + body.slice(0, 150));
+    }
+
+    const answer = await response.json().catch(() => null);
+
+    total.written += Number(answer?.written || 0);
+    total.cleared += Number(answer?.cleared || 0);
+    total.added += Number(answer?.added || 0);
+
+    if (!answer?.more) break;
   }
 
-  const answer = await response.json().catch(() => null);
-
-  return { written: Number(answer?.written || 0), cleared: Number(answer?.cleared || 0) };
+  return total;
 }
 
 /*
@@ -422,9 +437,9 @@ export async function runConsignmentForMerchant({
       }).catch((err) => {
         console.error("CONSIGNMENT PRICES NOT STORED", { merchant: merchant.name, error: err.message });
 
-        return { written: 0, cleared: 0 };
+        return { written: 0, cleared: 0, added: 0 };
       })
-    : { written: 0, cleared: 0 };
+    : { written: 0, cleared: 0, added: 0 };
 
   const counts = {
     onOurLocation: state.ourRows,
@@ -443,6 +458,7 @@ export async function runConsignmentForMerchant({
     activate: plan.activate.length,
     pricesLeftAlone: pricesLeftAlone.length,
     pricesRemembered: prices.written,
+    pricesAdded: prices.added,
     pricesCleared: prices.cleared
   };
 

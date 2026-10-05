@@ -159,10 +159,34 @@ const PUBLICATIONS = `
   }
 `;
 
+/*
+ * The options a page already has, with their ids.
+ *
+ * A page we did not build names its size option in its own language -
+ * UNION's says "Maat", another shop's will say "Size" - and reordering one
+ * needs the id of the option and of every value, which only the page can
+ * say. Asked once per page, and only on the repair path.
+ */
+const PRODUCT_OPTIONS = `
+  query productOptions($id: ID!) {
+    product(id: $id) {
+      id
+      options { id name position optionValues { id name } }
+    }
+  }
+`;
+
+/*
+ * Putting an option's values back in order.
+ *
+ * FIXED - this used productOptionUpdate, which changes what the values ARE
+ * and has no notion of where they sit. The order of an option is its own
+ * mutation, and it takes the values in the order they should end up in.
+ */
 const REORDER_OPTION_VALUES = `
-  mutation reorderOptionValues($productId: ID!, $option: OptionUpdateInput!, $optionValues: [OptionValueUpdateInput!]) {
-    productOptionUpdate(productId: $productId, option: $option, optionValuesToUpdate: $optionValues) {
-      product { id options { name optionValues { id name } } }
+  mutation reorderOptionValues($productId: ID!, $options: [OptionReorderInput!]!) {
+    productOptionsReorder(productId: $productId, options: $options) {
+      product { id options { id name optionValues { id name } } }
       userErrors { field message }
     }
   }
@@ -171,6 +195,25 @@ const REORDER_OPTION_VALUES = `
 /* ------------------------------------------------------------------ *
  * The writer
  * ------------------------------------------------------------------ */
+
+/*
+ * Which of a page's options is the size.
+ *
+ * By name in the handful of languages our stores write, and otherwise by
+ * being the only option there is - a shoe page with one option has no other
+ * candidate. Anything else is left alone rather than guessed at: putting
+ * sizes into a colour option is worse than not reordering.
+ */
+const SIZE_OPTION_NAMES = /^(maat|maten|size|sizes|taille|tailles|gr[oö](ss|ß)e|grootte|talla|tamanho|misura)$/i;
+
+function sizeOptionOf(product) {
+  const options = product?.options || [];
+
+  return (
+    options.find((option) => SIZE_OPTION_NAMES.test(String(option.name || "").trim())) ||
+    (options.length === 1 ? options[0] : null)
+  );
+}
 
 function collectErrors(payload, key) {
   const errors = payload?.[key]?.userErrors || [];
@@ -476,6 +519,27 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
   // The repair path: a size the page did not have yet.
   async function addSizes(entry) {
     /*
+      Which option carries the size on THIS page.
+
+      FIXED - this sent the name "Maat" and, for the reorder, no id at all.
+      Shopify refused the whole request rather than returning a userError, so
+      it threw, and because the sizes are added before the prices and the
+      quantities, one page in a Dutch-named shop cost UNION every write of
+      every run for a week.
+    */
+    const page = await graphql(PRODUCT_OPTIONS, { id: entry.productId }).catch(() => null);
+    const option = sizeOptionOf(page?.product);
+
+    if (!option) {
+      problems.push({
+        label: `maten bijzetten ${entry.sku}`,
+        failure: "deze pagina heeft geen maat-optie die we herkennen"
+      });
+
+      return;
+    }
+
+    /*
       On the shop's own shelf at nothing, for the same reason the whole
       ladder goes there when a page is built: a variant has to stand
       somewhere, and left unsaid Shopify picks. Ours is added by
@@ -489,7 +553,7 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
       {
         productId: entry.productId,
         variants: entry.sizes.map((size) => ({
-          optionValues: [{ optionName: "Maat", name: String(size) }],
+          optionValues: [{ optionName: option.name, name: String(size) }],
           inventoryItem: { sku: entry.sku, tracked: true },
           inventoryPolicy: "DENY",
           ...(theirs ? { inventoryQuantities: [{ locationId: theirs, availableQuantity: 0 }] } : {})
@@ -503,16 +567,45 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
       appended. Without this the page shows the new size last, whatever its
       number, which is the thing the whole create-it-whole approach avoids.
     */
-    await run(
-      `maten opnieuw ordenen ${entry.sku}`,
-      REORDER_OPTION_VALUES,
-      {
-        productId: entry.productId,
-        option: { name: "Maat" },
-        optionValues: entry.reorderTo.map((size, index) => ({ name: String(size), position: index + 1 }))
-      },
-      "productOptionUpdate"
-    );
+    /*
+      And then put the ladder back in order, because the new value was
+      appended. Without this the page shows the new size last, whatever its
+      number, which is the thing the whole create-it-whole approach avoids.
+
+      Read again first: the values that were just created have ids nobody
+      knew a moment ago, and a reorder names every value by id.
+
+      Never fatal. The sizes are on the page by now and can be sold; an order
+      that reads wrong is a page that looks untidy, and that is not worth a
+      shop's whole round.
+    */
+    try {
+      const after = await graphql(PRODUCT_OPTIONS, { id: entry.productId });
+      const current = sizeOptionOf(after?.product);
+
+      const idByName = new Map(
+        (current?.optionValues || []).map((value) => [String(value.name).trim(), value.id])
+      );
+
+      const values = entry.reorderTo
+        .map((size) => idByName.get(String(size).trim()))
+        .filter(Boolean)
+        .map((id) => ({ id }));
+
+      if (current?.id && values.length) {
+        await run(
+          `maten opnieuw ordenen ${entry.sku}`,
+          REORDER_OPTION_VALUES,
+          { productId: entry.productId, options: [{ id: current.id, values }] },
+          "productOptionsReorder"
+        );
+      }
+    } catch (error) {
+      problems.push({
+        label: `maten opnieuw ordenen ${entry.sku}`,
+        failure: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   /*
@@ -554,31 +647,70 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
    * shop with twelve hundred changes would have had the whole lot rejected,
    * and a rejected batch means nothing moved at all.
    */
+  function quantityInput(batch) {
+    return {
+      input: {
+        name: "available",
+        reason: "correction",
+        ignoreCompareQuantity: true,
+        quantities: batch.map((change) => ({
+          inventoryItemId: String(change.inventoryItemId).startsWith("gid://")
+            ? change.inventoryItemId
+            : `gid://shopify/InventoryItem/${change.inventoryItemId}`,
+          locationId: locationGid,
+          quantity: change.to
+        }))
+      }
+    };
+  }
+
+  /*
+   * Quantities, in batches, and a refused batch taken apart.
+   *
+   * FIXED - Shopify refuses the whole call over one bad line, so a single
+   * variant belonging to a page somebody deleted cost 249 pairs their stock
+   * and said so in one sentence about item number two. A batch that comes
+   * back refused is now halved and tried again, down to the single pair that
+   * is actually wrong, which is the only one left unwritten.
+   */
   async function setQuantities(changes) {
     if (!changes.length) return;
 
-    for (let i = 0; i < changes.length; i += 250) {
-      const batch = changes.slice(i, i + 250);
+    async function write(batch, depth = 0) {
+      if (!batch.length) return;
 
-      await run(
-        `aantallen zetten (${batch.length} van ${changes.length})`,
-        SET_QUANTITIES,
-        {
-          input: {
-            name: "available",
-            reason: "correction",
-            ignoreCompareQuantity: true,
-            quantities: batch.map((change) => ({
-              inventoryItemId: String(change.inventoryItemId).startsWith("gid://")
-                ? change.inventoryItemId
-                : `gid://shopify/InventoryItem/${change.inventoryItemId}`,
-              locationId: locationGid,
-              quantity: change.to
-            }))
-          }
-        },
-        "inventorySetQuantities"
-      );
+      const label = batch.length === 1
+        ? `aantal zetten ${batch[0].sku || ""} ${batch[0].size || ""}`.trim()
+        : `aantallen zetten (${batch.length} van ${changes.length})`;
+
+      const before = problems.length;
+      let refused = false;
+
+      try {
+        const answer = await run(label, SET_QUANTITIES, quantityInput(batch), "inventorySetQuantities");
+
+        // run() keeps a userError as a problem and hands back null; one bad
+        // line in the batch is exactly that case.
+        refused = answer === null && apply;
+      } catch (error) {
+        problems.push({ label, failure: error instanceof Error ? error.message : String(error) });
+        refused = true;
+      }
+
+      if (!refused || batch.length === 1 || depth > 10) return;
+
+      // Forget what the whole batch said; what matters is which single pair
+      // turns out to be wrong.
+      problems.length = before;
+
+      const half = Math.ceil(batch.length / 2);
+
+      await write(batch.slice(0, half), depth + 1);
+      await write(batch.slice(half), depth + 1);
+    }
+
+    for (let i = 0; i < changes.length; i += 250) {
+      await write(changes.slice(i, i + 250));
     }
   }
 
@@ -640,10 +772,21 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
     }
   }
 
+  /*
+   * Something went wrong that is worth reporting but not worth stopping for.
+   *
+   * Written from outside the writer, by the step that caught it, so the
+   * report says which page failed instead of the run ending with nothing.
+   */
+  function note(problem) {
+    problems.push(problem);
+  }
+
   return {
     createProduct,
     addSizes,
     activateAtOurLocation,
+    note,
     setFlags,
     setQuantities,
     setPrices,
@@ -662,15 +805,38 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
  * is then never at zero on both at once.
  */
 export async function applyPlan(plan, writer, { photosBySku = new Map(), picturesBySku = new Map() } = {}) {
+  /*
+    One page at a time, and one page that refuses is one page.
+
+    FIXED - a single product whose size option Shopify would not accept threw
+    out of here, and because pages come before prices and quantities, nothing
+    at all was written. UNION went a week without a single update over one
+    page. A page that fails is now a line in the report and the shop still
+    gets its stock.
+  */
   for (const entry of plan.createProducts) {
-    await writer.createProduct(entry, {
-      photos: photosBySku.get(entry.sku) || [],
-      pictureUrl: picturesBySku.get(entry.sku)
-    });
+    try {
+      await writer.createProduct(entry, {
+        photos: photosBySku.get(entry.sku) || [],
+        pictureUrl: picturesBySku.get(entry.sku)
+      });
+    } catch (error) {
+      writer.note({
+        label: `pagina maken ${entry.sku}`,
+        failure: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   for (const entry of plan.addSizes) {
-    await writer.addSizes(entry);
+    try {
+      await writer.addSizes(entry);
+    } catch (error) {
+      writer.note({
+        label: `maten bijzetten ${entry.sku}`,
+        failure: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   /*
