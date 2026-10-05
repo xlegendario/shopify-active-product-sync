@@ -161,12 +161,53 @@ function afterPlan(rows, plan) {
  * what this may do: Consignment Sync at all, Product Sync to create pages
  * the store does not have, Price Sync to set the numbers.
  */
+/*
+ * The prices a shop set for itself, by "SKU|size".
+ *
+ * Kept on the listing rather than in a table of its own: that row already
+ * knows the merchant, the SKU, the size and which Shopify variant it is,
+ * so there is nothing to join and nothing to keep in step.
+ *
+ * Read per merchant, because a price is one shop's answer and means
+ * nothing in another.
+ */
+export async function customPricesFor(merchantRecordId, { supabaseUrl, supabaseKey }) {
+  const prices = new Map();
+
+  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return prices;
+
+  const url =
+    `${String(supabaseUrl).replace(/\/$/, "")}/rest/v1/store_listings` +
+    `?select=sku,size,custom_price` +
+    `&merchant_record_id=eq.${encodeURIComponent(merchantRecordId)}` +
+    `&price_mode=eq.custom` +
+    `&custom_price=gt.0`;
+
+  const response = await fetch(url, {
+    headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` }
+  }).catch(() => null);
+
+  const rows = response && response.ok ? await response.json().catch(() => []) : [];
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const sku = String(row.sku || "").trim().toUpperCase();
+    const size = String(row.size || "").trim();
+
+    if (!sku || !size) continue;
+
+    prices.set(`${sku}|${size}`, Number(row.custom_price));
+  }
+
+  return prices;
+}
+
 export async function runConsignmentForMerchant({
   merchant,
   graphql,
   stock,
   ladders,
   photos,
+  customPrices = new Map(),
   apply = false
 }) {
   const fields = merchant.fields || {};
@@ -226,6 +267,7 @@ export async function runConsignmentForMerchant({
     inventoryRows: stock,
     merchantFields: fields,
     currentPrices,
+    customPrices,
     priceSync,
 
     /*
@@ -380,6 +422,7 @@ export async function runConsignmentForAll({
           stock,
           ladders,
           photos,
+          customPrices: await customPricesFor(merchant.recordId, { supabaseUrl, supabaseKey }),
           apply
         })
       );

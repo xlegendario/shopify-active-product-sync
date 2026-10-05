@@ -246,6 +246,15 @@ export function buildDesiredListings({
   inventoryRows,
   merchantFields,
   currentPrices = new Map(),
+  /*
+   * Prices the shop set itself, by "SKU|size".
+   *
+   * Lojiq works a price out from what the consignor asks, which is right
+   * until it is not: a shop knows its own market, and for stock nobody is
+   * holding there is no consignor to work from at all. A number here means
+   * that conversation already happened and this is the answer.
+   */
+  customPrices = new Map(),
   priceSync = false,
   excludeSellerRecordId = null,
   inventoryType = "all"
@@ -282,6 +291,32 @@ export function buildDesiredListings({
     }
 
     if (priceSync) {
+      const named = num(customPrices.get(`${pair.sku}|${pair.size}`));
+
+      if (named > 0) {
+        /*
+          A price under what the shop pays us is a loss it would never have
+          chosen on purpose. Refused rather than written: a shop selling at
+          a loss without being told is worse than a shop whose pair did not
+          appear, and the reason says exactly what is wrong.
+        */
+        if (named <= cost.net) {
+          rejected.push({ ...pair, cost: cost.net, sellingPrice: named, reason: "custom_price_under_cost" });
+          continue;
+        }
+
+        listings.push({
+          ...pair,
+          cost: cost.net,
+          invoiced: cost.gross,
+          sellingPrice: named,
+          priceSetByUs: true,
+          priceNamedByStore: true
+        });
+
+        continue;
+      }
+
       const selling = minimumSellingPrice({
         buyingPrice: cost.net,
         vatType: pair.vatType,
