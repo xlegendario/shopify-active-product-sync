@@ -201,6 +201,61 @@ export async function customPricesFor(merchantRecordId, { supabaseUrl, supabaseK
   return prices;
 }
 
+/*
+ * What the shop asks for our pairs today, kept on the listing.
+ *
+ * The pricing screen in the store portal shows this, and it cannot read
+ * Shopify itself. The push has just read every price on our shelf anyway,
+ * so writing them costs one request rather than a second pass.
+ *
+ * Only where we set prices. With Price Sync off the shop names its own
+ * numbers, a custom price here would do nothing, and storing thousands of
+ * rows for a screen with nothing to decide is work for its own sake.
+ *
+ * And only what moved. After the first run almost nothing has, so this is
+ * a read of a few thousand small rows and a write of a handful.
+ */
+async function rememberShopPrices({ merchantRecordId, rows, supabaseUrl, supabaseKey }) {
+  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return 0;
+
+  const base = String(supabaseUrl).replace(/\/$/, "");
+  const headers = { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}`, "Content-Type": "application/json" };
+
+  const known = await fetch(
+    `${base}/rest/v1/store_listings?select=id,sku,size,shopify_price&merchant_record_id=eq.${encodeURIComponent(merchantRecordId)}`,
+    { headers }
+  ).then((r) => (r.ok ? r.json() : [])).catch(() => []);
+
+  const byPair = new Map(
+    (Array.isArray(known) ? known : []).map((row) => [
+      `${String(row.sku || "").trim().toUpperCase()}|${String(row.size || "").trim()}`,
+      row
+    ])
+  );
+
+  const now = new Date().toISOString();
+  let written = 0;
+
+  for (const row of rows) {
+    const key = `${normalizeSku(row.sku)}|${sizeKey(row.size)}`;
+    const listing = byPair.get(key);
+    const price = Number(row.price);
+
+    if (!listing || !(price > 0)) continue;
+    if (Number(listing.shopify_price) === price) continue;
+
+    const ok = await fetch(`${base}/rest/v1/store_listings?id=eq.${listing.id}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ shopify_price: price, updated_at: now })
+    }).then((r) => r.ok).catch(() => false);
+
+    if (ok) written += 1;
+  }
+
+  return written;
+}
+
 export async function runConsignmentForMerchant({
   merchant,
   graphql,
@@ -208,6 +263,10 @@ export async function runConsignmentForMerchant({
   ladders,
   photos,
   customPrices = new Map(),
+  // Only to keep the shop's own prices where the pricing screen can read
+  // them; nothing in the push itself needs Supabase.
+  supabaseUrl = "",
+  supabaseKey = "",
   apply = false
 }) {
   const fields = merchant.fields || {};
@@ -262,6 +321,21 @@ export async function runConsignmentForMerchant({
       .filter((row) => row.price > 0)
       .map((row) => [`${normalizeSku(row.sku)}|${sizeKey(row.size)}`, row.price])
   );
+
+  // Kept for the pricing screen, which cannot read Shopify itself. Never
+  // allowed to hold up the push: a price nobody stored is a stale number
+  // on a screen, not a pair in the wrong place.
+  const pricesRemembered = priceSync
+    ? await rememberShopPrices({
+        merchantRecordId: merchant.recordId,
+        rows: state.rows,
+        supabaseUrl,
+        supabaseKey
+      }).catch((err) => {
+        console.error("CONSIGNMENT PRICES NOT STORED", { merchant: merchant.name, error: err.message });
+        return 0;
+      })
+    : 0;
 
   const { listings, rejected } = buildDesiredListings({
     inventoryRows: stock,
@@ -319,7 +393,8 @@ export async function runConsignmentForMerchant({
       return seen;
     }, {}),
     activate: plan.activate.length,
-    pricesLeftAlone: pricesLeftAlone.length
+    pricesLeftAlone: pricesLeftAlone.length,
+    pricesRemembered
   };
 
   if (!apply) {
@@ -423,6 +498,8 @@ export async function runConsignmentForAll({
           ladders,
           photos,
           customPrices: await customPricesFor(merchant.recordId, { supabaseUrl, supabaseKey }),
+          supabaseUrl,
+          supabaseKey,
           apply
         })
       );
