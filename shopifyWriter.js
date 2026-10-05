@@ -252,6 +252,37 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
     ? locationId
     : `gid://shopify/Location/${locationId}`;
 
+  /*
+   * The store's own shelf, as opposed to ours.
+   *
+   * Shopify will not let a variant exist at no location at all, so a size
+   * we do not supply has to stand somewhere - and the shop's own location
+   * is where "we have none of this" is simply true. Ours is for what we
+   * actually hold.
+   *
+   * Looked up once and remembered. Null means the shop has only our
+   * location, and then the ladder has nowhere else to go: the caller falls
+   * back to putting it on ours, which is what it always did.
+   */
+  let theirLocationGid;
+
+  async function theirShelf() {
+    if (theirLocationGid !== undefined) return theirLocationGid;
+
+    const data = await graphql(`
+      {
+        locations(first: 20, includeInactive: false) {
+          nodes { id name }
+        }
+      }`).catch(() => null);
+
+    const other = (data?.locations?.nodes || []).find((node) => node.id !== locationGid);
+
+    theirLocationGid = other?.id || null;
+
+    return theirLocationGid;
+  }
+
   async function run(label, query, variables, resultKey) {
     if (!apply) {
       wouldDo.push({ label, variables });
@@ -356,6 +387,8 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
       null
     ) ?? 0;
 
+    const theirs = await theirShelf();
+
     const variants = entry.sizes.map((size) => {
       const held = filled.get(String(size));
 
@@ -377,33 +410,38 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
         */
         inventoryPolicy: "DENY",
         /*
-          Only the sizes we actually hold get a level at our location.
+          The shop's shelf carries the whole ladder at nothing; ours carries
+          only what we hold.
 
           The field shape is worth a note: on a variant this is an
           InventoryLevelInput wanting availableQuantity, while
           inventorySetQuantities takes name and quantity. Two shapes for one
           idea, and reading either alone gives no hint the other differs.
 
-          FIXED - this passed a level for every size in the ladder, zero
-          included. A level is what puts a variant on our shelf, so a page
-          with 27 sizes of which we hold three put 27 rows there. For a
-          store whose whole catalogue we built that is the difference
-          between four thousand rows and twenty-eight thousand.
+          FIXED - every size went on OUR shelf, zero included. A level is
+          what puts a variant there, so a page with 27 sizes of which we
+          hold three put 27 rows on it. For UNION Amsterdam, whose whole
+          catalogue we built, that came to 27.881 rows against 4.083 real
+          ones - and the push reads our location in full before it decides
+          anything, so it ran out of Shopify's rate limit and stopped
+          syncing on 28-09-2026. A shop too big to read is a shop that can
+          never get smaller.
 
-          And the push reads our location in full before it decides
-          anything, so past a certain size it cannot: UNION Amsterdam
-          stopped syncing on 28-09-2026 because reading 27.881 rows runs
-          out of Shopify's rate limit, which killed the run that would have
-          cleaned them up. A shop too big to read is a shop that can never
-          get smaller.
+          The size still shows, and still shows as sold out: that is the
+          variant, which exists either way. What changes is whose shelf it
+          stands on, and "none of this" is true on theirs.
 
-          A size we do not hold needs no level: plan.activate connects a
-          variant the moment stock for it arrives, which is the one place
-          that should ever put something on our shelf.
+          Both locations at once on purpose. Shopify refuses to leave a
+          variant at no location at all, so letting it pick would hand that
+          choice to Shopify - and on a shop with several of its own, to
+          whichever one it fancies.
         */
-        ...(held && held.quantity > 0
-          ? { inventoryQuantities: [{ locationId: locationGid, availableQuantity: held.quantity }] }
-          : {})
+        inventoryQuantities: [
+          ...(theirs ? [{ locationId: theirs, availableQuantity: 0 }] : []),
+          ...(held && held.quantity > 0
+            ? [{ locationId: locationGid, availableQuantity: held.quantity }]
+            : theirs ? [] : [{ locationId: locationGid, availableQuantity: 0 }])
+        ]
       };
     });
 
@@ -437,6 +475,14 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
 
   // The repair path: a size the page did not have yet.
   async function addSizes(entry) {
+    /*
+      On the shop's own shelf at nothing, for the same reason the whole
+      ladder goes there when a page is built: a variant has to stand
+      somewhere, and left unsaid Shopify picks. Ours is added by
+      plan.activate the moment there is stock to put on it.
+    */
+    const theirs = await theirShelf();
+
     await run(
       `maten bijzetten ${entry.sku} (${entry.sizes.length})`,
       CREATE_VARIANTS,
@@ -445,7 +491,8 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
         variants: entry.sizes.map((size) => ({
           optionValues: [{ optionName: "Maat", name: String(size) }],
           inventoryItem: { sku: entry.sku, tracked: true },
-          inventoryPolicy: "DENY"
+          inventoryPolicy: "DENY",
+          ...(theirs ? { inventoryQuantities: [{ locationId: theirs, availableQuantity: 0 }] } : {})
         }))
       },
       "productVariantsBulkCreate"
