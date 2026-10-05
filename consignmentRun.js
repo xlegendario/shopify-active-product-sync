@@ -176,84 +176,124 @@ export async function customPricesFor(merchantRecordId, { supabaseUrl, supabaseK
 
   if (!merchantRecordId || !supabaseUrl || !supabaseKey) return prices;
 
-  const url =
-    `${String(supabaseUrl).replace(/\/$/, "")}/rest/v1/store_listings` +
-    `?select=sku,size,custom_price` +
-    `&merchant_record_id=eq.${encodeURIComponent(merchantRecordId)}` +
-    `&price_mode=eq.custom` +
-    `&custom_price=gt.0`;
+  const base = String(supabaseUrl).replace(/[/]+$/, "");
+  const page = 1000;
 
-  const response = await fetch(url, {
-    headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` }
-  }).catch(() => null);
+  /*
+    Page by page. A store that names a price for fifty shoes is past a
+    thousand sizes, and a single read would hand back the first thousand
+    without saying so - the rest of its prices would quietly stop working.
+  */
+  for (let offset = 0; ; offset += page) {
+    const url =
+      base + "/rest/v1/store_listings" +
+      "?select=sku,size,custom_price" +
+      "&merchant_record_id=eq." + encodeURIComponent(merchantRecordId) +
+      "&price_mode=eq.custom" +
+      "&custom_price=gt.0" +
+      "&order=id.asc" +
+      "&limit=" + page +
+      "&offset=" + offset;
 
-  const rows = response && response.ok ? await response.json().catch(() => []) : [];
+    const response = await fetch(url, {
+      headers: { apikey: supabaseKey, Authorization: "Bearer " + supabaseKey }
+    }).catch(() => null);
 
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const sku = String(row.sku || "").trim().toUpperCase();
-    const size = String(row.size || "").trim();
+    const rows = response && response.ok ? await response.json().catch(() => []) : [];
 
-    if (!sku || !size) continue;
+    if (!Array.isArray(rows) || !rows.length) break;
 
-    prices.set(`${sku}|${size}`, Number(row.custom_price));
+    for (const row of rows) {
+      const sku = normalizeSku(row.sku);
+      const size = sizeKey(row.size);
+
+      if (!sku || !size) continue;
+
+      prices.set(sku + "|" + size, Number(row.custom_price));
+    }
+
+    if (rows.length < page) break;
   }
 
   return prices;
 }
 
 /*
- * What the shop asks for our pairs today, kept on the listing.
+ * What the shop asks for our pairs, kept on the listing.
  *
  * The pricing screen in the store portal shows this, and it cannot read
- * Shopify itself. The push has just read every price on our shelf anyway,
- * so writing them costs one request rather than a second pass.
+ * Shopify itself. The push has just read every price in the shop anyway, so
+ * the numbers are already in hand.
+ *
+ * FIXED - this read the shop's listings over PostgREST, which hands back a
+ * thousand rows and says nothing about the rest. A store with 28.000
+ * listings therefore had prices written onto an arbitrary thousand of them,
+ * and the screen showed that arbitrary thousand as the shop's shelf. One
+ * call now carries every pair and the database does the matching.
+ *
+ * Only the pairs we supply. A price here is what marks a row as ours, so
+ * what we stopped supplying has its price cleared in the same call and
+ * leaves the screen rather than lingering as a pair nobody can explain.
  *
  * Only where we set prices. With Price Sync off the shop names its own
- * numbers, a custom price here would do nothing, and storing thousands of
- * rows for a screen with nothing to decide is work for its own sake.
- *
- * And only what moved. After the first run almost nothing has, so this is
- * a read of a few thousand small rows and a write of a handful.
+ * numbers and there is nothing on that screen to decide.
  */
-async function rememberShopPrices({ merchantRecordId, rows, supabaseUrl, supabaseKey }) {
-  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return 0;
+async function rememberShopPrices({ merchantRecordId, pairs, supabaseUrl, supabaseKey }) {
+  const none = { written: 0, cleared: 0 };
 
-  const base = String(supabaseUrl).replace(/\/$/, "");
-  const headers = { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}`, "Content-Type": "application/json" };
+  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return none;
 
-  const known = await fetch(
-    `${base}/rest/v1/store_listings?select=id,sku,size,shopify_price&merchant_record_id=eq.${encodeURIComponent(merchantRecordId)}`,
-    { headers }
-  ).then((r) => (r.ok ? r.json() : [])).catch(() => []);
+  const base = String(supabaseUrl).replace(/[/]+$/, "");
 
-  const byPair = new Map(
-    (Array.isArray(known) ? known : []).map((row) => [
-      `${String(row.sku || "").trim().toUpperCase()}|${String(row.size || "").trim()}`,
-      row
-    ])
-  );
+  const response = await fetch(base + "/rest/v1/rpc/remember_shop_prices", {
+    method: "POST",
+    headers: {
+      apikey: supabaseKey,
+      Authorization: "Bearer " + supabaseKey,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ p_merchant: merchantRecordId, p_pairs: pairs })
+  });
 
-  const now = new Date().toISOString();
-  let written = 0;
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
 
-  for (const row of rows) {
-    const key = `${normalizeSku(row.sku)}|${sizeKey(row.size)}`;
-    const listing = byPair.get(key);
-    const price = Number(row.price);
-
-    if (!listing || !(price > 0)) continue;
-    if (Number(listing.shopify_price) === price) continue;
-
-    const ok = await fetch(`${base}/rest/v1/store_listings?id=eq.${listing.id}`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ shopify_price: price, updated_at: now })
-    }).then((r) => r.ok).catch(() => false);
-
-    if (ok) written += 1;
+    throw new Error("prices not stored (" + response.status + "): " + body.slice(0, 150));
   }
 
-  return written;
+  const answer = await response.json().catch(() => null);
+
+  return { written: Number(answer?.written || 0), cleared: Number(answer?.cleared || 0) };
+}
+
+/*
+ * Which pair carries which price once this run has landed.
+ *
+ * Starts at what the shop asks today and is overruled by what we are about
+ * to set, so a price a store named this morning shows as that price straight
+ * away instead of lagging a run behind.
+ */
+function pricesAfterThisRun({ listings, currentPrices, setPrices }) {
+  const byPair = new Map();
+
+  for (const listing of listings) {
+    const key = normalizeSku(listing.sku) + "|" + sizeKey(listing.size);
+    const price = Number(currentPrices.get(key) ?? listing.sellingPrice);
+
+    if (price > 0) byPair.set(key, price);
+  }
+
+  for (const change of setPrices) {
+    const price = Number(change.to);
+
+    if (price > 0) byPair.set(normalizeSku(change.sku) + "|" + sizeKey(change.size), price);
+  }
+
+  return [...byPair].map(([key, price]) => {
+    const [sku, size] = key.split("|");
+
+    return { sku, size, price };
+  });
 }
 
 export async function runConsignmentForMerchant({
@@ -322,21 +362,6 @@ export async function runConsignmentForMerchant({
       .map((row) => [`${normalizeSku(row.sku)}|${sizeKey(row.size)}`, row.price])
   );
 
-  // Kept for the pricing screen, which cannot read Shopify itself. Never
-  // allowed to hold up the push: a price nobody stored is a stale number
-  // on a screen, not a pair in the wrong place.
-  const pricesRemembered = priceSync
-    ? await rememberShopPrices({
-        merchantRecordId: merchant.recordId,
-        rows: state.rows,
-        supabaseUrl,
-        supabaseKey
-      }).catch((err) => {
-        console.error("CONSIGNMENT PRICES NOT STORED", { merchant: merchant.name, error: err.message });
-        return 0;
-      })
-    : 0;
-
   const { listings, rejected } = buildDesiredListings({
     inventoryRows: stock,
     merchantFields: fields,
@@ -378,6 +403,29 @@ export async function runConsignmentForMerchant({
     (change) => change.to > 0 && !state.ourVariantIds.has(change.variantId)
   );
 
+  /*
+    The shelf as the pricing screen will show it.
+
+    After the plan, so a price we are about to set is the price the store
+    sees, and only on a real run - a dry run that writes to the database is
+    not a dry run.
+
+    Never allowed to hold up the push: a price nobody stored is a stale
+    number on a screen, not a pair in the wrong place.
+  */
+  const prices = apply && priceSync
+    ? await rememberShopPrices({
+        merchantRecordId: merchant.recordId,
+        pairs: pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices }),
+        supabaseUrl,
+        supabaseKey
+      }).catch((err) => {
+        console.error("CONSIGNMENT PRICES NOT STORED", { merchant: merchant.name, error: err.message });
+
+        return { written: 0, cleared: 0 };
+      })
+    : { written: 0, cleared: 0 };
+
   const counts = {
     onOurLocation: state.ourRows,
     storeCatalogueRows: state.catalogueRows,
@@ -394,7 +442,8 @@ export async function runConsignmentForMerchant({
     }, {}),
     activate: plan.activate.length,
     pricesLeftAlone: pricesLeftAlone.length,
-    pricesRemembered
+    pricesRemembered: prices.written,
+    pricesCleared: prices.cleared
   };
 
   if (!apply) {
