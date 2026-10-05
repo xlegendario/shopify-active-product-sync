@@ -1168,14 +1168,30 @@ function mapToSupabaseStoreListing({
   };
 }
 
+/*
+ * Write what changed, and nothing else.
+ *
+ * CHANGED - every call used to rewrite every row it was handed, changed or
+ * not, with fresh timestamps. store_listings carries nine indexes, so each
+ * webhook rewrote a product nine times over and each nightly pass rewrote
+ * whole catalogues - some 350,000 rows a night - for nothing. On 05-10-2026
+ * a webhook flood on top of that took the database down for an hour.
+ *
+ * upsert_store_listings_changed compares the content (names, size, SKU,
+ * picture, match, status) and leaves a row alone when nothing in it moved.
+ * Timestamps are not part of that comparison, so they now mean "last real
+ * change". The cleanup below no longer leans on them being touched.
+ *
+ * Returns how many rows were actually written.
+ */
 async function upsertStoreListingsSupabase(rows) {
-  if (!rows.length) return [];
+  if (!rows.length) return 0;
 
-  let affected = 0;
+  let written = 0;
 
   for (const chunk of chunkArray(rows, 500)) {
-    const { error } = await supabase.rpc(
-      "upsert_store_listings_keep_sku",
+    const { data, error } = await supabase.rpc(
+      "upsert_store_listings_changed",
       { rows: chunk }
     );
 
@@ -1183,79 +1199,91 @@ async function upsertStoreListingsSupabase(rows) {
       throw new Error(`Supabase upsert error: ${error.message}`);
     }
 
-    affected += chunk.length;
+    written += Number(data) || 0;
   }
 
-  return Array.from({ length: affected }, (_, i) => ({ id: i }));
+  return written;
 }
 
 /*
- * Switch off what this pass did not see - by time, and in small bites.
+ * Every row this store has today: id, variant and status.
  *
- * FIXED - two faults, the first hiding the second.
+ * Read once at the start of a pass, so the cleanup can work by absence -
+ * a variant the pass no longer sees in Shopify - instead of by a timestamp
+ * every row had to have rewritten. Paged on the (merchant, product, variant)
+ * index; a product's variants can straddle a page edge, so a page starts at
+ * the last product seen and the overlap is dropped by id.
+ */
+const PRELOAD_PAGE = 1000;
+
+async function loadStoreListingIndex(merchant) {
+  const rows = new Map();
+  let from = "";
+
+  for (;;) {
+    const { data, error } = await supabase
+      .from("store_listings")
+      .select("id,shopify_product_id,shopify_variant_id,status")
+      .eq("merchant_record_id", merchant.recordId)
+      .gte("shopify_product_id", from)
+      .order("shopify_product_id", { ascending: true })
+      .order("shopify_variant_id", { ascending: true })
+      .limit(PRELOAD_PAGE);
+
+    if (error) throw new Error(`Supabase listing preload error: ${error.message}`);
+
+    const fresh = (data || []).filter((row) => !rows.has(row.id));
+
+    for (const row of data || []) rows.set(row.id, row);
+
+    if (!data || data.length < PRELOAD_PAGE) break;
+
+    const last = data[data.length - 1].shopify_product_id;
+
+    // A page that is one product and nothing new cannot move on: stop.
+    if (!fresh.length || last === from) break;
+
+    from = last;
+  }
+
+  return rows;
+}
+
+/*
+ * Switch off what this pass did not see.
  *
- * It was one UPDATE over every row of the store, filtered on "not stamped
- * with tonight's sync id". Supabase cancels a statement after eight seconds,
- * and on a store of any size that read alone took longer: 27 seconds for
- * DripOrDrop, far more for SOSU's 272.000 rows. So the store failed at the
- * very last step, after hours of reading, kept its old Last Shopify Sync At,
- * went to the front of the queue again and failed again the next night. Nine
- * of eleven stores had not completed a pass in days, DripOrDrop not since May.
- *
- * And the filter itself was wrong. A webhook arriving during the pass
- * re-stamps a product the pass had already read with its own webhook id, so
- * the cleanup would have switched that live product off. The timeout was the
- * only thing stopping it, and on SOSU a pass takes eight hours.
- *
- * Now: a row survives when anything touched it after the pass started - the
- * pass itself or a webhook, both write last_shopify_sync_at. Read through the
- * index on (merchant_record_id, status, last_shopify_sync_at), a few hundred
- * ids at a time, each update well inside the limit however big the store.
- * The update repeats the condition, so a webhook landing between the read
- * and the write still wins.
+ * The rows come from the preload, the "seen" set from the pass itself. A row
+ * that was active, belongs to no variant the pass read from Shopify, and was
+ * not changed since the pass began (a webhook mid-pass writes updated_at on
+ * a real change) goes inactive. In batches of a few hundred ids, each update
+ * well inside the statement limit however big the store.
  */
 const CLEANUP_BATCH = 500;
 
 // A minute of slack for rows written in the same instant the pass began.
 const CLEANUP_SAFETY_MS = 60 * 1000;
 
-async function deactivateOldListingsSupabase(merchant, passStartedAt) {
+async function deactivateUnseenListings(preloaded, seenVariantIds, passStartedAt) {
   const cutoff = new Date(passStartedAt - CLEANUP_SAFETY_MS).toISOString();
+
+  const unseen = [...preloaded.values()]
+    .filter((row) => row.status === "active" && !seenVariantIds.has(String(row.shopify_variant_id)))
+    .map((row) => row.id);
+
   let total = 0;
 
-  for (;;) {
-    const { data: stale, error: readError } = await supabase
+  for (const ids of chunkArray(unseen, CLEANUP_BATCH)) {
+    const { data, error } = await supabase
       .from("store_listings")
-      .select("id")
-      .eq("merchant_record_id", merchant.recordId)
+      .update({ status: "inactive", updated_at: new Date().toISOString() })
+      .in("id", ids)
       .eq("status", "active")
-      .lt("last_shopify_sync_at", cutoff)
-      .limit(CLEANUP_BATCH);
-
-    if (readError) {
-      throw new Error(`Supabase inactive cleanup error: ${readError.message}`);
-    }
-
-    if (!stale?.length) break;
-
-    const { data: switchedOff, error: writeError } = await supabase
-      .from("store_listings")
-      .update({
-        status: "inactive",
-        updated_at: new Date().toISOString()
-      })
-      .in("id", stale.map((row) => row.id))
-      .eq("status", "active")
-      .lt("last_shopify_sync_at", cutoff)
+      .lt("updated_at", cutoff)
       .select("id");
 
-    if (writeError) {
-      throw new Error(`Supabase inactive cleanup error: ${writeError.message}`);
-    }
+    if (error) throw new Error(`Supabase inactive cleanup error: ${error.message}`);
 
-    total += switchedOff?.length || 0;
-
-    if (stale.length < CLEANUP_BATCH) break;
+    total += data?.length || 0;
   }
 
   return total;
@@ -1459,20 +1487,24 @@ async function syncOneProduct({ merchant, syncId, product, riskyMap, skipRiskyMa
     );
   }
 
-  const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
+  const written = await upsertStoreListingsSupabase(supabaseRows);
 
-  console.log("Supabase upsert completed", {
-    product: fullProduct.title,
-    rows: supabaseRecords.length,
-    retailedStatus,
-    matchRiskLevel: productMatchRiskLevel
-  });
+  // Only worth a line when something actually changed.
+  if (written) {
+    console.log("Supabase listing changed", {
+      product: fullProduct.title,
+      rows: written,
+      retailedStatus,
+      matchRiskLevel: productMatchRiskLevel
+    });
+  }
 
   return {
     variantsCounted,
     retailedMiss,
     riskyAction,
-    rowsUpserted: supabaseRecords.length
+    rowsUpserted: written,
+    variantIds: supabaseRows.map((row) => row.shopify_variant_id)
   };
 }
 
@@ -1488,6 +1520,10 @@ async function syncMerchant(merchant, runId) {
     shopifyDomain: merchant.shopifyDomain,
     syncId
   });
+
+  // What the store has on our side now, so the cleanup can work by absence.
+  const preloaded = await loadStoreListingIndex(merchant);
+  const seenVariantIds = new Set();
 
   const products = await fetchActiveProducts(merchant);
   const existingRiskyRecords = await fetchAllAirtableRecords(
@@ -1524,6 +1560,8 @@ async function syncMerchant(merchant, runId) {
       retailedMisses += outcome.retailedMiss;
       updated += outcome.rowsUpserted;
 
+      for (const id of outcome.variantIds || []) seenVariantIds.add(String(id));
+
       if (outcome.riskyAction === "created") riskyCreated += 1;
       if (outcome.riskyAction === "updated") riskyUpdated += 1;
     } catch (error) {
@@ -1548,7 +1586,7 @@ async function syncMerchant(merchant, runId) {
   let deactivated = 0;
 
   if (failedProducts === 0) {
-    deactivated = await deactivateOldListingsSupabase(merchant, passStartedAt);
+    deactivated = await deactivateUnseenListings(preloaded, seenVariantIds, passStartedAt);
   } else {
     console.warn("Skipping Supabase inactive cleanup because products failed", {
       merchantRecordId: merchant.recordId,
@@ -2171,13 +2209,13 @@ app.get("/run-test", async (_req, res) => {
         );
       }
     
-      const supabaseRecords = await upsertStoreListingsSupabase(supabaseRows);
+      const written = await upsertStoreListingsSupabase(supabaseRows);
     
-      updated += supabaseRecords.length;
+      updated += written;
     
       console.log("TEST Supabase product completed", {
         product: fullProduct.title,
-        rows: supabaseRecords.length,
+        rows: written,
         retailedStatus,
         matchRiskLevel: productMatchRiskLevel,
         riskyAction: riskyResult.action
@@ -2826,6 +2864,9 @@ async function handleProductWebhook({ merchant, topic, productId }) {
 
 const WEBHOOK_QUEUE_MAX = Number(process.env.WEBHOOK_QUEUE_MAX || 5000);
 
+// How long a product must be left alone before its webhook is handled.
+const WEBHOOK_SETTLE_MS = Number(process.env.WEBHOOK_SETTLE_MS || 45000);
+
 const webhookQueue = new Map();
 
 /*
@@ -2857,6 +2898,21 @@ async function drainWebhookQueue() {
   try {
     while (webhookQueue.size) {
       const [key, item] = webhookQueue.entries().next().value;
+
+      /*
+       * Let a product settle before reading it.
+       *
+       * A store editing a product, or our own push setting its prices and
+       * stock, sends several webhooks for it within seconds. A re-sent one
+       * moves to the back with a fresh time, so waiting until the oldest is
+       * WEBHOOK_SETTLE_MS old turns a burst into one read of the end state.
+       */
+      const wait = (item.queuedAt || 0) + WEBHOOK_SETTLE_MS - Date.now();
+
+      if (wait > 0) {
+        await sleep(Math.min(wait, 5000));
+        continue;
+      }
 
       webhookQueue.delete(key);
 
@@ -2923,7 +2979,7 @@ app.post("/webhooks/shopify/products/:secret", (req, res) => {
   const key = `${shop}|${productId}`;
 
   webhookQueue.delete(key);
-  webhookQueue.set(key, { shop, topic, productId });
+  webhookQueue.set(key, { shop, topic, productId, queuedAt: Date.now() });
 
   while (webhookQueue.size > WEBHOOK_QUEUE_MAX) {
     const oldest = webhookQueue.keys().next().value;
