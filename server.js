@@ -1162,6 +1162,10 @@ function mapToSupabaseStoreListing({
     match_risk_level: matchRiskLevel,
 
     status: "active",
+
+    // What the shop itself asks for this variant right now, for My Shelf.
+    store_price: Number(variant.price) > 0 ? Number(variant.price) : null,
+
     last_seen_sync_id: syncId,
     last_shopify_sync_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
@@ -2890,8 +2894,108 @@ let webhookWorkers = 0;
 // Webhooks received per shop and topic since the process started, so a
 // flood can be traced to the store sending it.
 const webhookArrivals = new Map();
+
+/*
+ * What a product looked like last time we synced it, as far as we care.
+ *
+ * Shopify sends products/update for every change, a price included, and some
+ * stores run apps that touch prices all day: on 05-10-2026 DripOrDrop sent
+ * 26,000 in two hours, APLUG 7,800, ALC 5,200. store_listings holds none of
+ * what a price change touches except the price itself, so a full sync - a
+ * product read from Shopify, a SKU lookup, an upsert - was spent on each.
+ *
+ * The fingerprint is the title, the status and per variant its id, SKU and
+ * title. When a webhook's payload matches the last one we synced, only the
+ * prices can have moved, and those come straight out of the payload into a
+ * buffer that is written in bulk. Kept as a short hash per product, so a
+ * store of fifty thousand products costs a few megabytes.
+ *
+ * Unknown after a restart, so the first webhook per product does a full sync
+ * once and fills it in.
+ */
+const productFingerprints = new Map();
+
+function productFingerprint(payload) {
+  const variants = (payload?.variants || [])
+    .map((variant) => [String(variant.id), String(variant.sku || ""), String(variant.title || "")])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+
+  return crypto
+    .createHash("sha1")
+    .update(JSON.stringify([String(payload?.status || ""), String(payload?.title || ""), variants]))
+    .digest("base64");
+}
+
+/*
+ * Prices waiting to be written, newest per variant, flushed every few
+ * seconds in one call per store through set_store_prices.
+ */
+const priceBuffer = new Map();
+const PRICE_FLUSH_MS = Number(process.env.PRICE_FLUSH_MS || 5000);
+let pricesWritten = 0;
+let priceFlushFailed = 0;
+
+function bufferPrices(shop, payload) {
+  for (const variant of payload?.variants || []) {
+    const price = Number(variant.price);
+
+    if (!(price > 0) || !variant.id) continue;
+
+    priceBuffer.set(`${shop}|${variant.id}`, {
+      shop,
+      productId: String(payload.id),
+      variantId: String(variant.id),
+      price
+    });
+  }
+}
+
+async function flushPriceBuffer() {
+  if (!priceBuffer.size) return;
+
+  const entries = [...priceBuffer.values()];
+  priceBuffer.clear();
+
+  const byShop = new Map();
+
+  for (const entry of entries) {
+    if (!byShop.has(entry.shop)) byShop.set(entry.shop, []);
+    byShop.get(entry.shop).push(entry);
+  }
+
+  for (const [shop, list] of byShop) {
+    try {
+      const merchant = await findMerchantByDomain(shop);
+
+      if (!merchant) continue;
+
+      for (const chunk of chunkArray(list, 500)) {
+        const { data, error } = await supabase.rpc("set_store_prices", {
+          rows: chunk.map((entry) => ({
+            merchant_record_id: merchant.recordId,
+            product_id: entry.productId,
+            variant_id: entry.variantId,
+            price: entry.price
+          }))
+        });
+
+        if (error) throw new Error(error.message);
+
+        pricesWritten += Number(data) || 0;
+      }
+    } catch (error) {
+      priceFlushFailed += 1;
+      console.error("Price flush failed", { shop, prices: list.length, error: error.message });
+    }
+  }
+}
+
+setInterval(() => {
+  flushPriceBuffer().catch((error) => console.error("Price flush crashed", error.message));
+}, PRICE_FLUSH_MS);
 let webhookDropped = 0;
 let webhookDone = 0;
+let webhookPriceOnly = 0;
 let webhookFailed = 0;
 
 async function drainWebhookQueue() {
@@ -2929,6 +3033,8 @@ async function drainWebhookQueue() {
         }
 
         await handleProductWebhook({ merchant, topic: item.topic, productId: item.productId });
+
+        if (item.fingerprint) productFingerprints.set(key, item.fingerprint);
 
         webhookDone += 1;
       } catch (error) {
@@ -2985,8 +3091,26 @@ app.post("/webhooks/shopify/products/:secret", (req, res) => {
   const arrivalKey = `${shop} ${topic}`;
   webhookArrivals.set(arrivalKey, (webhookArrivals.get(arrivalKey) || 0) + 1);
 
+  /*
+   * Nothing we track changed: take the prices and stop here. A delete has no
+   * variants to compare, so it always goes the full way.
+   */
+  let fingerprint = null;
+
+  if (!/delete/i.test(topic) && Array.isArray(payload?.variants)) {
+    fingerprint = productFingerprint(payload);
+
+    if (productFingerprints.get(key) === fingerprint) {
+      bufferPrices(shop, payload);
+      webhookPriceOnly += 1;
+      return;
+    }
+  } else {
+    productFingerprints.delete(key);
+  }
+
   webhookQueue.delete(key);
-  webhookQueue.set(key, { shop, topic, productId, queuedAt: Date.now() });
+  webhookQueue.set(key, { shop, topic, productId, fingerprint, queuedAt: Date.now() });
 
   while (webhookQueue.size > WEBHOOK_QUEUE_MAX) {
     const oldest = webhookQueue.keys().next().value;
@@ -3020,6 +3144,11 @@ app.get("/webhooks/status", (_req, res) => {
     done: webhookDone,
     failed: webhookFailed,
     dropped: webhookDropped,
+    priceOnly: webhookPriceOnly,
+    pricesWaiting: priceBuffer.size,
+    pricesWritten,
+    priceFlushFailed,
+    fingerprints: productFingerprints.size,
     queueMax: WEBHOOK_QUEUE_MAX,
     arrivals: Object.fromEntries(
       [...webhookArrivals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)
