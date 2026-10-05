@@ -2886,6 +2886,10 @@ const webhookQueue = new Map();
 const WEBHOOK_WORKERS = Number(process.env.WEBHOOK_WORKERS || 4);
 
 let webhookWorkers = 0;
+
+// Webhooks received per shop and topic since the process started, so a
+// flood can be traced to the store sending it.
+const webhookArrivals = new Map();
 let webhookDropped = 0;
 let webhookDone = 0;
 let webhookFailed = 0;
@@ -2978,6 +2982,9 @@ app.post("/webhooks/shopify/products/:secret", (req, res) => {
   */
   const key = `${shop}|${productId}`;
 
+  const arrivalKey = `${shop} ${topic}`;
+  webhookArrivals.set(arrivalKey, (webhookArrivals.get(arrivalKey) || 0) + 1);
+
   webhookQueue.delete(key);
   webhookQueue.set(key, { shop, topic, productId, queuedAt: Date.now() });
 
@@ -3014,6 +3021,9 @@ app.get("/webhooks/status", (_req, res) => {
     failed: webhookFailed,
     dropped: webhookDropped,
     queueMax: WEBHOOK_QUEUE_MAX,
+    arrivals: Object.fromEntries(
+      [...webhookArrivals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)
+    ),
     merchantCacheAgeMs: merchantCache.at ? Date.now() - merchantCache.at : null
   });
 });
