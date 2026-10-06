@@ -1287,7 +1287,89 @@ async function upsertStoreListingsSupabase(rows) {
     written += Number(data) || 0;
   }
 
+  await syncCatalogueFromRows(rows);
+
   return written;
+}
+
+/*
+ * The catalogue My Shelf reads: one row per product per store.
+ *
+ * store_listings is a row per variant, 1.2 million of them, and grouping a
+ * big store's rows per page view took 108 seconds for ALC. So every write of
+ * listing rows also writes their product's summary, here, where all paths
+ * meet - webhooks, the nightly pass and the changes pass alike. A product's
+ * variants always arrive together, so the summary is never of half a
+ * product. Only real changes are written.
+ *
+ * Never allowed to fail the sync: the catalogue is a view for the portal,
+ * and the listings it summarises matter more.
+ */
+function catalogueSku(value) {
+  return String(value || "").toUpperCase().replace(/\s+/g, "");
+}
+
+async function syncCatalogueFromRows(rows) {
+  const products = new Map();
+
+  for (const row of rows) {
+    const key = `${row.merchant_record_id}|${row.shopify_product_id}`;
+    const entry = products.get(key) || {
+      merchant_record_id: row.merchant_record_id,
+      shopify_product_id: String(row.shopify_product_id),
+      sku: catalogueSku(row.sku),
+      name: row.shopify_product_name || row.stockx_product_name || null,
+      brand: row.brand || null,
+      picture_url: row.picture_url || null,
+      status: "inactive",
+      sizes: 0,
+      price_low: null,
+      price_high: null
+    };
+
+    if (row.status === "active") {
+      entry.status = "active";
+      entry.sizes += 1;
+    }
+
+    const price = Number(row.store_price);
+
+    if (price > 0) {
+      entry.price_low = entry.price_low === null ? price : Math.min(entry.price_low, price);
+      entry.price_high = entry.price_high === null ? price : Math.max(entry.price_high, price);
+    }
+
+    products.set(key, entry);
+  }
+
+  if (!products.size) return;
+
+  try {
+    for (const chunk of chunkArray([...products.values()], 500)) {
+      const { error } = await supabase.rpc("upsert_catalogue_products_changed", { rows: chunk });
+
+      if (error) throw new Error(error.message);
+    }
+  } catch (error) {
+    console.error("Catalogue write failed (listings are fine):", error.message);
+  }
+}
+
+async function deactivateCatalogueProducts(merchant, productIds) {
+  if (!productIds.length) return;
+
+  try {
+    for (const chunk of chunkArray(productIds.map(String), 500)) {
+      const { error } = await supabase.rpc("deactivate_catalogue_products", {
+        p_merchant: merchant.recordId,
+        p_product_ids: chunk
+      });
+
+      if (error) throw new Error(error.message);
+    }
+  } catch (error) {
+    console.error("Catalogue deactivate failed (listings are fine):", error.message);
+  }
 }
 
 /*
@@ -1385,8 +1467,24 @@ const CLEANUP_BATCH = 500;
 // A minute of slack for rows written in the same instant the pass began.
 const CLEANUP_SAFETY_MS = 60 * 1000;
 
-async function deactivateUnseenListings(preloaded, seenVariantIds, passStartedAt) {
+async function deactivateUnseenListings(preloaded, seenVariantIds, passStartedAt, merchant = null) {
   const cutoff = new Date(passStartedAt - CLEANUP_SAFETY_MS).toISOString();
+
+  // A product none of whose variants the pass saw is gone from the store.
+  if (merchant) {
+    const seenProducts = new Set();
+    const allProducts = new Set();
+
+    for (const row of preloaded.rows.values()) {
+      allProducts.add(String(row.shopify_product_id));
+      if (seenVariantIds.has(String(row.shopify_variant_id))) seenProducts.add(String(row.shopify_product_id));
+    }
+
+    await deactivateCatalogueProducts(
+      merchant,
+      [...allProducts].filter((id) => !seenProducts.has(id))
+    );
+  }
 
   const unseen = [...preloaded.rows.values()]
     .filter((row) => row.status === "active" && !seenVariantIds.has(String(row.shopify_variant_id)))
@@ -1775,7 +1873,7 @@ async function syncMerchant(merchant, runId) {
   let deactivated = 0;
 
   if (failedProducts === 0) {
-    deactivated = await deactivateUnseenListings(preloaded, seenVariantIds, passStartedAt);
+    deactivated = await deactivateUnseenListings(preloaded, seenVariantIds, passStartedAt, merchant);
   } else {
     console.warn("Skipping Supabase inactive cleanup because products failed", {
       merchantRecordId: merchant.recordId,
@@ -3074,6 +3172,8 @@ async function fetchOneProduct(merchant, productId) {
   order that came from one still points at it.
 */
 async function deactivateProductListings(merchant, productId) {
+  await deactivateCatalogueProducts(merchant, [productId]);
+
   const { data, error } = await supabase
     .from("store_listings")
     .update({
