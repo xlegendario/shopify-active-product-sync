@@ -868,6 +868,38 @@ const ACTIVE_PRODUCTS_QUERY = `
     }
   `;
 
+// The same product shape, but for every status: a product that went to draft
+// since last night has to be seen to be switched off.
+const CHANGED_PRODUCTS_QUERY = ACTIVE_PRODUCTS_QUERY
+  .replace("query GetProducts($cursor: String)", "query GetChangedProducts($cursor: String, $q: String)")
+  .replace('query: "status:active"', "query: $q");
+
+/*
+ * Products changed since a moment, 250 at a time.
+ *
+ * Shopify moves a product's updated_at on every change we care about - a
+ * price, a variant, a SKU, a title, a status - so this is exactly the part of
+ * a catalogue that can differ from what we hold. Deletions are the one thing
+ * it cannot show; the weekly full pass takes care of those.
+ */
+async function* fetchProductPagesChangedSince(merchant, sinceIso) {
+  let cursor = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const result = await shopifyGraphQL(merchant, CHANGED_PRODUCTS_QUERY, {
+      cursor,
+      q: `updated_at:>'${sinceIso}'`
+    });
+    const connection = result.data.products;
+
+    yield connection.edges.map((edge) => edge.node);
+
+    hasNextPage = connection.pageInfo.hasNextPage;
+    cursor = connection.pageInfo.endCursor;
+  }
+}
+
 async function fetchActiveProducts(merchant) {
   const query = ACTIVE_PRODUCTS_QUERY;
 
@@ -1768,7 +1800,9 @@ async function syncMerchant(merchant, runId) {
 
   await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
     "Last Sync ID": syncId,
-    "Last Shopify Sync At": new Date().toISOString()
+    "Last Shopify Sync At": new Date().toISOString(),
+    // A full read covers the changes too; the next night starts from here.
+    "Last Incremental Sync At": new Date(passStartedAt).toISOString()
   });
 
   return {
@@ -1807,6 +1841,136 @@ async function syncMerchant(merchant, runId) {
  * This pass is the reconciliation that catches what a webhook missed, not
  * the way the data arrives.
  */
+/*
+ * The nightly pass for a store we read in full within the last week: only
+ * what changed since the last pass.
+ *
+ * The webhooks keep store_listings current through the day; this is the net
+ * under them, for whatever a webhook missed. Reading a whole catalogue for
+ * that every night was what made the pass grow with every store we signed.
+ *
+ * What a product's SKU resolved to last time is read for the page from
+ * store_listings, so a product that only changed its price does not go to
+ * the portal again. Risky-match records are left to the weekly full pass,
+ * as the webhooks leave them.
+ */
+async function syncMerchantChanges(merchant, runId, sinceIso) {
+  const syncId = `${runId}_${merchant.recordId}_changes`;
+  const passStartedAt = new Date();
+
+  let productsProcessed = 0;
+  let updated = 0;
+  let deactivated = 0;
+  let failedProducts = 0;
+  const pendingRows = [];
+
+  for await (const page of fetchProductPagesChangedSince(merchant, sinceIso)) {
+    const ids = page.map((product) => String(product.legacyResourceId || getNumericId(product.id)));
+
+    const knownSkus = new Map();
+    const productsWeHold = new Set();
+
+    for (const chunk of chunkArray(ids, 100)) {
+      const { data, error } = await supabase
+        .from("store_listings")
+        .select("shopify_product_id,shopify_sku,stockx_product_name,brand,picture_url,retailed_status,status")
+        .eq("merchant_record_id", merchant.recordId)
+        .in("shopify_product_id", chunk);
+
+      if (error) throw new Error(`Supabase changed-products lookup error: ${error.message}`);
+
+      for (const row of data || []) {
+        if (row.status === "active") productsWeHold.add(String(row.shopify_product_id));
+
+        const sku = String(row.shopify_sku || "").toUpperCase().trim();
+        const seen = knownSkus.get(sku);
+
+        if (sku && (!seen || (seen.retailedStatus !== "ok" && row.retailed_status === "ok"))) {
+          knownSkus.set(sku, {
+            retailedStatus: row.retailed_status,
+            name: row.stockx_product_name || "",
+            brand: row.brand || "",
+            image: row.picture_url || ""
+          });
+        }
+      }
+    }
+
+    for (const product of page) {
+      const productId = String(product.legacyResourceId || getNumericId(product.id));
+
+      try {
+        productsProcessed += 1;
+
+        if (product.status !== "ACTIVE") {
+          // Only touch what we still list as active.
+          if (productsWeHold.has(productId)) {
+            deactivated += await deactivateProductListings(merchant, productId);
+          }
+
+          continue;
+        }
+
+        const outcome = await syncOneProduct({
+          merchant,
+          syncId,
+          product,
+          riskyMap: new Map(),
+          skipRiskyMatches: true,
+          knownSkus,
+          deferWrite: true
+        });
+
+        pendingRows.push(...(outcome.pendingRows || []));
+
+        if (pendingRows.length >= PASS_WRITE_BATCH) {
+          updated += await upsertStoreListingsSupabase(pendingRows.splice(0));
+        }
+      } catch (error) {
+        failedProducts += 1;
+
+        console.error("Changed product sync failed:", {
+          merchant: merchant.name,
+          productId,
+          error: error.message
+        });
+      }
+    }
+  }
+
+  if (pendingRows.length) updated += await upsertStoreListingsSupabase(pendingRows.splice(0));
+
+  // Only moved on when everything landed, so a failed product is read again
+  // next night rather than forgotten.
+  if (failedProducts === 0) {
+    await updateAirtableRecord(AIRTABLE_MERCHANTS_TABLE_NAME, merchant.recordId, {
+      "Last Incremental Sync At": passStartedAt.toISOString()
+    });
+  }
+
+  const result = {
+    merchantRecordId: merchant.recordId,
+    merchantName: merchant.name,
+    mode: "changes",
+    since: sinceIso,
+    productsProcessed,
+    updated,
+    deactivated,
+    failedProducts
+  };
+
+  console.log("CHANGES SYNC FINISHED", result);
+
+  return result;
+}
+
+// A store is read in full when its last full pass is older than this.
+const FULL_PASS_EVERY_MS = Number(process.env.FULL_PASS_EVERY_DAYS || 7) * 24 * 60 * 60 * 1000;
+
+// Overlap when reading changes, so a product saved in the same minute the
+// last pass began is not missed.
+const CHANGES_OVERLAP_MS = 60 * 60 * 1000;
+
 async function syncAllMerchants({ budgetMs = 0, maxMerchants = 0, oldestFirst = false } = {}) {
   // A new run starts with a clean cache: a SKU that was not found last
   // time may exist by now.
@@ -1859,7 +2023,37 @@ async function syncAllMerchants({ budgetMs = 0, maxMerchants = 0, oldestFirst = 
   */
   const notReached = [];
 
+  /*
+   * First, every store whose full pass is recent: only what changed. Quick,
+   * so every store is current every night whatever the budget.
+   *
+   * Then the stores due a full pass, longest-unseen first, within the
+   * budget - one a week each, which is what catches deletions.
+   */
+  const fullDue = [];
+
   for (const merchant of merchants) {
+    const lastFull = Date.parse(merchant.fields?.["Last Shopify Sync At"] || "") || 0;
+    const lastChanges = Date.parse(merchant.fields?.["Last Incremental Sync At"] || "") || 0;
+
+    if (!oldestFirst || !lastFull || Date.now() - lastFull > FULL_PASS_EVERY_MS) {
+      fullDue.push(merchant);
+      continue;
+    }
+
+    const since = new Date(Math.max(lastFull, lastChanges) - CHANGES_OVERLAP_MS).toISOString();
+
+    try {
+      results.push(await syncMerchantChanges(merchant, runId, since));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+
+      console.error("MERCHANT CHANGES SYNC FAILED", { merchantName: merchant.name, runId, error: message });
+      failed.push({ merchantRecordId: merchant.recordId, merchantName: merchant.name, error: message });
+    }
+  }
+
+  for (const merchant of fullDue) {
     /*
       Stop before starting another store rather than in the middle of one.
 
