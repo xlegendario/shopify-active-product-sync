@@ -340,6 +340,30 @@ async function findRiskyProductMatch({ merchantRecordId, productId }) {
   return records[0] || null;
 }
 
+function sameRiskyFields(before = {}, after = {}) {
+  const text = (value) =>
+    Array.isArray(value) ? value.map(String).sort().join("|") : String(value ?? "");
+
+  const keys = [
+    "Shopify Product Name",
+    "StockX Product Name",
+    "Brand",
+    "SKU",
+    "SKU (Soft)",
+    "Match Risk Level",
+    "Retailed Status",
+    "Issue Type",
+    "Issue Notes"
+  ];
+
+  if (keys.some((key) => text(before[key]) !== text(after[key]))) return false;
+
+  // A picture we would set but the record has none of yet is a change.
+  if (after.Picture && !(before.Picture || []).length) return false;
+
+  return true;
+}
+
 async function upsertRiskyProductMatch({
   merchant,
   product,
@@ -407,6 +431,15 @@ async function upsertRiskyProductMatch({
   }
 
   const existing = riskyMap?.get(productId) || null;
+
+  /*
+   * Unchanged since last night: leave it. This used to rewrite every risky
+   * record on every pass - picture attachment included, which Airtable then
+   * fetches again - at five requests a second for the whole base.
+   */
+  if (existing && sameRiskyFields(existing.fields, fields)) {
+    return { action: "unchanged", recordId: existing.id };
+  }
 
   if (existing) {
     await updateAirtableRecord(
@@ -1220,14 +1253,31 @@ async function upsertStoreListingsSupabase(rows) {
  */
 const PRELOAD_PAGE = 1000;
 
+// Rows the nightly pass gathers before writing them in one call.
+const PASS_WRITE_BATCH = 500;
+
+/*
+ * Also what each SKU resolved to last time.
+ *
+ * Looking a style code up through the portal costs about 0.84 seconds -
+ * measured on 06-10-2026, nearly all of the 1.9 seconds a product took - and
+ * the pass asked again every night for SKUs it had resolved the night before.
+ * ALC alone has tens of thousands, which is why it never finished. The answer
+ * is already on the store's rows: name, brand, picture and whether it was
+ * found. Kept per SKU, not per row, so it stays small.
+ */
 async function loadStoreListingIndex(merchant) {
   const rows = new Map();
+  const knownSkus = new Map();
   let from = "";
 
   for (;;) {
     const { data, error } = await supabase
       .from("store_listings")
-      .select("id,shopify_product_id,shopify_variant_id,status")
+      .select(
+        "id,shopify_product_id,shopify_variant_id,status," +
+          "shopify_sku,stockx_product_name,brand,picture_url,retailed_status"
+      )
       .eq("merchant_record_id", merchant.recordId)
       .gte("shopify_product_id", from)
       .order("shopify_product_id", { ascending: true })
@@ -1238,7 +1288,27 @@ async function loadStoreListingIndex(merchant) {
 
     const fresh = (data || []).filter((row) => !rows.has(row.id));
 
-    for (const row of data || []) rows.set(row.id, row);
+    for (const row of data || []) {
+      rows.set(row.id, {
+        id: row.id,
+        shopify_product_id: row.shopify_product_id,
+        shopify_variant_id: row.shopify_variant_id,
+        status: row.status
+      });
+
+      const sku = String(row.shopify_sku || "").toUpperCase().trim();
+      const seen = knownSkus.get(sku);
+
+      // A found answer beats a miss for the same SKU.
+      if (sku && (!seen || (seen.retailedStatus !== "ok" && row.retailed_status === "ok"))) {
+        knownSkus.set(sku, {
+          retailedStatus: row.retailed_status,
+          name: row.stockx_product_name || "",
+          brand: row.brand || "",
+          image: row.picture_url || ""
+        });
+      }
+    }
 
     if (!data || data.length < PRELOAD_PAGE) break;
 
@@ -1250,7 +1320,7 @@ async function loadStoreListingIndex(merchant) {
     from = last;
   }
 
-  return rows;
+  return { rows, knownSkus };
 }
 
 /*
@@ -1270,7 +1340,7 @@ const CLEANUP_SAFETY_MS = 60 * 1000;
 async function deactivateUnseenListings(preloaded, seenVariantIds, passStartedAt) {
   const cutoff = new Date(passStartedAt - CLEANUP_SAFETY_MS).toISOString();
 
-  const unseen = [...preloaded.values()]
+  const unseen = [...preloaded.rows.values()]
     .filter((row) => row.status === "active" && !seenVariantIds.has(String(row.shopify_variant_id)))
     .map((row) => row.id);
 
@@ -1362,7 +1432,28 @@ async function fetchExistingSupabaseSkuMaster(productSku) {
  * Throws on failure. The caller decides whether that costs one product or
  * the whole store.
  */
-async function syncOneProduct({ merchant, syncId, product, riskyMap, skipRiskyMatches = false }) {
+/*
+ * A SKU not found last time is asked again on one day of the week, spread by
+ * the SKU itself, so a style that reached StockX since is picked up within a
+ * week without the whole catalogue asking every night.
+ */
+function retryMissToday(sku) {
+  let hash = 0;
+
+  for (const char of sku) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+
+  return hash % 7 === new Date().getUTCDay();
+}
+
+async function syncOneProduct({
+  merchant,
+  syncId,
+  product,
+  riskyMap,
+  skipRiskyMatches = false,
+  knownSkus = null,
+  deferWrite = false
+}) {
   let variantsCounted = 0;
   let retailedMiss = 0;
 
@@ -1391,7 +1482,17 @@ async function syncOneProduct({ merchant, syncId, product, riskyMap, skipRiskyMa
   //
   // It now goes to the portal, which uses SKU Master as its source and
   // only establishes anything on an exact StockX match.
-  const opgelost = await resolveSkuViaPortal(firstVariantSku);
+  const known = knownSkus?.get(String(firstVariantSku || "").toUpperCase().trim()) || null;
+
+  let opgelost;
+
+  if (known?.retailedStatus === "ok" && known.name) {
+    opgelost = { ok: true, product_name: known.name, brand: known.brand, image: known.image };
+  } else if (known?.retailedStatus === "not_found" && !retryMissToday(firstVariantSku)) {
+    opgelost = { ok: false, reason: "not_found" };
+  } else {
+    opgelost = await resolveSkuViaPortal(firstVariantSku);
+  }
 
   if (opgelost.ok) {
     retailed = {
@@ -1491,6 +1592,19 @@ async function syncOneProduct({ merchant, syncId, product, riskyMap, skipRiskyMa
     );
   }
 
+  // The nightly pass collects rows from many products and writes them in
+  // bulk; a webhook writes its one product straight away.
+  if (deferWrite) {
+    return {
+      variantsCounted,
+      retailedMiss,
+      riskyAction,
+      rowsUpserted: 0,
+      pendingRows: supabaseRows,
+      variantIds: supabaseRows.map((row) => row.shopify_variant_id)
+    };
+  }
+
   const written = await upsertStoreListingsSupabase(supabaseRows);
 
   // Only worth a line when something actually changed.
@@ -1529,6 +1643,9 @@ async function syncMerchant(merchant, runId) {
   const preloaded = await loadStoreListingIndex(merchant);
   const seenVariantIds = new Set();
 
+  // Rows waiting to be written, a few products' worth at a time.
+  const pendingRows = [];
+
   const products = await fetchActiveProducts(merchant);
   const existingRiskyRecords = await fetchAllAirtableRecords(
     AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
@@ -1558,11 +1675,23 @@ async function syncMerchant(merchant, runId) {
     try {
       productsProcessed += 1;
 
-      const outcome = await syncOneProduct({ merchant, syncId, product, riskyMap });
+      const outcome = await syncOneProduct({
+        merchant,
+        syncId,
+        product,
+        riskyMap,
+        knownSkus: preloaded.knownSkus,
+        deferWrite: true
+      });
 
       variantsProcessed += outcome.variantsCounted;
       retailedMisses += outcome.retailedMiss;
-      updated += outcome.rowsUpserted;
+
+      pendingRows.push(...(outcome.pendingRows || []));
+
+      if (pendingRows.length >= PASS_WRITE_BATCH) {
+        updated += await upsertStoreListingsSupabase(pendingRows.splice(0));
+      }
 
       for (const id of outcome.variantIds || []) seenVariantIds.add(String(id));
 
@@ -1585,6 +1714,13 @@ async function syncMerchant(merchant, runId) {
         error
       });
     }
+  }
+
+  try {
+    if (pendingRows.length) updated += await upsertStoreListingsSupabase(pendingRows.splice(0));
+  } catch (error) {
+    failedProducts += 1;
+    console.error("Final listing write failed:", { merchant: merchant.name, error: error.message });
   }
 
   let deactivated = 0;
