@@ -828,8 +828,7 @@ async function shopifyInventorySetQuantities(merchant, quantities) {
   return result.data.inventorySetQuantities.inventoryAdjustmentGroup;
 }
 
-async function fetchActiveProducts(merchant) {
-  const query = `
+const ACTIVE_PRODUCTS_QUERY = `
     query GetProducts($cursor: String) {
       products(first: 250, after: $cursor, query: "status:active") {
         edges {
@@ -869,23 +868,40 @@ async function fetchActiveProducts(merchant) {
     }
   `;
 
+async function fetchActiveProducts(merchant) {
+  const query = ACTIVE_PRODUCTS_QUERY;
+
+  const products = [];
+
+  for await (const page of fetchActiveProductPages(merchant, query)) {
+    products.push(...page);
+  }
+
+  return products;
+}
+
+/*
+ * The store's active products, 250 at a time.
+ *
+ * CHANGED - the nightly pass used to read a store's whole catalogue into
+ * memory before touching the first product. ALC has some 348,000 variants,
+ * and on 06-10-2026 the service ran out of memory part way through it and
+ * restarted, losing the pass. A page is now handled and let go before the
+ * next is read, so memory stays the same however big the store.
+ */
+async function* fetchActiveProductPages(merchant, query = ACTIVE_PRODUCTS_QUERY) {
   let cursor = null;
   let hasNextPage = true;
-  const products = [];
 
   while (hasNextPage) {
     const result = await shopifyGraphQL(merchant, query, { cursor });
     const connection = result.data.products;
 
-    for (const edge of connection.edges) {
-      products.push(edge.node);
-    }
+    yield connection.edges.map((edge) => edge.node);
 
     hasNextPage = connection.pageInfo.hasNextPage;
     cursor = connection.pageInfo.endCursor;
   }
-
-  return products;
 }
 
 async function fetchProductVariants(merchant, productGid) {
@@ -1646,7 +1662,6 @@ async function syncMerchant(merchant, runId) {
   // Rows waiting to be written, a few products' worth at a time.
   const pendingRows = [];
 
-  const products = await fetchActiveProducts(merchant);
   const existingRiskyRecords = await fetchAllAirtableRecords(
     AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
     `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
@@ -1671,7 +1686,8 @@ async function syncMerchant(merchant, runId) {
   
   let failedProducts = 0;
 
-  for (const product of products) {
+  for await (const page of fetchActiveProductPages(merchant)) {
+  for (const product of page) {
     try {
       productsProcessed += 1;
 
@@ -1714,6 +1730,7 @@ async function syncMerchant(merchant, runId) {
         error
       });
     }
+  }
   }
 
   try {
