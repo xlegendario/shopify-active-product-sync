@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { planListings, indexCurrentListings } from "./listingPlan.js";
-import { choiceOutcomes } from "./consignmentRun.js";
+import { choiceOutcomes, customPricesOffOurStock } from "./consignmentRun.js";
 
 const listing = (sku, size, quantity = 1) => ({ sku, size, quantity, sellingPrice: 150, cost: 100, productName: sku });
 
@@ -69,4 +69,20 @@ test("choices are marked from what actually happened", () => {
   const marks = Object.fromEntries(choiceOutcomes({ choices: all, plan, current, outcomes }).map((m) => [m.sku, m.status]));
 
   assert.deepEqual(marks, { NEW1: "done", NEWOWN: "failed", UNLINK1: "done", OFF1: "done", HAVE1: "done" });
+});
+
+test("custom prices reach sizes we hold none of, once", () => {
+  const rows = [
+    { sku: "kj 1468", size: "40", shopify_product_id: "15", shopify_variant_id: "57", store_price: "253", custom_price: "239" },
+    { sku: "KJ1468", size: "41 1/3", shopify_product_id: "15", shopify_variant_id: "58", store_price: "239", custom_price: "239" },
+    { sku: "KJ1468", size: "38", shopify_product_id: "15", shopify_variant_id: "59", store_price: "253", custom_price: "230" }
+  ];
+
+  const changes = customPricesOffOurStock(rows, [listing("KJ1468", "38")]);
+
+  assert.deepEqual(changes, [{
+    sku: "KJ1468", size: "40",
+    productId: "gid://shopify/Product/15", variantId: "gid://shopify/ProductVariant/57",
+    from: 253, to: 239
+  }]);
 });

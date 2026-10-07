@@ -292,6 +292,73 @@ export async function ownPricedFor(merchantRecordId, { supabaseUrl, supabaseKey 
 }
 
 /*
+ * Custom prices on sizes we hold none of.
+ *
+ * A store with Price Sync can name a price for any size in its catalogue,
+ * not only the ones carrying our stock - it is their shop, and the portal
+ * is where they price it. The sizes we do hold already get their custom
+ * price through the plan; these are the rest, written as they are.
+ *
+ * Only active sizes, and only where the shop's price is not already that
+ * number (store_price follows Shopify through the webhooks).
+ */
+export async function customPriceRowsFor(merchantRecordId, { supabaseUrl, supabaseKey }) {
+  const rows = [];
+
+  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return rows;
+
+  const base = String(supabaseUrl).replace(/[/]+$/, "");
+  const page = 1000;
+
+  for (let offset = 0; ; offset += page) {
+    const response = await fetch(
+      base + "/rest/v1/store_listings" +
+        "?select=sku,size,shopify_product_id,shopify_variant_id,store_price,custom_price" +
+        "&merchant_record_id=eq." + encodeURIComponent(merchantRecordId) +
+        "&price_mode=eq.custom&custom_price=gt.0&status=eq.active" +
+        "&order=id.asc&limit=" + page + "&offset=" + offset,
+      { headers: { apikey: supabaseKey, Authorization: "Bearer " + supabaseKey } }
+    ).catch(() => null);
+
+    const found = response && response.ok ? await response.json().catch(() => []) : [];
+
+    if (!Array.isArray(found) || !found.length) break;
+
+    rows.push(...found);
+
+    if (found.length < page) break;
+  }
+
+  return rows;
+}
+
+export function customPricesOffOurStock(rows, listings) {
+  const ours = new Set(listings.map((listing) => `${normalizeSku(listing.sku)}|${sizeKey(listing.size)}`));
+  const changes = [];
+
+  for (const row of rows) {
+    const sku = normalizeSku(row.sku);
+    const size = sizeKey(row.size);
+    const price = Number(row.custom_price);
+
+    if (!sku || !size || !(price > 0) || !row.shopify_variant_id || !row.shopify_product_id) continue;
+    if (ours.has(`${sku}|${size}`)) continue;
+    if (Number(row.store_price) === price) continue;
+
+    changes.push({
+      sku,
+      size,
+      productId: `gid://shopify/Product/${row.shopify_product_id}`,
+      variantId: `gid://shopify/ProductVariant/${row.shopify_variant_id}`,
+      from: row.store_price === null ? null : Number(row.store_price),
+      to: price
+    });
+  }
+
+  return changes;
+}
+
+/*
  * The store's choices this run carried out, marked so its catalogue says so.
  *
  *   add          done once the page exists (made now, or already there);
@@ -660,7 +727,16 @@ export async function runConsignmentForMerchant({
 
   const { setPrices, pricesLeftAlone } = dropPricesTheStoreOwns(plan, state.theirStock);
 
-  plan.setPrices = setPrices;
+  /*
+    And the custom prices on sizes we hold none of. After the line above on
+    purpose: that one protects a price the shop set on its own stock, and a
+    custom price is the shop setting it.
+  */
+  const customElsewhere = priceSync
+    ? customPricesOffOurStock(await customPriceRowsFor(merchant.recordId, { supabaseUrl, supabaseKey }), listings)
+    : [];
+
+  plan.setPrices = [...setPrices, ...customElsewhere];
 
   /*
     Variants the store made itself, which we are about to put stock on.
@@ -684,6 +760,7 @@ export async function runConsignmentForMerchant({
     addSizes: plan.addSizes.length,
     setQuantities: plan.setQuantities.length,
     setPrices: plan.setPrices.length,
+    customPricesOffOurStock: customElsewhere.length,
     clearQuantities: plan.clearQuantities.length,
     rejectedReasons: rejected.reduce((seen, row) => {
       seen[row.reason] = (seen[row.reason] || 0) + 1;
