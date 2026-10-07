@@ -255,6 +255,11 @@ export function buildDesiredListings({
    * that conversation already happened and this is the answer.
    */
   customPrices = new Map(),
+  /*
+   * Sizes the shop prices itself although Price Sync is on ("SKU|size").
+   * Judged against the shop's own price, as for a store without Price Sync.
+   */
+  ownPriced = new Set(),
   priceSync = false,
   excludeSellerRecordId = null,
   inventoryType = "all"
@@ -290,7 +295,7 @@ export function buildDesiredListings({
       continue;
     }
 
-    if (priceSync) {
+    if (priceSync && !ownPriced.has(`${pair.sku}|${pair.size}`)) {
       const named = num(customPrices.get(`${pair.sku}|${pair.size}`));
 
       if (named > 0) {

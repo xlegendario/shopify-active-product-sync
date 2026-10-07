@@ -153,6 +153,15 @@ const PUBLISH = `
   }
 `;
 
+const SET_STATUS = `
+  mutation setStatus($product: ProductUpdateInput!) {
+    productUpdate(product: $product) {
+      product { id status }
+      userErrors { field message }
+    }
+  }
+`;
+
 const PUBLICATIONS = `
   query publications {
     publications(first: 25) { nodes { id name } }
@@ -402,7 +411,13 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
       own stock. The StockX thumbnail only fills in when there are none, and
       then as one image rather than a gallery.
     */
-    const images = photos.length ? photos : [productImageUrl(pictureUrl)].filter(Boolean);
+    /*
+      A store that chose its own photos gets none of ours, and a draft: the
+      page is there to be finished, not to be shown.
+    */
+    const images = entry.draft
+      ? []
+      : photos.length ? photos : [productImageUrl(pictureUrl)].filter(Boolean);
 
     const created = await run(
       `product aanmaken ${entry.sku}`,
@@ -411,7 +426,7 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
         product: {
           title: entry.title,
           vendor: entry.brand || undefined,
-          status: "ACTIVE",
+          status: entry.draft ? "DRAFT" : "ACTIVE",
           productOptions: [{ name: "Maat", values: entry.sizes.map((size) => ({ name: String(size) })) }]
         },
         media: images.length
@@ -514,6 +529,22 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
     }
 
     return productId;
+  }
+
+  /*
+   * A page the store switched off in its catalogue: to draft, never
+   * deleted. Draft keeps the handle, the photos and the history, and the
+   * store can put it back with one click in Shopify.
+   */
+  async function setDraft(entry) {
+    const result = await run(
+      `uitzetten ${entry.sku}`,
+      SET_STATUS,
+      { product: { id: entry.productId, status: "DRAFT" } },
+      "productUpdate"
+    );
+
+    return Boolean(result?.product?.id) || !apply;
   }
 
   // The repair path: a size the page did not have yet.
@@ -784,6 +815,7 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
 
   return {
     createProduct,
+    setDraft,
     addSizes,
     activateAtOurLocation,
     note,
@@ -814,17 +846,44 @@ export async function applyPlan(plan, writer, { photosBySku = new Map(), picture
     page. A page that fails is now a line in the report and the shop still
     gets its stock.
   */
+  /*
+    What became of each page made or switched off, by style code, so the
+    store's choice in its catalogue can be marked done or failed.
+  */
+  const outcomes = new Map();
+  const failedSince = (before) => writer.report.problems.slice(before).map((p) => p.failure).join("; ");
+
   for (const entry of plan.createProducts) {
+    const before = writer.report.problems.length;
+
     try {
-      await writer.createProduct(entry, {
+      const productId = await writer.createProduct(entry, {
         photos: photosBySku.get(entry.sku) || [],
         pictureUrl: picturesBySku.get(entry.sku)
       });
+
+      outcomes.set(entry.sku, productId
+        ? { ok: true, productId }
+        : { ok: false, error: failedSince(before) || "Shopify did not make the page" });
     } catch (error) {
-      writer.note({
-        label: `pagina maken ${entry.sku}`,
-        failure: error instanceof Error ? error.message : String(error)
-      });
+      const failure = error instanceof Error ? error.message : String(error);
+
+      writer.note({ label: `pagina maken ${entry.sku}`, failure });
+      outcomes.set(entry.sku, { ok: false, error: failure });
+    }
+  }
+
+  for (const entry of plan.deactivateProducts || []) {
+    const before = writer.report.problems.length;
+
+    try {
+      const ok = await writer.setDraft(entry);
+      outcomes.set(entry.sku, ok ? { ok: true } : { ok: false, error: failedSince(before) || "Shopify did not take it" });
+    } catch (error) {
+      const failure = error instanceof Error ? error.message : String(error);
+
+      writer.note({ label: `uitzetten ${entry.sku}`, failure });
+      outcomes.set(entry.sku, { ok: false, error: failure });
     }
   }
 
@@ -852,5 +911,5 @@ export async function applyPlan(plan, writer, { photosBySku = new Map(), picture
   await writer.setQuantities(plan.setQuantities);
   await writer.setQuantities(plan.clearQuantities);
 
-  return writer.report;
+  return { ...writer.report, outcomes };
 }

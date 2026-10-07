@@ -91,14 +91,26 @@ export function ladderFor({ sku, knownSizes, heldSizes }) {
 /*
  * What has to happen, per store.
  *
- * `productSync` off means we never create anything: a store's product pages
- * are its own, and we only fill sizes it already sells. That is the setting
- * every store but our own runs with.
+ * What the store chose in its catalogue (the portal's My Shelf) decides
+ * what we may do to its pages, per style (07-10-2026):
+ *
+ *   add          we create the page if it has none, and add sizes to it
+ *   unlinked     none of our stock on it, the page stays as it is
+ *   deactivated  none of our stock on it, and the page goes to draft once
+ *   (nothing)    we only fill sizes the page already has
+ *
+ * `choices` maps a style code to { choice, photos, status }.
+ *
+ * CHANGED - this was one switch per store, Product Sync, which created a
+ * page for everything we held. UNION's shelf filled up with whatever a
+ * consignor sent in, so now a store picks per product. `productSync` is
+ * kept for the preview scripts and means "as if every style were added".
  */
 export function planListings({
   desired,
   current,
   sizeLadders = new Map(),
+  choices = new Map(),
   productSync = false,
   priceSync = false,
   sellWithoutStock = false
@@ -108,13 +120,39 @@ export function planListings({
   const setQuantities = [];
   const setPrices = [];
   const clearQuantities = [];
+  const deactivateProducts = [];
   const skipped = [];
+
+  const choiceOf = (sku) => choices.get(sku)?.choice || null;
+  const added = (sku) => productSync || choiceOf(sku) === "add";
+  const blocked = (sku) => ["unlinked", "deactivated"].includes(choiceOf(sku));
 
   const wantedBySku = new Map();
 
   for (const listing of desired || []) {
+    /*
+      Not wanted at all: then the clearing below takes our stock off the
+      page as well, which is the whole point of unlinking.
+    */
+    if (blocked(listing.sku)) {
+      skipped.push({ ...listing, reason: `store_${choiceOf(listing.sku)}` });
+      continue;
+    }
+
     if (!wantedBySku.has(listing.sku)) wantedBySku.set(listing.sku, []);
     wantedBySku.get(listing.sku).push(listing);
+  }
+
+  /*
+    Switched off: the page goes to draft, once. Only while the choice is
+    still pending - a store that puts the page live again afterwards did so
+    on purpose, and we do not fight it every half hour.
+  */
+  for (const [sku, chosen] of choices) {
+    if (chosen.choice !== "deactivated" || chosen.status !== "pending") continue;
+
+    const product = current.get(sku);
+    if (product?.productId) deactivateProducts.push({ sku, productId: product.productId });
   }
 
   for (const [sku, listings] of wantedBySku) {
@@ -122,7 +160,7 @@ export function planListings({
     const heldSizes = listings.map((l) => l.size);
 
     if (!product) {
-      if (!productSync) {
+      if (!added(sku)) {
         listings.forEach((l) => skipped.push({ ...l, reason: "product_not_in_store" }));
         continue;
       }
@@ -133,6 +171,11 @@ export function planListings({
         sku,
         title: first.productName || sku,
         brand: first.brand || "",
+        /*
+          With its own photos the store wants the page made but not shown:
+          a draft without pictures, live once they have put theirs on.
+        */
+        draft: choices.get(sku)?.photos === "own",
         /*
           The whole ladder, in order, in one go. Adding sizes later is what
           shuffles a product page, so a page is born complete: the sizes we
@@ -160,7 +203,7 @@ export function planListings({
     const missing = listings.filter((l) => !product.variants.has(l.size));
 
     if (missing.length) {
-      if (!productSync) {
+      if (!added(sku)) {
         missing.forEach((l) => skipped.push({ ...l, reason: "size_not_in_store" }));
       } else {
         addSizes.push({
@@ -246,5 +289,5 @@ export function planListings({
     }
   }
 
-  return { createProducts, addSizes, setQuantities, setPrices, clearQuantities, skipped };
+  return { createProducts, addSizes, setQuantities, setPrices, clearQuantities, deactivateProducts, skipped };
 }

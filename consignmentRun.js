@@ -219,6 +219,153 @@ export async function customPricesFor(merchantRecordId, { supabaseUrl, supabaseK
 }
 
 /*
+ * What a store chose in its catalogue (the portal's My Shelf), by style.
+ *
+ * Unlike a price, a failed read here is not something to carry on without:
+ * an empty answer would put our stock straight back on every page the
+ * store unlinked. So it throws, and the store sits this run out.
+ */
+export async function catalogueChoicesFor(merchantRecordId, { supabaseUrl, supabaseKey }) {
+  const choices = new Map();
+
+  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return choices;
+
+  const response = await fetch(
+    String(supabaseUrl).replace(/[/]+$/, "") + "/rest/v1/store_catalogue_choices" +
+      "?select=sku,choice,photos,status" +
+      "&merchant_record_id=eq." + encodeURIComponent(merchantRecordId) +
+      "&limit=50000",
+    { headers: { apikey: supabaseKey, Authorization: "Bearer " + supabaseKey } }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Could not read the store's catalogue choices (Supabase ${response.status})`);
+  }
+
+  for (const row of await response.json()) {
+    const sku = normalizeSku(row.sku);
+    if (sku) choices.set(sku, { choice: row.choice, photos: row.photos, status: row.status });
+  }
+
+  return choices;
+}
+
+/*
+ * The sizes a store prices itself, even with Price Sync on: "SKU|size".
+ *
+ * Own price means we leave the number alone and judge the pair against it,
+ * exactly as for a store without Price Sync.
+ */
+export async function ownPricedFor(merchantRecordId, { supabaseUrl, supabaseKey }) {
+  const own = new Set();
+
+  if (!merchantRecordId || !supabaseUrl || !supabaseKey) return own;
+
+  const base = String(supabaseUrl).replace(/[/]+$/, "");
+  const page = 1000;
+
+  for (let offset = 0; ; offset += page) {
+    const response = await fetch(
+      base + "/rest/v1/store_listings" +
+        "?select=sku,size" +
+        "&merchant_record_id=eq." + encodeURIComponent(merchantRecordId) +
+        "&price_mode=eq.own" +
+        "&order=id.asc&limit=" + page + "&offset=" + offset,
+      { headers: { apikey: supabaseKey, Authorization: "Bearer " + supabaseKey } }
+    ).catch(() => null);
+
+    const rows = response && response.ok ? await response.json().catch(() => []) : [];
+
+    if (!Array.isArray(rows) || !rows.length) break;
+
+    for (const row of rows) {
+      const sku = normalizeSku(row.sku);
+      const size = sizeKey(row.size);
+
+      if (sku && size) own.add(sku + "|" + size);
+    }
+
+    if (rows.length < page) break;
+  }
+
+  return own;
+}
+
+/*
+ * The store's choices this run carried out, marked so its catalogue says so.
+ *
+ *   add          done once the page exists (made now, or already there);
+ *                failed with Shopify's reason when making it was refused.
+ *                Still pending when we hold none of it at the moment - the
+ *                page is made the day stock comes in.
+ *   unlinked     done: our stock came off in this run.
+ *   deactivated  done once the page is on draft, or when there was no page.
+ */
+export function choiceOutcomes({ choices, plan, current, outcomes }) {
+  const marks = [];
+
+  for (const [sku, chosen] of choices) {
+    if (chosen.status !== "pending") continue;
+
+    const result = outcomes.get(sku);
+
+    if (chosen.choice === "add") {
+      if (result) marks.push({ sku, status: result.ok ? "done" : "failed", error: result.ok ? null : result.error });
+      else if (current.has(sku)) marks.push({ sku, status: "done", error: null });
+      continue;
+    }
+
+    if (chosen.choice === "unlinked") {
+      marks.push({ sku, status: "done", error: null });
+      continue;
+    }
+
+    if (chosen.choice === "deactivated") {
+      const planned = (plan.deactivateProducts || []).some((entry) => entry.sku === sku);
+
+      if (!planned) marks.push({ sku, status: "done", error: null });
+      else if (result) marks.push({ sku, status: result.ok ? "done" : "failed", error: result.ok ? null : result.error });
+    }
+  }
+
+  return marks;
+}
+
+async function markChoices(merchantRecordId, marks, { supabaseUrl, supabaseKey }) {
+  const base = String(supabaseUrl).replace(/[/]+$/, "");
+  let written = 0;
+
+  for (const mark of marks) {
+    const response = await fetch(
+      base + "/rest/v1/store_catalogue_choices" +
+        "?merchant_record_id=eq." + encodeURIComponent(merchantRecordId) +
+        "&sku=eq." + encodeURIComponent(mark.sku) +
+        // Only while still pending: a store that changed its mind during
+        // this run keeps its new choice.
+        "&status=eq.pending",
+      {
+        method: "PATCH",
+        headers: {
+          apikey: supabaseKey,
+          Authorization: "Bearer " + supabaseKey,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal"
+        },
+        body: JSON.stringify({
+          status: mark.status,
+          error: mark.error ? String(mark.error).slice(0, 500) : null,
+          done_at: new Date().toISOString()
+        })
+      }
+    ).catch(() => null);
+
+    if (response?.ok) written += 1;
+  }
+
+  return written;
+}
+
+/*
  * What the shop asks for our pairs, kept on the listing.
  *
  * The pricing screen in the store portal shows this, and it cannot read
@@ -420,6 +567,9 @@ export async function runConsignmentForMerchant({
   ladders,
   photos,
   customPrices = new Map(),
+  // What the store chose in its catalogue, and the sizes it prices itself.
+  choices = new Map(),
+  ownPriced = new Set(),
   // Only to keep the shop's own prices where the pricing screen can read
   // them; nothing in the push itself needs Supabase.
   supabaseUrl = "",
@@ -430,14 +580,17 @@ export async function runConsignmentForMerchant({
 
   const consignmentSync = Boolean(fields["Consignment Sync?"]);
   const priceSync = Boolean(fields["Price Sync?"]);
-  const productSync = Boolean(fields["Product Sync?"]);
 
+  /*
+    CHANGED - Product Sync? is no longer read. Which pages we make is now
+    the store's choice per product in its catalogue (`choices`), never a
+    switch that makes a page for everything we hold.
+  */
   const base = {
     merchantRecordId: merchant.recordId,
     merchantName: merchant.name,
     consignmentSync,
-    priceSync,
-    productSync
+    priceSync
   };
 
   if (!consignmentSync) {
@@ -484,6 +637,7 @@ export async function runConsignmentForMerchant({
     merchantFields: fields,
     currentPrices,
     customPrices,
+    ownPriced,
     priceSync,
 
     /*
@@ -500,7 +654,7 @@ export async function runConsignmentForMerchant({
     desired: listings,
     current,
     sizeLadders: ladders,
-    productSync,
+    choices,
     priceSync
   });
 
@@ -526,6 +680,7 @@ export async function runConsignmentForMerchant({
     wanted: listings.length,
     rejected: rejected.length,
     createProducts: plan.createProducts.length,
+    deactivateProducts: plan.deactivateProducts.length,
     addSizes: plan.addSizes.length,
     setQuantities: plan.setQuantities.length,
     setPrices: plan.setPrices.length,
@@ -558,6 +713,20 @@ export async function runConsignmentForMerchant({
   );
 
   const report = await applyPlan(plan, writer, { photosBySku });
+
+  /*
+    The store's choices, marked done or failed so its catalogue stops
+    saying "next pass". Never allowed to hold up the push either.
+  */
+  const choicesMarked = await markChoices(
+    merchant.recordId,
+    choiceOutcomes({ choices, plan, current, outcomes: report.outcomes }),
+    { supabaseUrl, supabaseKey }
+  ).catch((err) => {
+    console.error("CATALOGUE CHOICES NOT MARKED", { merchant: merchant.name, error: err.message });
+
+    return 0;
+  });
 
   /*
     A page we just built belongs in the catalogue mirror now, not after the
@@ -623,6 +792,7 @@ export async function runConsignmentForMerchant({
     pricesAdded: prices.added,
     pricesCleared: prices.cleared,
     setFlags: flagsSet,
+    choicesMarked,
     done: report.done.length,
     problems: report.problems.slice(0, 10)
   };
@@ -686,6 +856,8 @@ export async function runConsignmentForAll({
           ladders,
           photos,
           customPrices: await customPricesFor(merchant.recordId, { supabaseUrl, supabaseKey }),
+          choices: await catalogueChoicesFor(merchant.recordId, { supabaseUrl, supabaseKey }),
+          ownPriced: await ownPricedFor(merchant.recordId, { supabaseUrl, supabaseKey }),
           supabaseUrl,
           supabaseKey,
           apply
