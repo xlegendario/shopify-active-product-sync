@@ -29,10 +29,20 @@ import { createShopifyWriter, applyPlan, productImageUrl } from "./shopifyWriter
 import { readStoreState, readOurLocationStock, readFlagSetting } from "./storeState.js";
 
 /*
- * Our consignment stock, whole.
+ * Our consignment stock, whole - but only what ships fast.
  *
  * Paged, because Supabase answers at most a thousand rows and a silent
  * thousand-row answer once made a full catalogue look like a small one.
+ *
+ * And filtered on the delivery time, because this is the one place where our
+ * stock becomes somebody else's shop. A store that sells a pair from here
+ * tells its own customer when it arrives, and that promise is built on a
+ * consignor posting within two days. A supplier who first has to have the
+ * pair sent to him from his own shelf abroad takes five, and those sizes
+ * must not quietly end up on a shelf that promises two.
+ *
+ * An empty lead_time_days is the old promise, so nothing that was already
+ * being pushed changes.
  */
 export async function fetchConsignmentStock({ supabaseUrl, supabaseKey }) {
   const rows = [];
@@ -41,7 +51,8 @@ export async function fetchConsignmentStock({ supabaseUrl, supabaseKey }) {
     const response = await fetch(
       `${supabaseUrl}/rest/v1/consignment_inventory` +
         `?select=id,sku,size,vat_type,selling_price_suggested,quantity,seller_id,` +
-        `seller_record_id,brand,product_name&quantity=gt.0`,
+        `seller_record_id,brand,product_name,lead_time_days&quantity=gt.0` +
+        `&or=(lead_time_days.is.null,lead_time_days.lte.2)`,
       {
         headers: {
           apikey: supabaseKey,
