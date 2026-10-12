@@ -51,7 +51,7 @@ export async function fetchConsignmentStock({ supabaseUrl, supabaseKey }) {
     const response = await fetch(
       `${supabaseUrl}/rest/v1/consignment_inventory` +
         `?select=id,sku,size,vat_type,selling_price_suggested,quantity,seller_id,` +
-        `seller_record_id,brand,product_name,lead_time_days&quantity=gt.0` +
+        `seller_record_id,brand,product_name,lead_time_days,contract_labels_only&quantity=gt.0` +
         `&or=(lead_time_days.is.null,lead_time_days.lte.2)`,
       {
         headers: {
@@ -655,6 +655,16 @@ export async function runConsignmentForMerchant({
   apply = false
 }) {
   const fields = merchant.fields || {};
+
+  /*
+    Turum's stock ships on Turum's own label, straight to the shopper, and
+    we can only give them that address for a store whose labels we make on
+    our contract - we read it from its Shopify. Any other store sends us a
+    label of its own, so those sizes stay off its shelf.
+  */
+  if (!fields["Labels On Contract?"]) {
+    stock = stock.filter((row) => !row.contract_labels_only);
+  }
 
   const consignmentSync = Boolean(fields["Consignment Sync?"]);
   const priceSync = Boolean(fields["Price Sync?"]);
