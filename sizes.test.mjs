@@ -89,3 +89,9 @@ test("a real 38 and a 38 2/3 stay two different sizes", () => {
   assert.notEqual(normalizeSize("38"), normalizeSize("38 2/3"));
   assert.notEqual(normalizeSize("EU 38"), normalizeSize("38 2/3 EU"));
 });
+
+test("an emoji behind the size is decoration", () => {
+  assert.equal(normalizeSize("36.5 ⚡"), "36.5");
+  assert.equal(normalizeSize("36 2/3 ⚡"), "36 2/3");
+  assert.equal(normalizeSize("38 ⚡"), "38");
+});

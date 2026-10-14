@@ -43,8 +43,17 @@ const EU_TRAILING = new RegExp(`[\\s.:-]*(?:${EU_WORDS})$`, "i");
  */
 const OTHER_SCALE = /(?:^|\s)(?:us|usa|uk|gb|cm|jp|jpn|mondo|mx)(?=\s|\d|$)/i;
 
+/*
+ * Emoji are decoration, never part of a size.
+ *
+ * SNEAKEREGEER marks its fast-shipping sizes "36.5 ⚡", which matched none
+ * of our stock until the bolt was gone.
+ */
+const DECORATION = /[\p{Extended_Pictographic}\uFE0F\u200D]/gu;
+
 function tidy(value) {
   return String(value == null ? "" : value)
+    .replace(DECORATION, "")
     .replace(/,/g, ".")
     .replace(/\s+/g, " ")
     .trim();

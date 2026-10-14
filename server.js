@@ -1101,13 +1101,24 @@ function buildStockxName(retailed) {
     .trim();
 }
 
+/*
+ * Stores that put the size behind the style code in every variant's SKU.
+ *
+ * LetzKick writes "CJ9179-001-42.5". SNEAKEREGEER writes it without any
+ * separator at all - "CW1590-103-375" for 37.5, "HQ8708-3623" for 36 2/3 -
+ * and sometimes only the whole number, "HQ6507-35" for 35 1/2.
+ *
+ * Kept to a list on purpose: a real style code can end in digits, and only
+ * for these stores do we know the last part is a size.
+ */
+const SIZE_SUFFIX_SKU_MERCHANTS = new Set(["LetzKick", "SNEAKEREGEER"]);
+
 function normalizeMerchantVariantSku(merchant, sku, variant) {
   const rawSku = String(sku || "").trim();
 
   if (!rawSku) return "";
 
-  // Only for this specific store
-  if (merchant.name !== "LetzKick") {
+  if (!SIZE_SUFFIX_SKU_MERCHANTS.has(merchant.name)) {
     return rawSku;
   }
 
@@ -1117,27 +1128,65 @@ function normalizeMerchantVariantSku(merchant, sku, variant) {
     )
   );
 
-  const size = String(
-    sizeOption?.value || variant?.title || ""
-  ).trim();
+  const label = String(sizeOption?.value || variant?.title || "").trim();
+  const size = normalizeSize(label);
 
-  if (!size) return rawSku;
+  if (!size || !/\d/.test(size)) return rawSku;
 
-  const possibleSizes = new Set([
+  const whole = size.match(/^\d+/)?.[0] || "";
+
+  // Longest first, so 35.5 is tried as "355" before "35".
+  const possibleSizes = [...new Set([
+    label,
     size,
-    size.replace(",", "."),
-    size.replace(".", ",")
-  ]);
+    size.replace(".", ","),
+    // "37.5" -> "375", "36 2/3" -> "3623": the size as a store glues it on.
+    size.replace(/[\s.,/]/g, ""),
+    whole
+  ])]
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+
+  const upper = rawSku.toUpperCase();
 
   for (const possibleSize of possibleSizes) {
-    const suffix = `-${possibleSize}`;
+    const suffix = `-${possibleSize}`.toUpperCase();
 
-    if (rawSku.endsWith(suffix)) {
+    if (upper.endsWith(suffix) && upper.length > suffix.length) {
       return rawSku.slice(0, -suffix.length).trim();
     }
   }
 
   return rawSku;
+}
+
+/*
+ * One SKU for the whole product, decided by its variants together.
+ *
+ * This used to be the first variant's alone, so a single odd variant - a
+ * size whose suffix we cannot read - gave every row of the product a SKU
+ * with a size still stuck to it. Now the most common reading wins.
+ */
+function productSkuFor(merchant, variants) {
+  const counts = new Map();
+
+  for (const variant of variants) {
+    const sku = normalizeMerchantVariantSku(merchant, variant?.sku || "", variant);
+
+    if (sku) counts.set(sku, (counts.get(sku) || 0) + 1);
+  }
+
+  let best = "";
+  let bestCount = 0;
+
+  for (const [sku, count] of counts) {
+    if (count > bestCount) {
+      best = sku;
+      bestCount = count;
+    }
+  }
+
+  return best;
 }
 
 function calculateMatchRisk({ sku, stockxMatched }) {
@@ -1606,13 +1655,7 @@ async function syncOneProduct({
   const fullProduct = product;
   const variants = fullProduct.variants.edges.map((edge) => edge.node);
 
-  const firstVariant = variants[0];
-
-  const firstVariantSku = normalizeMerchantVariantSku(
-    merchant,
-    firstVariant?.sku || "",
-    firstVariant
-  );
+  const firstVariantSku = productSkuFor(merchant, variants);
 
   const retailedQuery = firstVariantSku || fullProduct.title;
 
@@ -2069,7 +2112,7 @@ const FULL_PASS_EVERY_MS = Number(process.env.FULL_PASS_EVERY_DAYS || 7) * 24 * 
 // last pass began is not missed.
 const CHANGES_OVERLAP_MS = 60 * 60 * 1000;
 
-async function syncAllMerchants({ budgetMs = 0, maxMerchants = 0, oldestFirst = false } = {}) {
+async function syncAllMerchants({ budgetMs = 0, maxMerchants = 0, oldestFirst = false, onlyClientId = "" } = {}) {
   // A new run starts with a clean cache: a SKU that was not found last
   // time may exist by now.
   resetSkuResolveCache();
@@ -2080,6 +2123,14 @@ async function syncAllMerchants({ budgetMs = 0, maxMerchants = 0, oldestFirst = 
   const startedAt = Date.now();
 
   let merchants = await fetchActiveMerchants();
+
+  if (onlyClientId) {
+    merchants = merchants.filter((merchant) => merchant.fields?.["Client ID"] === onlyClientId);
+
+    if (!merchants.length) {
+      throw new Error(`No active merchant with Client ID ${onlyClientId}`);
+    }
+  }
 
   /*
     Longest unseen goes first.
@@ -2551,13 +2602,7 @@ app.get("/run-test", async (_req, res) => {
       const fullProduct = product;
       const variants = fullProduct.variants.edges.map((e) => e.node);
     
-      const firstVariant = variants[0];
-
-      const firstVariantSku = normalizeMerchantVariantSku(
-        merchant,
-        firstVariant?.sku || "",
-        firstVariant
-      );
+          const firstVariantSku = productSkuFor(merchant, variants);
       
       const retailedQuery = firstVariantSku || fullProduct.title;
     
@@ -3777,10 +3822,16 @@ const JOBS = {
   products: {
     schedule: process.env.CRON_PRODUCTS || "0 1 * * *",
     what: "the catalogue pass, longest-unseen stores first, within its budget",
-    run: () =>
+    /*
+      With a client ID only that store, start to finish and without a budget:
+      for onboarding, so a new store's store_listings is filled now instead of
+      at night, and without walking every other store with it.
+    */
+    run: ({ client } = {}) =>
       syncAllMerchants({
         oldestFirst: true,
-        budgetMs: PRODUCT_BUDGET_MINUTES * 60 * 1000
+        budgetMs: client ? 0 : PRODUCT_BUDGET_MINUTES * 60 * 1000,
+        onlyClientId: client || ""
       })
   }
 };
@@ -3794,7 +3845,7 @@ const JOBS = {
  */
 const runningJobs = new Set();
 
-async function runJob(name, trigger) {
+async function runJob(name, trigger, options = {}) {
   const job = JOBS[name];
 
   if (!job) throw new Error(`Unknown job ${name}`);
@@ -3811,7 +3862,7 @@ async function runJob(name, trigger) {
   console.log(`START ${name} (${trigger}) - ${job.what}`);
 
   try {
-    const result = await job.run();
+    const result = await job.run(options);
 
     console.log(`DONE ${name} in ${Math.round((Date.now() - started) / 1000)}s`);
 
@@ -3847,7 +3898,9 @@ app.post("/jobs/:job", async (req, res) => {
     return res.status(404).json({ error: `Unknown job ${req.params.job}` });
   }
 
-  res.json(await runJob(req.params.job, "manual"));
+  const client = String(req.query.client || "").trim();
+
+  res.json(await runJob(req.params.job, "manual", client ? { client } : {}));
 });
 
 app.get("/jobs", (_req, res) => {
