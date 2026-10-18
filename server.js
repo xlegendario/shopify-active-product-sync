@@ -1113,10 +1113,30 @@ function buildStockxName(retailed) {
  */
 const SIZE_SUFFIX_SKU_MERCHANTS = new Set(["LetzKick", "SNEAKEREGEER"]);
 
+/*
+ * Madonnina glues the first size of the run behind an underscore, the same
+ * on every variant: "DD1391-103_36" on size 45.5 too. Also "HP5054_35_1/3",
+ * "205759-610_36-37", and sometimes a colour in front: "(Red)_HV0234_38.5".
+ *
+ * A list again: other stores use "_" for real, "001FWH701005_GRN_A".
+ */
+const UNDERSCORE_SIZE_SKU_MERCHANTS = new Set(["Madonnina Resell"]);
+
+function stripUnderscoreSize(rawSku) {
+  return rawSku
+    .replace(/^\([^)]*\)_/, "")
+    .replace(/_\d{1,2}(?:\.5)?(?:_[12]\/3|-\d{1,2})?$/, "")
+    .trim();
+}
+
 function normalizeMerchantVariantSku(merchant, sku, variant) {
   const rawSku = String(sku || "").trim();
 
   if (!rawSku) return "";
+
+  if (UNDERSCORE_SIZE_SKU_MERCHANTS.has(merchant.name)) {
+    return stripUnderscoreSize(rawSku) || rawSku;
+  }
 
   if (!SIZE_SUFFIX_SKU_MERCHANTS.has(merchant.name)) {
     return rawSku;
