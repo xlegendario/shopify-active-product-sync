@@ -1255,6 +1255,7 @@ function mapToSupabaseStoreListing({
   retailed,
   retailedStatus,
   productSku,
+  handSku = "",
   stockxMatched
 }) {
   const stockxProductName = buildStockxName(retailed);
@@ -1273,7 +1274,7 @@ function mapToSupabaseStoreListing({
   // was narrowed and this caller was never brought along. Removed, so the
   // two now say the same thing.
   const matchRiskLevel = calculateMatchRisk({
-    sku: productSku,
+    sku: productSku || handSku,
     stockxMatched
   });
 
@@ -1289,7 +1290,7 @@ function mapToSupabaseStoreListing({
 
     shopify_product_name: product.title || "",
     size: normalizeSize(variant.title),
-    sku: productSku || null,
+    sku: productSku || handSku || null,
 
     /*
       The store's own SKU, kept beside the one we use.
@@ -1468,6 +1469,7 @@ const PASS_WRITE_BATCH = 500;
 async function loadStoreListingIndex(merchant) {
   const rows = new Map();
   const knownSkus = new Map();
+  const handSkus = new Map();
   let from = "";
 
   for (;;) {
@@ -1475,7 +1477,7 @@ async function loadStoreListingIndex(merchant) {
       .from("store_listings")
       .select(
         "id,shopify_product_id,shopify_variant_id,status," +
-          "shopify_sku,stockx_product_name,brand,picture_url,retailed_status"
+          "shopify_sku,sku,stockx_product_name,brand,picture_url,retailed_status"
       )
       .eq("merchant_record_id", merchant.recordId)
       .gte("shopify_product_id", from)
@@ -1494,6 +1496,8 @@ async function loadStoreListingIndex(merchant) {
         shopify_variant_id: row.shopify_variant_id,
         status: row.status
       });
+
+      rememberHandSku(handSkus, row);
 
       const sku = String(row.shopify_sku || "").toUpperCase().trim();
       const seen = knownSkus.get(sku);
@@ -1519,7 +1523,44 @@ async function loadStoreListingIndex(merchant) {
     from = last;
   }
 
-  return { rows, knownSkus };
+  return { rows, knownSkus, handSkus };
+}
+
+/*
+ * A product the store left without a SKU, where we filled one in by hand
+ * (fill-skus, match-by-name). The upsert keeps that SKU, but the sync only
+ * ever resolved the store's own, so the product stayed nameless and High for
+ * good - and every order on it came in without a product name and on High
+ * (ORD-032340, Madonnina's Jordan 5 Wolf Grey). Kept per product.
+ */
+function rememberHandSku(handSkus, row) {
+  const hand = String(row.sku || "").toUpperCase().trim();
+
+  if (!hand || String(row.shopify_sku || "").trim()) return;
+
+  handSkus.set(String(row.shopify_product_id), hand);
+}
+
+async function lookupHandSku(merchant, productId) {
+  const { data, error } = await supabase
+    .from("store_listings")
+    .select("shopify_product_id,shopify_sku,sku")
+    .eq("merchant_record_id", merchant.recordId)
+    .eq("shopify_product_id", productId)
+    .is("shopify_sku", null)
+    .not("sku", "is", null)
+    .limit(1);
+
+  if (error) {
+    console.warn("hand SKU lookup failed", { merchant: merchant.name, productId, error: error.message });
+    return "";
+  }
+
+  const handSkus = new Map();
+
+  for (const row of data || []) rememberHandSku(handSkus, row);
+
+  return handSkus.get(String(productId)) || "";
 }
 
 /*
@@ -1667,6 +1708,7 @@ async function syncOneProduct({
   riskyMap,
   skipRiskyMatches = false,
   knownSkus = null,
+  handSkus = null,
   deferWrite = false
 }) {
   let variantsCounted = 0;
@@ -1677,7 +1719,17 @@ async function syncOneProduct({
 
   const firstVariantSku = productSkuFor(merchant, variants);
 
-  const retailedQuery = firstVariantSku || fullProduct.title;
+  // No SKU from the store: the one we filled in by hand, if there is one.
+  const productId = String(fullProduct.legacyResourceId || getNumericId(fullProduct.id));
+  const handSku = firstVariantSku
+    ? ""
+    : handSkus
+      ? handSkus.get(productId) || ""
+      : await lookupHandSku(merchant, productId);
+
+  const lookupSku = firstVariantSku || handSku;
+
+  const retailedQuery = lookupSku || fullProduct.title;
 
   let retailed = null;
   let retailedStatus = "ok";
@@ -1691,16 +1743,16 @@ async function syncOneProduct({
   //
   // It now goes to the portal, which uses SKU Master as its source and
   // only establishes anything on an exact StockX match.
-  const known = knownSkus?.get(String(firstVariantSku || "").toUpperCase().trim()) || null;
+  const known = knownSkus?.get(String(lookupSku || "").toUpperCase().trim()) || null;
 
   let opgelost;
 
   if (known?.retailedStatus === "ok" && known.name) {
     opgelost = { ok: true, product_name: known.name, brand: known.brand, image: known.image };
-  } else if (known?.retailedStatus === "not_found" && !retryMissToday(firstVariantSku)) {
+  } else if (known?.retailedStatus === "not_found" && !retryMissToday(lookupSku)) {
     opgelost = { ok: false, reason: "not_found" };
   } else {
-    opgelost = await resolveSkuViaPortal(firstVariantSku);
+    opgelost = await resolveSkuViaPortal(lookupSku);
   }
 
   if (opgelost.ok) {
@@ -1746,7 +1798,7 @@ async function syncOneProduct({
   const stockxProductName = buildStockxName(retailed);
 
   const productMatchRiskLevel = calculateMatchRisk({
-    sku: firstVariantSku,
+    sku: lookupSku,
     stockxMatched,
     shopifyProductName: fullProduct.title || "",
     stockxProductName,
@@ -1772,7 +1824,7 @@ async function syncOneProduct({
     : await upsertRiskyProductMatch({
         merchant,
         product: fullProduct,
-        productSku: firstVariantSku,
+        productSku: lookupSku,
         retailed,
         retailedStatus,
         matchRiskLevel: productMatchRiskLevel,
@@ -1796,6 +1848,7 @@ async function syncOneProduct({
         retailed,
         retailedStatus,
         productSku: firstVariantSku,
+        handSku,
         stockxMatched
       })
     );
@@ -1890,6 +1943,7 @@ async function syncMerchant(merchant, runId) {
         product,
         riskyMap,
         knownSkus: preloaded.knownSkus,
+        handSkus: preloaded.handSkus,
         deferWrite: true
       });
 
@@ -2029,12 +2083,13 @@ async function syncMerchantChanges(merchant, runId, sinceIso) {
     const ids = page.map((product) => String(product.legacyResourceId || getNumericId(product.id)));
 
     const knownSkus = new Map();
+    const handSkus = new Map();
     const productsWeHold = new Set();
 
     for (const chunk of chunkArray(ids, 100)) {
       const { data, error } = await supabase
         .from("store_listings")
-        .select("shopify_product_id,shopify_sku,stockx_product_name,brand,picture_url,retailed_status,status")
+        .select("shopify_product_id,shopify_sku,sku,stockx_product_name,brand,picture_url,retailed_status,status")
         .eq("merchant_record_id", merchant.recordId)
         .in("shopify_product_id", chunk);
 
@@ -2042,6 +2097,8 @@ async function syncMerchantChanges(merchant, runId, sinceIso) {
 
       for (const row of data || []) {
         if (row.status === "active") productsWeHold.add(String(row.shopify_product_id));
+
+        rememberHandSku(handSkus, row);
 
         const sku = String(row.shopify_sku || "").toUpperCase().trim();
         const seen = knownSkus.get(sku);
@@ -2079,6 +2136,7 @@ async function syncMerchantChanges(merchant, runId, sinceIso) {
           riskyMap: new Map(),
           skipRiskyMatches: true,
           knownSkus,
+          handSkus,
           deferWrite: true
         });
 
