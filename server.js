@@ -1256,6 +1256,7 @@ function mapToSupabaseStoreListing({
   retailedStatus,
   productSku,
   handSku = "",
+  handSkuDoubtful = false,
   stockxMatched
 }) {
   const stockxProductName = buildStockxName(retailed);
@@ -1273,7 +1274,7 @@ function mapToSupabaseStoreListing({
   // They are the fingerprint of the change that caused this: the signature
   // was narrowed and this caller was never brought along. Removed, so the
   // two now say the same thing.
-  const matchRiskLevel = calculateMatchRisk({
+  const matchRiskLevel = handSkuDoubtful ? "High" : calculateMatchRisk({
     sku: productSku || handSku,
     stockxMatched
   });
@@ -1541,6 +1542,31 @@ function rememberHandSku(handSkus, row) {
   handSkus.set(String(row.shopify_product_id), hand);
 }
 
+/*
+ * A hand SKU is our guess, not the store's word, so it only counts as a
+ * match when the StockX name says nothing the store's title does not: every
+ * word of it must be in the title, apart from the ones that never tell two
+ * pairs apart. "Hank OG Sole Canvas Low Purple" filled with the code of the
+ * Black one stays High, with the name on it for whoever looks.
+ */
+const NAME_FILLER = new Set(["retro", "og", "sp", "se", "qs", "x", "and", "the", "of", "essentials"]);
+
+function nameWords(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .split(/[^a-z0-9.]+/)
+    .filter(Boolean);
+}
+
+function handSkuNameAgrees(shopifyTitle, stockxName) {
+  const title = new Set(nameWords(shopifyTitle));
+
+  return nameWords(stockxName).every(
+    (word) => title.has(word) || NAME_FILLER.has(word) || /^(19|20)\d\d$/.test(word)
+  );
+}
+
 async function lookupHandSku(merchant, productId) {
   const { data, error } = await supabase
     .from("store_listings")
@@ -1797,7 +1823,10 @@ async function syncOneProduct({
 
   const stockxProductName = buildStockxName(retailed);
 
-  const productMatchRiskLevel = calculateMatchRisk({
+  const handSkuDoubtful =
+    Boolean(handSku) && stockxMatched && !handSkuNameAgrees(fullProduct.title, stockxProductName);
+
+  const productMatchRiskLevel = handSkuDoubtful ? "High" : calculateMatchRisk({
     sku: lookupSku,
     stockxMatched,
     shopifyProductName: fullProduct.title || "",
@@ -1849,6 +1878,7 @@ async function syncOneProduct({
         retailedStatus,
         productSku: firstVariantSku,
         handSku,
+        handSkuDoubtful,
         stockxMatched
       })
     );
