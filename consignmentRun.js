@@ -26,6 +26,7 @@ import { ladderFor } from "./sizeLadders.js";
 import { createStockxClient } from "./stockxSizes.js";
 import { photoSources, photosForSkus, photosFor } from "./storePhotos.js";
 import { createShopifyWriter, applyPlan, productImageUrl } from "./shopifyWriter.js";
+import { wantsNormalizedPhotos, normalizedPhotoUrls, isNormalizedPhoto } from "./photoNormalize.js";
 import { readStoreState, readOurLocationStock, readFlagSetting } from "./storeState.js";
 
 /*
@@ -806,9 +807,22 @@ export async function runConsignmentForMerchant({
 
   const writer = createShopifyWriter({ graphql, locationId, apply: true });
 
-  const photosBySku = new Map(
-    plan.createProducts.map((entry) => [entry.sku, photosFor(photos, entry.sku)])
-  );
+  /*
+    A store that wants one look for every photograph gets them normalised
+    first (photoNormalize.js). Only new pages pass through here, so a run
+    normalises a handful of images at most; each is kept and never redone.
+  */
+  const normalize = wantsNormalizedPhotos(merchant);
+  const photosBySku = new Map();
+
+  for (const entry of plan.createProducts) {
+    const urls = photosFor(photos, entry.sku);
+
+    photosBySku.set(
+      entry.sku,
+      normalize && urls.length ? await normalizedPhotoUrls(urls, { supabaseUrl, supabaseKey }) : urls
+    );
+  }
 
   const report = await applyPlan(plan, writer, { photosBySku });
 
@@ -1028,7 +1042,14 @@ const ADD_MEDIA = `
   }
 `;
 
-export async function backfillPhotosForMerchant({ merchant, graphql, photos, apply = false }) {
+export async function backfillPhotosForMerchant({
+  merchant,
+  graphql,
+  photos,
+  supabaseUrl = "",
+  supabaseKey = "",
+  apply = false
+}) {
   const fields = merchant.fields || {};
 
   const base = { merchantRecordId: merchant.recordId, merchantName: merchant.name };
@@ -1066,12 +1087,18 @@ export async function backfillPhotosForMerchant({ merchant, graphql, photos, app
   let filled = 0;
   const problems = [];
 
+  const normalize = wantsNormalizedPhotos(merchant);
+
   for (const item of fillable) {
     try {
+      // Normalised images are finished as they are; only the raw ones get
+      // Shopify's resize-and-pad treatment.
+      const urls = normalize ? await normalizedPhotoUrls(item.urls, { supabaseUrl, supabaseKey }) : item.urls;
+
       const data = await graphql(ADD_MEDIA, {
         id: item.id,
-        media: item.urls.map((url) => ({
-          originalSource: productImageUrl(url),
+        media: urls.map((url) => ({
+          originalSource: isNormalizedPhoto(url) ? url : productImageUrl(url),
           mediaContentType: "IMAGE"
         }))
       });
@@ -1132,7 +1159,14 @@ export async function backfillPhotosForAll({
   for (const merchant of wanted) {
     try {
       results.push(
-        await backfillPhotosForMerchant({ merchant, graphql: graphqlFor(merchant), photos, apply })
+        await backfillPhotosForMerchant({
+          merchant,
+          graphql: graphqlFor(merchant),
+          photos,
+          supabaseUrl,
+          supabaseKey,
+          apply
+        })
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
