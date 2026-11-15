@@ -242,21 +242,41 @@ export async function catalogueChoicesFor(merchantRecordId, { supabaseUrl, supab
 
   if (!merchantRecordId || !supabaseUrl || !supabaseKey) return choices;
 
-  const response = await fetch(
-    String(supabaseUrl).replace(/[/]+$/, "") + "/rest/v1/store_catalogue_choices" +
-      "?select=sku,choice,photos,status" +
-      "&merchant_record_id=eq." + encodeURIComponent(merchantRecordId) +
-      "&limit=50000",
-    { headers: { apikey: supabaseKey, Authorization: "Bearer " + supabaseKey } }
-  );
+  /*
+    FIXED - read in pages. limit=50000 was capped at Supabase's 1000 rows
+    without a word, so a store with more choices than that never had the
+    rest carried out: UNION's 1682 left 539 pages it switched off live and
+    its new picks never made (15-11-2026).
+  */
+  const page = 1000;
 
-  if (!response.ok) {
-    throw new Error(`Could not read the store's catalogue choices (Supabase ${response.status})`);
-  }
+  for (let from = 0; ; from += page) {
+    const response = await fetch(
+      String(supabaseUrl).replace(/[/]+$/, "") + "/rest/v1/store_catalogue_choices" +
+        "?select=sku,choice,photos,status" +
+        "&merchant_record_id=eq." + encodeURIComponent(merchantRecordId) +
+        "&order=sku.asc",
+      {
+        headers: {
+          apikey: supabaseKey,
+          Authorization: "Bearer " + supabaseKey,
+          Range: `${from}-${from + page - 1}`
+        }
+      }
+    );
 
-  for (const row of await response.json()) {
-    const sku = normalizeSku(row.sku);
-    if (sku) choices.set(sku, { choice: row.choice, photos: row.photos, status: row.status });
+    if (!response.ok) {
+      throw new Error(`Could not read the store's catalogue choices (Supabase ${response.status})`);
+    }
+
+    const rows = await response.json();
+
+    for (const row of rows) {
+      const sku = normalizeSku(row.sku);
+      if (sku) choices.set(sku, { choice: row.choice, photos: row.photos, status: row.status });
+    }
+
+    if (rows.length < page) break;
   }
 
   return choices;
