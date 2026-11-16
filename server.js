@@ -5,6 +5,8 @@ import { createClient } from "@supabase/supabase-js";
 
 import { runConsignmentForAll, backfillPhotosForAll } from "./consignmentRun.js";
 import { normalizeSize } from "./sizes.js";
+import { autopriceMerchant } from "./autopriceRun.js";
+import { storeProPrices, supabase as marketDb } from "./marketPrices.js";
 
 const app = express();
 
@@ -3908,6 +3910,114 @@ const CONSIGNMENT_APPLY =
  */
 const PRODUCT_BUDGET_MINUTES = Number(process.env.PRODUCT_SYNC_BUDGET_MINUTES || 300);
 
+/* ------------------------------------------------------------------ *
+ * Autopricing
+ * ------------------------------------------------------------------ */
+
+const AUTOPRICE_CLIENTS = String(process.env.AUTOPRICE_CLIENTS || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const AUTOPRICE_SECRET = process.env.AUTOPRICE_SECRET || "";
+const AUTOPRICE_DISCORD_WEBHOOK = process.env.AUTOPRICE_DISCORD_WEBHOOK || "";
+
+const autopriceDb = () =>
+  marketDb({ supabaseUrl: process.env.SUPABASE_URL, supabaseKey: process.env.SUPABASE_SERVICE_ROLE_KEY });
+
+async function autopriceAlert(message) {
+  console.log("AUTOPRICE ALERT " + message);
+
+  if (!AUTOPRICE_DISCORD_WEBHOOK) return;
+
+  await fetch(AUTOPRICE_DISCORD_WEBHOOK, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "Autopricing: " + message })
+  }).catch(() => null);
+}
+
+async function autopriceAll({ onlyClientId = "" } = {}) {
+  const wanted = onlyClientId ? [onlyClientId] : AUTOPRICE_CLIENTS;
+
+  if (!wanted.length) return { skipped: "AUTOPRICE_CLIENTS is empty" };
+
+  const merchants = (await fetchActiveMerchants()).filter((m) => wanted.includes(m.fields["Client ID"]));
+  const results = [];
+
+  for (const m of merchants) {
+    results.push(await autopriceMerchant({ merchant: { ...m.fields, "Record ID": m.recordId } }));
+  }
+
+  /*
+    The watchdog. The Pro reads come from a browser on the VPS, and when it
+    is logged out or stuck nothing here would otherwise notice: prices fall
+    back to the dearer API stand-in and nobody knows why.
+  */
+  const [latest] = await autopriceDb().select(
+    "market_products", "select=pro_checked_at&pro_checked_at=not.is.null&order=pro_checked_at.desc&limit=1"
+  ).catch(() => []);
+
+  const hours = latest ? (Date.now() - new Date(latest.pro_checked_at)) / 3600000 : null;
+
+  if (hours === null || hours > 3) {
+    await autopriceAlert(
+      hours === null
+        ? "the StockX Pro extension has not sent a single price yet."
+        : `no StockX Pro price for ${Math.round(hours)} hours. Is the browser on the VPS still logged in?`
+    );
+  }
+
+  return results;
+}
+
+function autopriceAuthorized(req) {
+  return AUTOPRICE_SECRET && String(req.headers["x-autoprice-secret"] || "") === AUTOPRICE_SECRET;
+}
+
+/*
+ * The extension asks which product to read next on StockX Pro.
+ *
+ * Longest-unread first, over every style an autopricing store has on its
+ * shelf. Answers one product at a time so the browser keeps its own pace.
+ */
+app.get("/autoprice/pro-next", async (req, res) => {
+  if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const db = autopriceDb();
+    const minHours = Number(process.env.AUTOPRICE_PRO_EVERY_HOURS || 20);
+    const cutoff = new Date(Date.now() - minHours * 3600000).toISOString();
+    const rows = await db.select(
+      "market_products",
+      "select=sku,stockx_product_id,pro_checked_at&stockx_product_id=not.is.null" +
+        "&or=(pro_checked_at.is.null,pro_checked_at.lt.%22" + encodeURIComponent(cutoff) + "%22)" +
+        "&order=pro_checked_at.asc.nullsfirst&limit=1"
+    );
+
+    res.json(rows[0] ? { sku: rows[0].sku, productId: rows[0].stockx_product_id } : { idle: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// What the extension read: { sku, sizes: { "42.5": { total, buyNow, asks } } }.
+app.post("/autoprice/stockx-pro", async (req, res) => {
+  if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const stored = await storeProPrices({ db: autopriceDb(), sku: req.body?.sku, sizes: req.body?.sizes });
+    res.json({ ok: true, stored });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// The extension saying it is logged out or stuck.
+app.post("/autoprice/alert", async (req, res) => {
+  if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
+
+  await autopriceAlert(String(req.body?.message || "the extension reported a problem").slice(0, 500));
+  res.json({ ok: true });
+});
+
 const JOBS = {
   consignment: {
     schedule: process.env.CRON_CONSIGNMENT || "*/30 * * * *",
@@ -3925,6 +4035,18 @@ const JOBS = {
     schedule: process.env.CRON_PHOTOS || "0 5 * * 1",
     what: "pictures onto products that were created without any",
     run: () => backfillPhotos({ apply: CONSIGNMENT_APPLY })
+  },
+
+  autoprice: {
+    /*
+      Prices for the sizes a store does not hold, from the cheapest sourcing
+      platform plus the store's own margin. Only the stores named in
+      AUTOPRICE_CLIENTS take part, and for now it writes nothing but
+      autoprice_listings: Shopify comes once the numbers have been checked.
+    */
+    schedule: process.env.CRON_AUTOPRICE || "20 */6 * * *",
+    what: "autopricing for the stores in AUTOPRICE_CLIENTS (test mode: autoprice_listings only)",
+    run: ({ client } = {}) => autopriceAll({ onlyClientId: client || "" })
   },
 
   products: {

@@ -1,0 +1,349 @@
+/*
+ * What a pair costs us on each sourcing platform, read into market_prices.
+ *
+ * Three readers run from this service, without a browser:
+ *
+ *   stockx_api  the official API, all sizes in one call. Only a stand-in:
+ *               what we really pay comes from the Pro page, which the
+ *               autopricing extension posts to /autoprice/stockx-pro.
+ *   dewu        tosneaker's Dewu Europe feed, RMB per EU size.
+ *   goat        Retailed's GOAT prices for France in dollars, per US size,
+ *               converted to what the Dutch page charges (see autoprice.js).
+ *
+ * Where to find a style on each platform is looked up once and kept in
+ * market_products, so a daily read is one or two calls per product.
+ */
+import { createStockxClient } from "./stockxSizes.js";
+import { normalizeSize as sizeKey } from "./sizes.js";
+import { safeStockxCost, goatCost, dewuCost } from "./autoprice.js";
+
+const STOCKX = "https://api.stockx.com/v2/catalog";
+const RETAILED = "https://app.retailed.io/api/v1/scraper/goat";
+const DEWU = "https://product.tosneaker.com/api/v1/dewu/europe";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const clean = (sku) => String(sku || "").trim().toUpperCase().replace(/\s+/g, "-");
+
+/* ------------------------------------------------------------------ *
+ * Supabase
+ * ------------------------------------------------------------------ */
+
+export function supabase({ supabaseUrl, supabaseKey }) {
+  const base = String(supabaseUrl).replace(/[/]+$/, "") + "/rest/v1/";
+  const headers = { apikey: supabaseKey, Authorization: "Bearer " + supabaseKey, "Content-Type": "application/json" };
+
+  async function select(table, query) {
+    const rows = [];
+    const page = 1000;
+
+    // Paged: a single read stops at 1000 rows without saying so.
+    for (let from = 0; ; from += page) {
+      const res = await fetch(base + table + "?" + query, { headers: { ...headers, Range: `${from}-${from + page - 1}` } });
+
+      if (!res.ok) throw new Error(`Supabase ${res.status} reading ${table}: ${await res.text()}`);
+
+      const batch = await res.json();
+      rows.push(...batch);
+
+      if (batch.length < page) return rows;
+    }
+  }
+
+  async function upsert(table, rows, onConflict) {
+    for (let i = 0; i < rows.length; i += 500) {
+      const res = await fetch(base + table + "?on_conflict=" + onConflict, {
+        method: "POST",
+        headers: { ...headers, Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(rows.slice(i, i + 500))
+      });
+
+      if (!res.ok) throw new Error(`Supabase ${res.status} writing ${table}: ${await res.text()}`);
+    }
+  }
+
+  return { select, upsert };
+}
+
+/* ------------------------------------------------------------------ *
+ * Finding a style on each platform
+ * ------------------------------------------------------------------ */
+
+async function findStockx(client, sku) {
+  // StockX answers an unknown style code with a 404 rather than an empty list.
+  const search = await client.call(`${STOCKX}/search?query=${encodeURIComponent(sku)}&pageSize=10`).catch((error) => {
+    if (/StockX 404/.test(error.message)) return null;
+    throw error;
+  });
+  const hit = (search?.products || []).find((p) => clean(p.styleId) === sku);
+
+  if (!hit) return null;
+
+  const variants = await client.call(`${STOCKX}/products/${hit.productId}/variants`);
+
+  /*
+    Per variant: its EU size (our key everywhere) and the size the product
+    is natively sold in. GOAT keys on the native one - US men's for most
+    sneakers, US women's for a women's style, EU for Mihara - so this is the
+    bridge between the two.
+  */
+  const sizes = (Array.isArray(variants) ? variants : []).map((v) => {
+    const eu = (v.sizeChart?.availableConversions || []).find((c) => String(c.type).toLowerCase() === "eu")?.size;
+
+    return {
+      variantId: v.variantId,
+      eu: sizeKey(eu || v.variantValue),
+      native: String(v.variantValue || "").replace(/[A-Z]+$/i, "").trim()
+    };
+  });
+
+  return { productId: hit.productId, sizes };
+}
+
+async function findGoat(sku, apiKey) {
+  const res = await fetch(`${RETAILED}/search?query=${encodeURIComponent(sku)}`, { headers: { "x-api-key": apiKey } });
+
+  if (!res.ok) throw new Error(`Retailed ${res.status} on GOAT search`);
+
+  const body = await res.json();
+  const list = Array.isArray(body) ? body : [body];
+
+  // The slug ends in the style code; anything else is a different pair.
+  const hit = list.find((x) => String(x?.slug || "").toUpperCase().endsWith(sku));
+
+  return hit ? { id: String(hit.id), slug: hit.slug } : null;
+}
+
+async function dewuJson(url) {
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+
+  if (!res.ok) throw new Error(`tosneaker ${res.status}`);
+
+  return res.json();
+}
+
+async function findDewu(sku) {
+  const body = await dewuJson(`${DEWU}/searchProduct?keyword=${encodeURIComponent(sku)}`);
+  let list = body?.data?.data || body?.data || [];
+
+  if (!Array.isArray(list)) list = [list];
+
+  const hit = list.find((p) => clean(p.article_number) === sku);
+
+  return hit ? String(hit.spu_id || hit.dw_spu_id) : null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Reading the prices
+ * ------------------------------------------------------------------ */
+
+async function readStockxApi(client, product) {
+  const market = await client.call(`${STOCKX}/products/${product.stockx_product_id}/market-data?currencyCode=EUR`);
+  const byVariant = new Map((product.stockx_sizes || []).map((s) => [s.variantId, s.eu]));
+  const out = [];
+
+  for (const m of Array.isArray(market) ? market : []) {
+    const size = byVariant.get(m.variantId);
+    const ask = Number(m.standardMarketData?.lowestAsk ?? m.lowestAskAmount) || null;
+    const cost = safeStockxCost(ask);
+
+    if (size && cost) out.push({ size, cost, raw: { lowestAsk: ask } });
+  }
+
+  return out;
+}
+
+async function readGoat(product, apiKey) {
+  const res = await fetch(`${RETAILED}/prices?query=${product.goat_id}&country=FR`, { headers: { "x-api-key": apiKey } });
+
+  if (!res.ok) throw new Error(`Retailed ${res.status} on GOAT prices`);
+
+  const rows = await res.json();
+
+  if (!Array.isArray(rows)) throw new Error("Retailed gave no price list");
+
+  const euByNative = new Map((product.stockx_sizes || []).map((s) => [s.native, s.eu]));
+  const out = [];
+
+  for (const r of rows) {
+    // New, in a good box: what the page sells as "Buy New".
+    if (r.shoeCondition !== "new_no_defects" || r.boxCondition !== "good_condition") continue;
+
+    const usd = (r.lowestPriceCents?.amount || 0) / 100;
+    const size = euByNative.get(String(r.sizeOption?.value));
+    const cost = goatCost(usd);
+
+    if (size && cost) out.push({ size, cost, raw: { frUsd: usd } });
+  }
+
+  return out;
+}
+
+/*
+ * Dewu's size label as an EU size.
+ *
+ * Usually just "42.5", but New Balance comes as colour, width and size:
+ * "灰棕色 D宽 42.5". Only the standard D width is the pair we sell; a wide
+ * fit (2E, 4E) is a different shoe and is left out.
+ */
+export function dewuSize(label) {
+  const text = String(label || "").replace(/^EU\s*/i, "").trim();
+  const width = text.match(/(\S+)宽/);
+
+  if (width && width[1].toUpperCase() !== "D") return "";
+
+  const size = text.match(/(\d{2}(?:\.5)?(?:\s+[12]\/3)?)\s*$/);
+
+  return size ? sizeKey(size[1]) : "";
+}
+
+async function readDewu(product, fee) {
+  const body = await dewuJson(`${DEWU}/productPrice?dw_spu_id=${product.dewu_spu_id}`);
+  const variants = body?.data?.data || body?.data || [];
+  const out = [];
+
+  for (const v of Array.isArray(variants) ? variants : []) {
+    const normal = Number(v.normal_price) || 0;
+    const storage = Number(v.storage_price) || 0;
+    const rmb = normal > 0 ? normal : storage;
+    const cost = dewuCost(rmb, fee);
+    const size = dewuSize(v.size);
+
+    // The ceiling is applied when pricing, not here: the raw cost stays visible.
+    if (size && cost) out.push({ size, cost, raw: { rmb, kind: normal > 0 ? "normal" : "storage" } });
+  }
+
+  return out;
+}
+
+export async function readDewuFee({ airtableToken, airtableBaseId }) {
+  const url = new URL(`https://api.airtable.com/v0/${airtableBaseId}/${encodeURIComponent("Sellers Database")}`);
+  url.searchParams.set("filterByFormula", "{Dewu Supplier?} = 1");
+  url.searchParams.set("maxRecords", "1");
+
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${airtableToken}` } });
+  const fee = Number((await res.json()).records?.[0]?.fields?.["Dewu Fee"]);
+
+  if (!Number.isFinite(fee)) throw new Error("No Dewu Fee in Sellers Database");
+
+  return fee;
+}
+
+/* ------------------------------------------------------------------ *
+ * One pass over a list of styles
+ * ------------------------------------------------------------------ */
+
+const HOURS = 3600000;
+
+/*
+ * Refreshes whatever is due for each SKU and writes it to market_prices.
+ *
+ * every: how many hours between reads, per platform. A platform that fails
+ * for one SKU is logged and skipped; the rest carry on.
+ */
+export async function refreshMarketPrices(skus, {
+  db, retailedKey, dewuFee,
+  every = { stockx_api: 6, dewu: 24, goat: 24 },
+  log = console
+} = {}) {
+  const client = createStockxClient();
+  const wanted = [...new Set(skus.map(clean).filter(Boolean))];
+  const known = new Map();
+
+  for (let i = 0; i < wanted.length; i += 100) {
+    const chunk = wanted.slice(i, i + 100);
+    const rows = await db.select("market_products", "select=*&sku=in.(" + chunk.map((s) => `"${s}"`).join(",") + ")");
+
+    for (const r of rows) known.set(r.sku, r);
+  }
+
+  const now = Date.now();
+  const due = (at, hours) => !at || now - new Date(at).getTime() >= hours * HOURS;
+  const stats = { skus: wanted.length, stockx_api: 0, dewu: 0, goat: 0, errors: 0 };
+
+  for (const sku of wanted) {
+    const product = known.get(sku) || { sku };
+    const prices = [];
+    const note = (source, rows) => {
+      /*
+        One row per size: two variants can land on the same EU size (a
+        women's and a men's label, Dewu's widths), and one write may not
+        touch the same row twice. The cheapest is the one we would buy.
+      */
+      const best = new Map();
+      for (const r of rows) if (!best.has(r.size) || r.cost < best.get(r.size).cost) best.set(r.size, r);
+      for (const r of best.values()) prices.push({ sku, size: r.size, source, cost: r.cost, raw: r.raw, observed_at: new Date().toISOString() });
+      stats[source] += best.size;
+    };
+
+    try {
+      // Found on a platform once, never searched again; not found is retried weekly.
+      if (product.stockx_product_id === undefined || (!product.stockx_product_id && due(product.updated_at, 24 * 7))) {
+        const sx = await findStockx(client, sku);
+        product.stockx_product_id = sx?.productId || null;
+        product.stockx_sizes = sx?.sizes || null;
+        if (retailedKey) {
+          const goat = await findGoat(sku, retailedKey).catch(() => null);
+          product.goat_id = goat?.id || null;
+          product.goat_slug = goat?.slug || null;
+        }
+        product.dewu_spu_id = await findDewu(sku).catch(() => null);
+        product.updated_at = new Date().toISOString();
+      }
+
+      if (product.stockx_product_id && due(product.api_checked_at, every.stockx_api)) {
+        note("stockx_api", await readStockxApi(client, product));
+        product.api_checked_at = new Date().toISOString();
+      }
+
+      if (product.dewu_spu_id && due(product.dewu_checked_at, every.dewu)) {
+        note("dewu", await readDewu(product, dewuFee));
+        product.dewu_checked_at = new Date().toISOString();
+      }
+
+      if (product.goat_id && retailedKey && product.stockx_sizes && due(product.goat_checked_at, every.goat)) {
+        note("goat", await readGoat(product, retailedKey));
+        product.goat_checked_at = new Date().toISOString();
+      }
+    } catch (error) {
+      stats.errors += 1;
+      log.log(`AUTOPRICE market read failed for ${sku}: ${error.message}`);
+    }
+
+    // Pro times are the extension's to write; never put back an old one.
+    const { pro_checked_at, ...row } = product;
+    try {
+      await db.upsert("market_products", [row], "sku");
+      if (prices.length) await db.upsert("market_prices", prices, "sku,size,source");
+    } catch (error) {
+      stats.errors += 1;
+      log.log(`AUTOPRICE market write failed for ${sku}: ${error.message}`);
+    }
+
+    await sleep(300);
+  }
+
+  return stats;
+}
+
+/*
+ * What the autopricing extension read on the Pro page for one product.
+ *
+ * sizes: { "42.5": { total, buyNow, asks } } - EU sizes, Total incl. tax.
+ */
+export async function storeProPrices({ db, sku, sizes }) {
+  const at = new Date().toISOString();
+  const rows = Object.entries(sizes || {})
+    .filter(([, v]) => Number(v?.total) > 0)
+    .map(([size, v]) => ({
+      sku: clean(sku), size: sizeKey(size), source: "stockx_pro", cost: Number(v.total),
+      depth: Number.isFinite(Number(v.asks)) ? Number(v.asks) : null,
+      raw: { buyNow: v.buyNow ?? null }, observed_at: at
+    }));
+
+  const unique = [...new Map(rows.sort((x, y) => y.cost - x.cost).map((r) => [r.size, r])).values()];
+
+  if (unique.length) await db.upsert("market_prices", unique, "sku,size,source");
+  await db.upsert("market_products", [{ sku: clean(sku), pro_checked_at: at }], "sku");
+
+  return unique.length;
+}
