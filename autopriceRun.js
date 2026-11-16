@@ -31,7 +31,12 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
 
   if (refresh) {
     const dewuFee = await readDewuFee({ airtableToken: env.AIRTABLE_TOKEN, airtableBaseId: env.AIRTABLE_BASE_ID });
-    market = await refreshMarketPrices(skus, { db, retailedKey: env.RETAILED_API_KEY, dewuFee, log });
+    /*
+      GOAT costs Retailed calls (one per product per day), so it is a switch
+      of its own: AUTOPRICE_GOAT=true once the Retailed plan carries it.
+    */
+    const retailedKey = String(env.AUTOPRICE_GOAT || "").toLowerCase() === "true" ? env.RETAILED_API_KEY : "";
+    market = await refreshMarketPrices(skus, { db, retailedKey, dewuFee, log });
   }
 
   const observations = new Map();

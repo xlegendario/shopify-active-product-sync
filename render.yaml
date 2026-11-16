@@ -92,8 +92,9 @@ services:
       # Discord-webhook voor "uitgelogd" en "geen Pro-prijzen meer".
       - key: AUTOPRICE_DISCORD_WEBHOOK
         sync: false
-      - key: RETAILED_API_KEY
-        sync: false
+      # GOAT via Retailed aan/uit (kost ~1 call per product per dag).
+      - key: AUTOPRICE_GOAT
+        value: 'false'
 
       # Secrets: in het Render dashboard invullen, niet hier.
       #
