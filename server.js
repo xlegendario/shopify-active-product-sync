@@ -3914,8 +3914,6 @@ const PRODUCT_BUDGET_MINUTES = Number(process.env.PRODUCT_SYNC_BUDGET_MINUTES ||
  * Autopricing
  * ------------------------------------------------------------------ */
 
-const AUTOPRICE_CLIENTS = String(process.env.AUTOPRICE_CLIENTS || "")
-  .split(",").map((s) => s.trim()).filter(Boolean);
 const AUTOPRICE_SECRET = process.env.AUTOPRICE_SECRET || "";
 const AUTOPRICE_DISCORD_WEBHOOK = process.env.AUTOPRICE_DISCORD_WEBHOOK || "";
 
@@ -3935,11 +3933,17 @@ async function autopriceAlert(message) {
 }
 
 async function autopriceAll({ onlyClientId = "" } = {}) {
-  const wanted = onlyClientId ? [onlyClientId] : AUTOPRICE_CLIENTS;
+  /*
+    The switch is Price Sync? in Merchants: a store where we set the prices
+    also gets prices for the sizes it does not hold. A client id from the
+    jobs endpoint narrows it to that one store, but never adds a store that
+    has Price Sync off.
+  */
+  const merchants = (await fetchActiveMerchants()).filter((m) =>
+    Boolean(m.fields["Price Sync?"]) && (!onlyClientId || m.fields["Client ID"] === onlyClientId)
+  );
 
-  if (!wanted.length) return { skipped: "AUTOPRICE_CLIENTS is empty" };
-
-  const merchants = (await fetchActiveMerchants()).filter((m) => wanted.includes(m.fields["Client ID"]));
+  if (!merchants.length) return { skipped: "no active store with Price Sync? on" };
   const results = [];
 
   for (const m of merchants) {
@@ -4040,12 +4044,12 @@ const JOBS = {
   autoprice: {
     /*
       Prices for the sizes a store does not hold, from the cheapest sourcing
-      platform plus the store's own margin. Only the stores named in
-      AUTOPRICE_CLIENTS take part, and for now it writes nothing but
+      platform plus the store's own margin. Only stores with Price Sync? on
+      in Merchants take part, and for now it writes nothing but
       autoprice_listings: Shopify comes once the numbers have been checked.
     */
     schedule: process.env.CRON_AUTOPRICE || "20 */6 * * *",
-    what: "autopricing for the stores in AUTOPRICE_CLIENTS (test mode: autoprice_listings only)",
+    what: "autopricing for the stores with Price Sync? on (test mode: autoprice_listings only)",
     run: ({ client } = {}) => autopriceAll({ onlyClientId: client || "" })
   },
 

@@ -76,11 +76,9 @@ services:
       - key: PHOTO_SOURCE_MERCHANTS
         value: SOSU KICKS S.R.L.,ALC SELECT STORE SL,SneakerAsk
 
-      # Autopricing. Welke winkels meedoen (Client ID's, komma's ertussen);
-      # leeg betekent dat de job niets doet. Schrijft voorlopig alleen naar
-      # autoprice_listings, nog niet naar Shopify.
-      - key: AUTOPRICE_CLIENTS
-        sync: false
+      # Autopricing. Doet mee voor elke actieve winkel met Price Sync? aan in
+      # Merchants. Schrijft voorlopig alleen naar autoprice_listings, nog niet
+      # naar Shopify.
       - key: CRON_AUTOPRICE
         value: '20 */6 * * *'
       # Hoe vaak de extensie een product op StockX Pro opnieuw leest.
