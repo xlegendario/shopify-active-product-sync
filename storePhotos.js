@@ -220,14 +220,28 @@ async function remember(sku, found) {
   });
 }
 
+/*
+ * Fewer photographs than this and the next store is asked as well.
+ *
+ * ADDED 16-11-2026: a Maison Mihara page had two photographs, one of them a
+ * hand holding the shoe, because SOSU was first and had only those two.
+ */
+const ENOUGH_PHOTOS = Number(process.env.PHOTO_ENOUGH || 3);
+const RETRY_FEW_AFTER_DAYS = Number(process.env.PHOTO_RETRY_FEW_DAYS || 7);
+
 function worthAsking(entry) {
   if (!entry) return true;
-  if (entry.images.length) return false;
   if (!entry.checkedAt) return true;
 
   const age = Date.now() - new Date(entry.checkedAt).getTime();
+  const days = 24 * 60 * 60 * 1000;
 
-  return age > RETRY_UNKNOWN_AFTER_DAYS * 24 * 60 * 60 * 1000;
+  if (!entry.images.length) return age > RETRY_UNKNOWN_AFTER_DAYS * days;
+
+  // A thin gallery is asked about again now and then: another store may carry it by now.
+  if (entry.images.length < ENOUGH_PHOTOS) return age > RETRY_FEW_AFTER_DAYS * days;
+
+  return false;
 }
 
 /*
@@ -257,17 +271,32 @@ export async function photosForSkus(skus, { sources = [], onProgress = () => {} 
       continue;
     }
 
+    /*
+      In order of preference, and the first store with enough photographs
+      wins. A store with fewer only keeps the pair while nobody after it has
+      more: the background is replaced on every photograph anyway, so
+      another store's set no longer looks out of place, and three angles
+      beat two.
+    */
     let found = null;
 
     for (const source of sources) {
+      let hit = null;
+
       try {
-        found = await askStore(source, sku);
+        hit = await askStore(source, sku);
       } catch (err) {
         onProgress({ sku, error: `${source.name}: ${err.message}` });
         continue;
       }
 
-      if (found) break;
+      if (hit && (!found || hit.images.length > found.images.length)) found = hit;
+      if (found && found.images.length >= ENOUGH_PHOTOS) break;
+    }
+
+    // A re-ask that turns up nothing new keeps what we had.
+    if (entry?.images?.length && (!found || found.images.length <= entry.images.length)) {
+      found = { images: entry.images, source: entry.source };
     }
 
     photos.set(sku, found?.images || []);

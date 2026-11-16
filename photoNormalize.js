@@ -179,6 +179,53 @@ function cutEdges(alpha, width, height) {
 }
 
 /*
+ * Whether a photograph is a packshot - the product on its own - rather than
+ * a picture of it in the world.
+ *
+ * ADDED 16-11-2026. The cut-out below assumes a packshot, and on anything
+ * else it makes a mess: a pair on a pavement came out with half the paving
+ * stones gone and a sleeve hanging in the air. The comment at the top called
+ * those rare enough to fix by hand; on UNION's shelf it was 36 of 1304
+ * photographs over 21 pairs, which is too many to find by eye.
+ *
+ * A packshot either has real transparency, or a frame that is one colour all
+ * the way round: every one of its four edges at least 95% background. Checked
+ * by eye on all 1304: of the 74 without transparency, the 38 with four clean
+ * edges were packshots and every one with three or fewer was a street shot,
+ * a hand, a model, or a studio shot with legs in it.
+ */
+export async function isPackshot(input) {
+  const { data, info } = await sharp(input, { failOn: "none" })
+    .rotate()
+    .resize(300, 300, { fit: "inside" })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height } = info;
+  const n = width * height;
+
+  let seeThrough = 0;
+  for (let i = 0; i < n; i += 1) if (data[i * 4 + 3] < 250) seeThrough += 1;
+  if (seeThrough / n > 0.05) return true;
+
+  const top = [], bottom = [], left = [], right = [];
+  for (let x = 0; x < width; x += 1) { top.push(x); bottom.push((height - 1) * width + x); }
+  for (let y = 0; y < height; y += 1) { left.push(y * width); right.push(y * width + width - 1); }
+
+  const border = [...top, ...bottom, ...left, ...right];
+  const median = (channel) => {
+    const values = border.map((i) => data[i * 4 + channel]).sort((a, b) => a - b);
+    return values[values.length >> 1];
+  };
+  const bg = [median(0), median(1), median(2)];
+  const near = (i) =>
+    Math.max(Math.abs(data[i * 4] - bg[0]), Math.abs(data[i * 4 + 1] - bg[1]), Math.abs(data[i * 4 + 2] - bg[2])) <= TOLERANCE;
+
+  return [top, bottom, left, right].every((edge) => edge.filter(near).length / edge.length >= 0.95);
+}
+
+/*
  * A source image in, the normalised JPEG out. Null when nothing that looks
  * like a product was found.
  */
@@ -280,6 +327,11 @@ export function isNormalizedPhoto(url) {
   return String(url || "").includes(`/storage/v1/object/public/${BUCKET}/normalized/`);
 }
 
+function skipPath(sourceUrl) {
+  const key = crypto.createHash("sha1").update(`${STYLE}|${sourceUrl}`).digest("hex");
+  return `normalized/${STYLE}/${key}.skip.txt`;
+}
+
 function storagePath(sourceUrl) {
   const key = crypto.createHash("sha1").update(`${STYLE}|${sourceUrl}`).digest("hex");
   return `normalized/${STYLE}/${key}.jpg`;
@@ -315,10 +367,31 @@ export async function normalizedPhotoUrls(urls, { supabaseUrl, supabaseKey, all 
         continue;
       }
 
+      // Judged once: a marker where the image would go says "not a packshot".
+      const skipped = await fetch(`${base}/storage/v1/object/public/${BUCKET}/${skipPath(source)}`, { method: "HEAD" });
+
+      if (skipped.ok) continue;
+
       const res = await fetch(source);
       if (!res.ok) throw new Error(`source answered ${res.status}`);
 
-      const jpeg = await normalizeImage(Buffer.from(await res.arrayBuffer()));
+      const input = Buffer.from(await res.arrayBuffer());
+
+      /*
+        A street or model shot is left out, not counted as a failure: the
+        pair's other photographs are fine, and with all: true a single
+        failure would cost the whole gallery.
+      */
+      if (!(await isPackshot(input))) {
+        await fetch(`${base}/storage/v1/object/${BUCKET}/${skipPath(source)}`, {
+          method: "POST",
+          headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}`, "Content-Type": "text/plain", "x-upsert": "true" },
+          body: "not a packshot"
+        }).catch(() => null);
+        continue;
+      }
+
+      const jpeg = await normalizeImage(input);
       if (!jpeg) throw new Error("no product found in the image");
 
       const upload = await fetch(`${base}/storage/v1/object/${BUCKET}/${path}`, {
@@ -342,7 +415,7 @@ export async function normalizedPhotoUrls(urls, { supabaseUrl, supabaseKey, all 
     }
   }
 
-  if (all) return failed ? null : out;
+  if (all) return failed || !out.length ? null : out;
 
   return out.length ? out : sources;
 }
