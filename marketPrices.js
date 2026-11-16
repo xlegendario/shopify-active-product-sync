@@ -61,7 +61,13 @@ export function supabase({ supabaseUrl, supabaseKey }) {
     }
   }
 
-  return { select, upsert };
+  async function remove(table, query) {
+    const res = await fetch(base + table + "?" + query, { method: "DELETE", headers: { ...headers, Prefer: "return=minimal" } });
+
+    if (!res.ok) throw new Error(`Supabase ${res.status} deleting from ${table}: ${await res.text()}`);
+  }
+
+  return { select, upsert, remove };
 }
 
 /* ------------------------------------------------------------------ *
@@ -332,8 +338,14 @@ export async function refreshMarketPrices(skus, {
  */
 export async function storeProPrices({ db, sku, sizes }) {
   const at = new Date().toISOString();
+  /*
+    Only sizes with a Buy Now. Without one the table still shows a Total,
+    but that is the total on a bid - nothing anyone is selling - so a size
+    like that would be priced on a pair we cannot buy (seen 16-11-2026:
+    A01FW702-BLK sizes 49-51 at 74 euros, all without an ask).
+  */
   const rows = Object.entries(sizes || {})
-    .filter(([, v]) => Number(v?.total) > 0)
+    .filter(([, v]) => Number(v?.total) > 0 && Number(v?.buyNow) > 0)
     .map(([size, v]) => ({
       sku: clean(sku), size: sizeKey(size), source: "stockx_pro", cost: Number(v.total),
       depth: Number.isFinite(Number(v.asks)) ? Number(v.asks) : null,
@@ -342,6 +354,11 @@ export async function storeProPrices({ db, sku, sizes }) {
 
   const unique = [...new Map(rows.sort((x, y) => y.cost - x.cost).map((r) => [r.size, r])).values()];
 
+  /*
+    The read replaces the last one for this style: a size whose last ask
+    sold since then must not keep its old Pro price for another day and a half.
+  */
+  if (db.remove) await db.remove("market_prices", `sku=eq.${encodeURIComponent(clean(sku))}&source=eq.stockx_pro`);
   if (unique.length) await db.upsert("market_prices", unique, "sku,size,source");
   await db.upsert("market_products", [{ sku: clean(sku), pro_checked_at: at }], "sku");
 
