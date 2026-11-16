@@ -229,9 +229,22 @@ async function runOnce() {
     if (!read) return;
   }
 
+  /*
+    The Pro page itself did not come up: almost always a logged-out browser
+    that StockX shows as a landing page rather than a login form. Nothing is
+    marked as read - otherwise a logged-out browser would walk the whole
+    queue and leave every product "done" with no prices. Pause and alert.
+  */
+  if (read?.error === "page did not load") {
+    await chrome.storage.local.set({ pausedUntil: Date.now() + LOGGED_OUT_WAIT_MS });
+    await status("StockX Pro did not open - logged out? Log in, then press Start");
+    await alert(s, "StockX Pro did not open on the VPS (logged out?). Log in once in the autopricing Chrome profile and press Start in the extension.");
+    return;
+  }
+
   if (read?.error) {
     await status(`${next.sku}: ${read.error}`);
-    // Still marked as read, so one broken page does not block the queue.
+    // The page was there but had no table: marked as read so it does not block the queue.
     await api(s, "/autoprice/stockx-pro", { sku: next.sku, sizes: {} });
     return;
   }
