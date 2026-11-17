@@ -49,7 +49,14 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
   for (let i = 0; i < skus.length; i += 100) {
     const list = "(" + skus.slice(i, i + 100).map((s) => `"${s}"`).join(",") + ")";
 
-    for (const r of await db.select("market_prices", "select=sku,size,source,cost,observed_at&sku=in." + list)) {
+    /*
+      Ordered on purpose. select() pages through with Range headers, and
+      without an order Postgres may hand back the pages in a different
+      order each time - rows skipped on one page and repeated on the next.
+      A batch of 100 style codes is ~8000 price rows, so it pages, and the
+      skipped ones turned whole products "no fresh cost" (U9060PB, 17-11).
+    */
+    for (const r of await db.select("market_prices", "select=sku,size,source,cost,observed_at&order=sku,size,source&sku=in." + list)) {
       const key = r.sku + "|" + r.size;
       if (!observations.has(key)) observations.set(key, {});
       observations.get(key)[r.source] = { cost: Number(r.cost), observedAt: r.observed_at };
@@ -57,7 +64,7 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
 
     for (const r of await db.select(
       "autoprice_listings",
-      "select=sku,size,status,price,priced_at&merchant_record_id=eq." + encodeURIComponent(merchantId) + "&sku=in." + list
+      "select=sku,size,status,price,priced_at&order=sku,size&merchant_record_id=eq." + encodeURIComponent(merchantId) + "&sku=in." + list
     )) {
       previous.set(r.sku + "|" + r.size, { status: r.status, price: Number(r.price) || null, pricedAt: r.priced_at });
     }
