@@ -24,6 +24,8 @@
  * own stock as ours and then set it to zero.
  */
 
+import { isStandardVariant } from "./delivery.js";
+
 /*
  * What is on our location.
  *
@@ -175,6 +177,9 @@ export async function readOurLocationStock(graphql, locationId, flag = null) {
 
       if (!variant) continue;
 
+      // Never ours to stock: Standard is sourced after the sale (delivery.js).
+      if (isStandardVariant(variant)) continue;
+
       rows.push({
         sku: node.item?.sku || variant.sku || "",
         size: sizeOf(variant),
@@ -231,6 +236,7 @@ export async function readStoreCatalogue(graphql) {
     for (const product of products?.nodes || []) {
       for (const variant of product.variants?.nodes || []) {
         if (!String(variant.sku || "").trim()) continue;
+        if (isStandardVariant(variant)) continue;
 
         rows.push({
           sku: variant.sku,

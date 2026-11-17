@@ -28,6 +28,7 @@ import { photoSources, photosForSkus, photosFor } from "./storePhotos.js";
 import { createShopifyWriter, applyPlan, productImageUrl } from "./shopifyWriter.js";
 import { wantsNormalizedPhotos, normalizedPhotoUrls, isNormalizedPhoto } from "./photoNormalize.js";
 import { readStoreState, readOurLocationStock, readFlagSetting } from "./storeState.js";
+import { expressOptionOn } from "./delivery.js";
 
 /*
  * Our consignment stock, whole - but only what ships fast.
@@ -825,7 +826,7 @@ export async function runConsignmentForMerchant({
     };
   }
 
-  const writer = createShopifyWriter({ graphql, locationId, apply: true });
+  const writer = createShopifyWriter({ graphql, locationId, apply: true, expressOption: expressOptionOn(fields) });
 
   /*
     A store that wants one look for every photograph gets them normalised

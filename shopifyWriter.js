@@ -9,6 +9,7 @@
  * The GraphQL client is handed in rather than built here, so this uses the
  * same connection, retries and error logging as the rest of the service.
  */
+import { isStandardVariant, hasDeliveryOption, EXPRESS, DELIVERY_OPTION } from "./delivery.js";
 
 const ONLINE_STORE = "Online Store";
 
@@ -276,6 +277,7 @@ export async function readCurrentListings(graphql, skus) {
     for (const product of data?.products?.nodes || []) {
       for (const variant of product.variants?.nodes || []) {
         if (String(variant.sku || "").trim().toUpperCase() !== sku) continue;
+        if (isStandardVariant(variant)) continue;
 
         rows.push({
           sku,
@@ -295,7 +297,14 @@ export async function readCurrentListings(graphql, skus) {
   return rows;
 }
 
-export function createShopifyWriter({ graphql, locationId, apply = false }) {
+export function createShopifyWriter({ graphql, locationId, apply = false, expressOption = false }) {
+  /*
+    Stores with "Express Option?" get every size twice (delivery.js). What
+    this writer creates for them is always the Express side; Standard is
+    standardWriter.js's.
+  */
+  const expressValue = (optionName = DELIVERY_OPTION) => ({ optionName, name: EXPRESS });
+
   const done = [];
   const wouldDo = [];
   const problems = [];
@@ -427,7 +436,10 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
           title: entry.title,
           vendor: entry.brand || undefined,
           status: entry.draft ? "DRAFT" : "ACTIVE",
-          productOptions: [{ name: "Maat", values: entry.sizes.map((size) => ({ name: String(size) })) }]
+          productOptions: [
+            { name: "Maat", values: entry.sizes.map((size) => ({ name: String(size) })) },
+            ...(expressOption ? [{ name: DELIVERY_OPTION, values: [{ name: EXPRESS }, { name: "Standard" }] }] : [])
+          ]
         },
         media: images.length
           ? images.map((src) => ({ originalSource: src, mediaContentType: "IMAGE", alt: entry.title }))
@@ -451,7 +463,10 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
       const held = filled.get(String(size));
 
       return {
-        optionValues: [{ optionName: "Maat", name: String(size) }],
+        optionValues: [
+          { optionName: "Maat", name: String(size) },
+          ...(expressOption ? [expressValue()] : [])
+        ],
         /*
           A size we cannot fill still needs a price, and it was taking the
           first filled one, which is whichever consignor happened to be first
@@ -578,13 +593,24 @@ export function createShopifyWriter({ graphql, locationId, apply = false }) {
     */
     const theirs = await theirShelf();
 
+    /*
+      A page with a delivery option wants a value for it on every variant,
+      and anything our stock goes on is the Express one.
+    */
+    const deliveryOption = hasDeliveryOption(page?.product)
+      ? page.product.options.find((o) => /^(levering|delivery)$/i.test(String(o.name || "").trim()))
+      : null;
+
     await run(
       `maten bijzetten ${entry.sku} (${entry.sizes.length})`,
       CREATE_VARIANTS,
       {
         productId: entry.productId,
         variants: entry.sizes.map((size) => ({
-          optionValues: [{ optionName: option.name, name: String(size) }],
+          optionValues: [
+            { optionName: option.name, name: String(size) },
+            ...(deliveryOption ? [expressValue(deliveryOption.name)] : [])
+          ],
           inventoryItem: { sku: entry.sku, tracked: true },
           inventoryPolicy: "DENY",
           ...(theirs ? { inventoryQuantities: [{ locationId: theirs, availableQuantity: 0 }] } : {})

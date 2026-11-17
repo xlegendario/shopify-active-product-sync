@@ -3,15 +3,18 @@
  *
  * Reads the store's shelf (catalogue choices "add"), refreshes the market
  * prices that are due, decides every size with autoprice.js and writes the
- * outcome to autoprice_listings. Nothing goes to Shopify from here: that is
- * a later step, switched on per store once the numbers have been checked.
+ * outcome to autoprice_listings. A store with "Express Option?" on also gets
+ * the open prices written to Shopify as "<size> / Standard" variants
+ * (standardWriter.js); for any other store nothing goes to Shopify.
  */
 import { priceSize } from "./autoprice.js";
 import { refreshMarketPrices, readDewuFee, supabase } from "./marketPrices.js";
+import { expressOptionOn } from "./delivery.js";
+import { writeStandardVariants } from "./standardWriter.js";
 
 const clean = (sku) => String(sku || "").trim().toUpperCase().replace(/\s+/g, "-");
 
-export async function autopriceMerchant({ merchant, env = process.env, refresh = true, onlySkus = null, log = console }) {
+export async function autopriceMerchant({ merchant, env = process.env, refresh = true, onlySkus = null, graphql = null, apply = true, log = console }) {
   const merchantId = merchant["Record ID"];
   const db = supabase({ supabaseUrl: env.SUPABASE_URL, supabaseKey: env.SUPABASE_SERVICE_ROLE_KEY });
 
@@ -79,7 +82,21 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
 
   await db.upsert("autoprice_listings", rows, "merchant_record_id,sku,size");
 
-  const summary = { merchant: merchant["Client ID"], skus: skus.length, sizes: rows.length, ...tally, market };
+  let shopify = null;
+
+  if (graphql && expressOptionOn(merchant)) {
+    const listingsBySku = new Map();
+
+    for (const r of rows) {
+      if (r.status !== "open" || !(r.price > 0)) continue;
+      if (!listingsBySku.has(r.sku)) listingsBySku.set(r.sku, []);
+      listingsBySku.get(r.sku).push({ size: r.size, price: r.price });
+    }
+
+    shopify = await writeStandardVariants({ graphql, skus, listingsBySku, apply, log });
+  }
+
+  const summary = { merchant: merchant["Client ID"], skus: skus.length, sizes: rows.length, ...tally, market, shopify };
   log.log("AUTOPRICE " + JSON.stringify(summary));
 
   return summary;

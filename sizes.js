@@ -54,6 +54,9 @@ const DECORATION = /[\p{Extended_Pictographic}\uFE0F\u200D]/gu;
 function tidy(value) {
   return String(value == null ? "" : value)
     .replace(DECORATION, "")
+    // "42 / Express": the delivery option travels in a variant title on
+    // stores that offer both (see delivery.js). The size is the part before.
+    .replace(/\s*\/\s*(standard|express)\s*$/i, "")
     .replace(/,/g, ".")
     .replace(/\s+/g, " ")
     .trim();

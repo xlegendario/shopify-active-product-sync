@@ -624,6 +624,14 @@ async function fetchStockSyncMerchants() {
     const locationId = String(fields[AIRTABLE_SHOPIFY_LOCATION_ID_FIELD] || "").trim();
     const storeName = String(fields["Store Name"] || "").trim();
 
+    /*
+      Not for stores with Express and Standard per size (delivery.js): this
+      push matches on sku+size and would put our stock on both variants.
+      Their stock goes through the consignment run, which knows the
+      difference.
+    */
+    if (fields["Express Option?"]) continue;
+
     if (!shopifyDomain || !shopifyToken || !locationId || !storeName) {
       console.warn("Skipping stock sync merchant missing required fields", {
         recordId: record.id,
@@ -3933,7 +3941,7 @@ async function autopriceAlert(message) {
   }).catch(() => null);
 }
 
-async function autopriceAll({ onlyClientId = "" } = {}) {
+async function autopriceAll({ onlyClientId = "", skus = "", apply = true } = {}) {
   /*
     The switch is Price Sync? in Merchants: a store where we set the prices
     also gets prices for the sizes it does not hold. A client id from the
@@ -3948,7 +3956,19 @@ async function autopriceAll({ onlyClientId = "" } = {}) {
   const results = [];
 
   for (const m of merchants) {
-    results.push(await autopriceMerchant({ merchant: { ...m.fields, "Record ID": m.recordId } }));
+    /*
+      skus narrows a run to a few style codes (comma separated), for trying
+      the Standard writer on a handful of pages first. apply=false then shows
+      what it would write.
+    */
+    const onlySkus = String(skus || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+    results.push(await autopriceMerchant({
+      merchant: { ...m.fields, "Record ID": m.recordId },
+      onlySkus: onlySkus.length ? onlySkus : null,
+      graphql: (query, variables) => shopifyGraphQL(m, query, variables).then((body) => body.data),
+      apply
+    }));
   }
 
   /*
@@ -4096,8 +4116,9 @@ const JOBS = {
       autoprice_listings: Shopify comes once the numbers have been checked.
     */
     schedule: process.env.CRON_AUTOPRICE || "20 */6 * * *",
-    what: "autopricing for the stores with Price Sync? on (test mode: autoprice_listings only)",
-    run: ({ client } = {}) => autopriceAll({ onlyClientId: client || "" })
+    what: "autopricing for the stores with Price Sync? on; Standard variants on Shopify where Express Option? is on",
+    run: ({ client, skus, apply } = {}) =>
+      autopriceAll({ onlyClientId: client || "", skus: skus || "", apply: String(apply ?? "true") !== "false" })
   },
 
   descriptions: {
@@ -4191,8 +4212,13 @@ app.post("/jobs/:job", async (req, res) => {
   }
 
   const client = String(req.query.client || "").trim();
+  const options = client ? { client } : {};
 
-  res.json(await runJob(req.params.job, "manual", client ? { client } : {}));
+  // Only the autoprice job reads these: a few style codes, and a dry run.
+  if (req.query.skus) options.skus = String(req.query.skus);
+  if (req.query.apply) options.apply = String(req.query.apply);
+
+  res.json(await runJob(req.params.job, "manual", options));
 });
 
 app.get("/jobs", (_req, res) => {
