@@ -222,6 +222,16 @@ export async function isPackshot(input) {
   const near = (i) =>
     Math.max(Math.abs(data[i * 4] - bg[0]), Math.abs(data[i * 4 + 1] - bg[1]), Math.abs(data[i * 4 + 2] - bg[2])) <= TOLERANCE;
 
+  /*
+    A dark backdrop is no packshot we can cut. The background is removed by
+    colour, and on a dark grey studio wall a black upper is the same colour:
+    a black XLG and the Black Cat came out as a sole and a few speckles
+    (17-11-2026). Left out, like a street shot.
+  */
+  const luminance = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2];
+
+  if (luminance < 150) return false;
+
   return [top, bottom, left, right].every((edge) => edge.filter(near).length / edge.length >= 0.95);
 }
 
