@@ -27,12 +27,22 @@ test("the delivery choice in a variant title is not part of the size", () => {
   assert.equal(normalizeSize("38 2/3"), "38 2/3");
 });
 
-test("a page without the option gets it, and every wanted size a Standard variant", () => {
-  const plan = planStandard({ product: page([v("a", "42", null, 200), v("b", "43", null, 210)], false), wanted: [{ size: "42", price: 180 }, { size: "44", price: 190 }] });
+test("a page without the option gets it, and every wanted size on its ladder a Standard variant", () => {
+  const plan = planStandard({ product: page([v("a", "42", null, 200), v("b", "43", null, 210)], false), wanted: [{ size: "42", price: 180 }, { size: "43", price: 190 }] });
 
   assert.equal(plan.needsDeliveryOption, true);
-  assert.deepEqual(plan.create.map((c) => [c.size, c.price]), [["42", "180.00"], ["44", "190.00"]]);
-  assert.deepEqual(plan.newSizeValues, ["44"]);
+  assert.deepEqual(plan.create.map((c) => [c.size, c.price]), [["42", "180.00"], ["43", "190.00"]]);
+  assert.deepEqual(plan.newSizeValues, []);
+});
+
+test("a size the page's ladder does not have is never added, and removed if it was", () => {
+  const plan = planStandard({
+    product: page([v("e", "36 2/3", "Express", 200), v("s", "36.5", "Standard", 180)]),
+    wanted: [{ size: "36.5", price: 180 }, { size: "36 2/3", price: 190 }]
+  });
+
+  assert.deepEqual(plan.create.map((c) => c.size), ["36 2/3"]);
+  assert.deepEqual(plan.remove.map((r) => r.id), ["s"]);
 });
 
 test("Express variants are never touched; Standard follows the autoprice", () => {
@@ -48,7 +58,7 @@ test("Express variants are never touched; Standard follows the autoprice", () =>
 });
 
 test("an unchanged price is left alone", () => {
-  const plan = planStandard({ product: page([v("s42", "42", "Standard", 240)]), wanted: [{ size: "42", price: 240 }] });
+  const plan = planStandard({ product: page([v("e42", "42", "Express", 300), v("s42", "42", "Standard", 240)]), wanted: [{ size: "42", price: 240 }] });
 
   assert.deepEqual([plan.create.length, plan.update.length, plan.remove.length], [0, 0, 0]);
 });

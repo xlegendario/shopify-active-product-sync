@@ -93,6 +93,17 @@ const sizeOf = (variant) => {
   return normalizeSize((named || options[0])?.value || "");
 };
 
+// A size option whose values are not in ladder order, e.g. after Standard sizes were appended.
+function sizesOutOfOrder(product) {
+  const option = (product?.options || []).find((o) => SIZE_OPTION_NAMES.test(String(o.name || "").trim()));
+
+  if (!option) return false;
+
+  const names = option.optionValues.map((v) => v.name);
+
+  return sortEuSizes(names).some((name, i) => name !== names[i]);
+}
+
 /*
  * What has to change on one page.
  *
@@ -106,7 +117,21 @@ export function planStandard({ product, wanted }) {
 
   const variants = product.variants?.nodes || [];
   const standard = new Map(variants.filter(isStandardVariant).map((v) => [sizeOf(v), v]));
-  const want = new Map((wanted || []).filter((w) => Number(w.price) > 0).map((w) => [normalizeSize(w.size), w]));
+
+  /*
+    Only sizes on the page's own ladder - the sizes its Express variants
+    were made with. A market can label the same shoe differently: StockX
+    Pro gives adidas pairs as 36.5 / 37 / 38.5 where adidas and the page say
+    36 2/3 / 37 1/3 / 38. Adding those as new sizes would sell a size that
+    does not exist next to the one that does.
+  */
+  const ladder = new Set(variants.filter((v) => !isStandardVariant(v)).map(sizeOf));
+  const want = new Map(
+    (wanted || [])
+      .filter((w) => Number(w.price) > 0)
+      .map((w) => [normalizeSize(w.size), w])
+      .filter(([size]) => ladder.has(size))
+  );
 
   const create = [];
   const update = [];
@@ -183,7 +208,7 @@ export async function writeStandardVariants({ graphql, skus, listingsBySku, appl
 
       let plan = planStandard({ product: page, wanted: listingsBySku.get(sku) || [] });
 
-      if (!plan.create.length && !plan.update.length && !plan.remove.length) continue;
+      if (!plan.create.length && !plan.update.length && !plan.remove.length && !sizesOutOfOrder(page)) continue;
 
       /*
         The migration. Existing variants all take the first value, Express,
@@ -243,18 +268,27 @@ export async function writeStandardVariants({ graphql, skus, listingsBySku, appl
         A size the page did not have lands at the end of the size option.
         Put the ladder back in order, as the consignment writer does.
       */
-      if (apply && plan.newSizeValues.length) {
+      if (apply && (plan.newSizeValues.length || sizesOutOfOrder(page))) {
         const after = await findPage(graphql, sku);
-        const option = (after?.options || []).find((o) => o.name === plan.sizeOptionName);
 
-        if (option) {
-          const byName = new Map(option.optionValues.map((v) => [v.name, v.id]));
-          const ordered = sortEuSizes(option.optionValues.map((v) => v.name)).map((name) => ({ id: byName.get(name) }));
+        /*
+          Shopify wants every option of the page in a reorder, not only the
+          one that moves: sizes sorted, Express before Standard.
+        */
+        const options = (after?.options || []).map((o) => {
+          const byName = new Map(o.optionValues.map((v) => [v.name, v.id]));
+          const names = o.name === plan.sizeOptionName
+            ? sortEuSizes(o.optionValues.map((v) => v.name))
+            : DELIVERY_NAMES.test(o.name)
+              ? [EXPRESS, STANDARD].filter((n) => byName.has(n))
+              : o.optionValues.map((v) => v.name);
 
-          await run(`maten ordenen ${sku}`, REORDER, {
-            productId: page.id,
-            options: [{ id: option.id, values: ordered }]
-          }, "productOptionsReorder").catch((error) => problems.push({ sku, failure: error.message }));
+          return { id: o.id, values: names.map((name) => ({ id: byName.get(name) })) };
+        });
+
+        if (options.length) {
+          await run(`maten ordenen ${sku}`, REORDER, { productId: page.id, options }, "productOptionsReorder")
+            .catch((error) => problems.push({ sku, failure: error.message }));
         }
       }
     } catch (error) {
