@@ -202,9 +202,34 @@ export function dewuSize(label) {
   return size ? sizeKey(size[1]) : "";
 }
 
+/*
+ * Dewu's half sizes onto an adidas ladder of thirds.
+ *
+ * Dewu writes adidas as 36, 36.5, 37, 38, 38.5, 39 ... where adidas and
+ * StockX write 36, 36 2/3, 37 1/3, 38, 38 2/3, 39 1/3 - the same US sizes
+ * (4, 4.5, 5, 5.5, 6, 6.5). Left as they were, Dewu's prices landed on
+ * sizes the page does not have and never on the ones it does.
+ *
+ * Only for a ladder that has thirds; anything else is returned unchanged.
+ */
+export function dewuOnLadder(size, ladder) {
+  const sizes = new Set((ladder || []).map(String));
+
+  if (![...sizes].some((s) => /\d\/3$/.test(s)) || sizes.has(size)) return size;
+
+  const half = String(size).match(/^(\d{2})\.5$/);
+  if (half && sizes.has(`${half[1]} 2/3`)) return `${half[1]} 2/3`;
+
+  const whole = String(size).match(/^(\d{2})$/);
+  if (whole && sizes.has(`${whole[1]} 1/3`)) return `${whole[1]} 1/3`;
+
+  return "";
+}
+
 async function readDewu(product, fee) {
   const body = await dewuJson(`${DEWU}/productPrice?dw_spu_id=${product.dewu_spu_id}`);
   const variants = body?.data?.data || body?.data || [];
+  const ladder = (product.stockx_sizes || []).map((s) => s.eu).filter(Boolean);
   const out = [];
 
   for (const v of Array.isArray(variants) ? variants : []) {
@@ -212,7 +237,7 @@ async function readDewu(product, fee) {
     const storage = Number(v.storage_price) || 0;
     const rmb = normal > 0 ? normal : storage;
     const cost = dewuCost(rmb, fee);
-    const size = dewuSize(v.size);
+    const size = dewuOnLadder(dewuSize(v.size), ladder);
 
     // The ceiling is applied when pricing, not here: the raw cost stays visible.
     if (size && cost) out.push({ size, cost, raw: { rmb, kind: normal > 0 ? "normal" : "storage" } });
