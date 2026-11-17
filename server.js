@@ -7,6 +7,7 @@ import { runConsignmentForAll, backfillPhotosForAll } from "./consignmentRun.js"
 import { normalizeSize } from "./sizes.js";
 import { autopriceMerchant } from "./autopriceRun.js";
 import { storeProPrices, supabase as marketDb } from "./marketPrices.js";
+import { describeStore, createDescriptionWriter } from "./productDescriptions.js";
 
 const app = express();
 
@@ -4022,6 +4023,52 @@ app.post("/autoprice/alert", async (req, res) => {
   res.json({ ok: true });
 });
 
+/*
+ * Descriptions and SEO text for the active products that have none.
+ *
+ * Only for the stores named in DESCRIPTION_CLIENTS (Client IDs from
+ * Merchants), and dry unless DESCRIPTION_APPLY is true. A store's own text is
+ * never replaced: only an empty description, and only empty SEO fields.
+ */
+const DESCRIPTION_APPLY = String(process.env.DESCRIPTION_APPLY || "").toLowerCase() === "true";
+
+async function describeAll({ onlyClientId = "", apply = DESCRIPTION_APPLY } = {}) {
+  const wanted = String(process.env.DESCRIPTION_CLIENTS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  const merchants = (await fetchActiveMerchants()).filter(
+    (m) => wanted.includes(m.fields["Client ID"]) && (!onlyClientId || m.fields["Client ID"] === onlyClientId)
+  );
+
+  if (!merchants.length) return { skipped: "no active store in DESCRIPTION_CLIENTS" };
+
+  const writer = process.env.ANTHROPIC_API_KEY ? createDescriptionWriter() : null;
+  const reports = [];
+
+  for (const merchant of merchants) {
+    const report = await describeStore({
+      graphql: async (query, variables) => (await shopifyGraphQL(merchant, query, variables)).data,
+      storeName: merchant.name,
+      apply,
+      writer
+    });
+
+    console.log(
+      `DESCRIPTIONS ${merchant.name}: ${report.blank} blank, ${report.fromLibrary.length} from library, ` +
+        `${report.written.length} written, ${report.skipped.length} skipped, ${report.failed.length} failed` +
+        (report.cost ? `, ~$${report.cost.usd}` : "") +
+        (apply ? "" : " (dry)")
+    );
+    for (const f of report.failed) console.warn("DESCRIPTION FAILED", merchant.name, f.handle, f.reason);
+
+    reports.push(report);
+  }
+
+  return reports;
+}
+
 const JOBS = {
   consignment: {
     schedule: process.env.CRON_CONSIGNMENT || "*/30 * * * *",
@@ -4051,6 +4098,17 @@ const JOBS = {
     schedule: process.env.CRON_AUTOPRICE || "20 */6 * * *",
     what: "autopricing for the stores with Price Sync? on (test mode: autoprice_listings only)",
     run: ({ client } = {}) => autopriceAll({ onlyClientId: client || "" })
+  },
+
+  descriptions: {
+    /*
+      Every two hours: a page made by the catalogue push or by hand in
+      Shopify gets its text the same morning, and a run with nothing blank
+      is one cheap read per store.
+    */
+    schedule: process.env.CRON_DESCRIPTIONS || "40 */2 * * *",
+    what: "descriptions and SEO text for active products that have none (DESCRIPTION_CLIENTS)",
+    run: ({ client } = {}) => describeAll({ onlyClientId: client || "" })
   },
 
   products: {

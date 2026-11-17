@@ -94,6 +94,22 @@ services:
       - key: AUTOPRICE_GOAT
         value: 'false'
 
+      # Productomschrijvingen + SEO voor actieve producten zonder tekst.
+      # Alleen voor deze winkels (Client ID's uit Merchants), en alleen lege
+      # velden: eigen tekst van een winkel wordt nooit overschreven.
+      - key: DESCRIPTION_CLIENTS
+        value: CL-00031
+      - key: CRON_DESCRIPTIONS
+        value: '40 */2 * * *'
+      # Schrijven aan/uit. Uit = droog: bepaalt en schrijft de teksten, maar
+      # verandert niets in Shopify of storefront_library. In het dashboard.
+      - key: DESCRIPTION_APPLY
+        sync: false
+      # Claude API-key voor het schrijven. Zonder key worden alleen teksten
+      # uit storefront_library gebruikt.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
       # Secrets: in het Render dashboard invullen, niet hier.
       #
       # WEBHOOK_SECRET is een willekeurige waarde die jij verzint. Hij komt
