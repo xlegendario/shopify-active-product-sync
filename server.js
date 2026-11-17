@@ -8,6 +8,7 @@ import { normalizeSize } from "./sizes.js";
 import { autopriceMerchant } from "./autopriceRun.js";
 import { storeProPrices, supabase as marketDb } from "./marketPrices.js";
 import { describeStore, createDescriptionWriter } from "./productDescriptions.js";
+import { photoSources } from "./storePhotos.js";
 
 const app = express();
 
@@ -3948,7 +3949,8 @@ async function autopriceAll({ onlyClientId = "", skus = "", apply = true } = {})
     jobs endpoint narrows it to that one store, but never adds a store that
     has Price Sync off.
   */
-  const merchants = (await fetchActiveMerchants()).filter((m) =>
+  const active = await fetchActiveMerchants();
+  const merchants = active.filter((m) =>
     Boolean(m.fields["Price Sync?"]) && (!onlyClientId || m.fields["Client ID"] === onlyClientId)
   );
 
@@ -3967,7 +3969,9 @@ async function autopriceAll({ onlyClientId = "", skus = "", apply = true } = {})
       merchant: { ...m.fields, "Record ID": m.recordId },
       onlySkus: onlySkus.length ? onlySkus : null,
       graphql: (query, variables) => shopifyGraphQL(m, query, variables).then((body) => body.data),
-      apply
+      apply,
+      // For pages built for pairs nobody holds yet (standardPages.js).
+      photoSources: photoSources(active.map((x) => ({ name: x.name, storeUrl: x.shopifyDomain, token: x.shopifyToken })))
     }));
   }
 

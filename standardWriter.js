@@ -93,15 +93,23 @@ const sizeOf = (variant) => {
   return normalizeSize((named || options[0])?.value || "");
 };
 
-// A size option whose values are not in ladder order, e.g. after Standard sizes were appended.
+/*
+ * A page whose options are not in the order shoppers should see them: sizes
+ * by the ladder (Standard sizes are appended at the end), and Standard
+ * before Express - the cheaper choice on the left, as the store asked.
+ */
 function sizesOutOfOrder(product) {
-  const option = (product?.options || []).find((o) => SIZE_OPTION_NAMES.test(String(o.name || "").trim()));
+  const options = product?.options || [];
+  const sizes = options.find((o) => SIZE_OPTION_NAMES.test(String(o.name || "").trim()));
+  const delivery = options.find((o) => DELIVERY_NAMES.test(String(o.name || "").trim()));
 
-  if (!option) return false;
+  const names = (sizes?.optionValues || []).map((v) => v.name);
+  const sizesWrong = sortEuSizes(names).some((name, i) => name !== names[i]);
 
-  const names = option.optionValues.map((v) => v.name);
+  const values = (delivery?.optionValues || []).map((v) => v.name);
+  const deliveryWrong = values.includes(STANDARD) && values.includes(EXPRESS) && values.indexOf(STANDARD) > values.indexOf(EXPRESS);
 
-  return sortEuSizes(names).some((name, i) => name !== names[i]);
+  return sizesWrong || deliveryWrong;
 }
 
 /*
@@ -170,7 +178,28 @@ function errorsOf(payload, key) {
   return errors.length ? errors.map((e) => `${(e.field || []).join(".")}: ${e.message}`).join("; ") : null;
 }
 
-async function findPage(graphql, sku) {
+const PAGE_FIELDS = `
+  id
+  title
+  options { id name position optionValues { id name } }
+  variants(first: 250) {
+    nodes { id sku price inventoryPolicy selectedOptions { name value } }
+  }
+`;
+
+const PAGE_BY_ID = `query standardPageById($id: ID!) { product(id: $id) { ${PAGE_FIELDS} } }`;
+
+/*
+ * The page for a style code. A page made a moment ago is not in Shopify's
+ * search yet, so a known product id is asked for directly.
+ */
+async function findPage(graphql, sku, productId = null) {
+  if (productId) {
+    const byId = await graphql(PAGE_BY_ID, { id: productId }).catch(() => null);
+
+    if (byId?.product) return byId.product;
+  }
+
   const data = await graphql(PAGE, { q: `sku:${sku}` });
 
   return (data?.products?.nodes || []).find((p) =>
@@ -183,9 +212,10 @@ async function findPage(graphql, sku) {
  *
  * listingsBySku: Map(sku -> [{ size, price }]) of the OPEN autoprice rows.
  */
-export async function writeStandardVariants({ graphql, skus, listingsBySku, apply = false, log = console }) {
+export async function writeStandardVariants({ graphql, skus, listingsBySku, apply = false, pageIds = new Map(), log = console }) {
   const tally = { pages: 0, missingPage: 0, optionAdded: 0, created: 0, updated: 0, removed: 0, failed: 0 };
   const problems = [];
+  const missing = [];
 
   const run = async (label, query, variables, key) => {
     if (!apply) return { dry: true };
@@ -200,9 +230,9 @@ export async function writeStandardVariants({ graphql, skus, listingsBySku, appl
 
   for (const sku of skus) {
     try {
-      let page = await findPage(graphql, sku);
+      let page = await findPage(graphql, sku, pageIds.get(sku));
 
-      if (!page) { tally.missingPage += 1; continue; }
+      if (!page) { tally.missingPage += 1; missing.push(sku); continue; }
 
       tally.pages += 1;
 
@@ -223,7 +253,7 @@ export async function writeStandardVariants({ graphql, skus, listingsBySku, appl
         tally.optionAdded += 1;
 
         if (apply) {
-          page = await findPage(graphql, sku);
+          page = await findPage(graphql, sku, page.id);
           plan = planStandard({ product: page, wanted: listingsBySku.get(sku) || [] });
         }
       }
@@ -269,18 +299,18 @@ export async function writeStandardVariants({ graphql, skus, listingsBySku, appl
         Put the ladder back in order, as the consignment writer does.
       */
       if (apply && (plan.newSizeValues.length || sizesOutOfOrder(page))) {
-        const after = await findPage(graphql, sku);
+        const after = await findPage(graphql, sku, page.id);
 
         /*
           Shopify wants every option of the page in a reorder, not only the
-          one that moves: sizes sorted, Express before Standard.
+          one that moves: sizes sorted, Standard before Express.
         */
         const options = (after?.options || []).map((o) => {
           const byName = new Map(o.optionValues.map((v) => [v.name, v.id]));
           const names = o.name === plan.sizeOptionName
             ? sortEuSizes(o.optionValues.map((v) => v.name))
             : DELIVERY_NAMES.test(o.name)
-              ? [EXPRESS, STANDARD].filter((n) => byName.has(n))
+              ? [STANDARD, EXPRESS].filter((n) => byName.has(n))
               : o.optionValues.map((v) => v.name);
 
           return { id: o.id, values: names.map((name) => ({ id: byName.get(name) })) };
@@ -299,7 +329,7 @@ export async function writeStandardVariants({ graphql, skus, listingsBySku, appl
 
   log.log("STANDARD " + JSON.stringify({ apply, ...tally, problems: problems.slice(0, 10) }));
 
-  return { apply, ...tally, problems };
+  return { apply, ...tally, problems, missing };
 }
 
 export { deliveryOf };

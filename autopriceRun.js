@@ -11,10 +11,11 @@ import { priceSize } from "./autoprice.js";
 import { refreshMarketPrices, readDewuFee, supabase } from "./marketPrices.js";
 import { expressOptionOn } from "./delivery.js";
 import { writeStandardVariants } from "./standardWriter.js";
+import { createMissingPages } from "./standardPages.js";
 
 const clean = (sku) => String(sku || "").trim().toUpperCase().replace(/\s+/g, "-");
 
-export async function autopriceMerchant({ merchant, env = process.env, refresh = true, onlySkus = null, graphql = null, apply = true, log = console }) {
+export async function autopriceMerchant({ merchant, env = process.env, refresh = true, onlySkus = null, graphql = null, apply = true, photoSources = [], log = console }) {
   const merchantId = merchant["Record ID"];
   const db = supabase({ supabaseUrl: env.SUPABASE_URL, supabaseKey: env.SUPABASE_SERVICE_ROLE_KEY });
 
@@ -94,6 +95,37 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
     }
 
     shopify = await writeStandardVariants({ graphql, skus, listingsBySku, apply, log });
+
+    /*
+      A pair the store chose that has no page yet - nobody ever held it, so
+      the consignment run never built one. With Standard it can be sold, so
+      the page is made here and then given its Standard sizes.
+    */
+    const toBuild = (shopify.missing || []).filter((sku) => listingsBySku.has(sku));
+
+    if (toBuild.length) {
+      const drafts = new Set(
+        (await db.select(
+          "store_catalogue_choices",
+          "select=sku,photos&photos=eq.own&merchant_record_id=eq." + encodeURIComponent(merchantId)
+        ).catch(() => [])).map((c) => clean(c.sku))
+      );
+
+      const pages = await createMissingPages({
+        graphql, merchant, skus: toBuild, listingsBySku, photoSources, drafts,
+        supabaseUrl: env.SUPABASE_URL, supabaseKey: env.SUPABASE_SERVICE_ROLE_KEY, apply, log
+      });
+
+      const madeNow = [...pages.created, ...pages.drafts].filter((p) => p.productId);
+      const second = apply && madeNow.length
+        ? await writeStandardVariants({
+          graphql, skus: madeNow.map((p) => p.sku), listingsBySku, apply, log,
+          pageIds: new Map(madeNow.map((p) => [p.sku, p.productId]))
+        })
+        : null;
+
+      shopify = { ...shopify, pages: { created: pages.created.length, drafts: pages.drafts.length, skipped: pages.skipped, problems: pages.problems }, afterPages: second };
+    }
   }
 
   const summary = { merchant: merchant["Client ID"], skus: skus.length, sizes: rows.length, ...tally, market, shopify };
