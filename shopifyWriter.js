@@ -216,6 +216,17 @@ const REORDER_OPTION_VALUES = `
  */
 const SIZE_OPTION_NAMES = /^(maat|maten|size|sizes|taille|tailles|gr[oö](ss|ß)e|grootte|talla|tamanho|misura)$/i;
 
+const LETTER_SIZE = /^(XXS|XS|S|M|L|XL|XXL|XXXL|2XL|3XL|OS|ONE SIZE)$/i;
+const GARMENT = /\b(jacket|hoodie|t-shirt|tee|pants|shorts|sweatpants?|sweater|crewneck|track top|full set)\b/i;
+
+export function productTypeFor(entry) {
+  const sizes = (entry.sizes || []).map((s) => String(s).trim());
+
+  return GARMENT.test(entry.title || "") || (sizes.length && sizes.every((s) => LETTER_SIZE.test(s)))
+    ? "Clothing"
+    : "Sneakers";
+}
+
 function sizeOptionOf(product) {
   const options = product?.options || [];
 
@@ -435,6 +446,12 @@ export function createShopifyWriter({ graphql, locationId, apply = false, expres
         product: {
           title: entry.title,
           vendor: entry.brand || undefined,
+          /*
+            A store with "Express Option?" (UNION) filters on Sneakers /
+            Clothing, which reads the product type. Letter sizes or a
+            garment in the name make it Clothing; everything else is a shoe.
+          */
+          productType: expressOption ? productTypeFor(entry) : undefined,
           status: entry.draft ? "DRAFT" : "ACTIVE",
           productOptions: [
             { name: "Maat", values: entry.sizes.map((size) => ({ name: String(size) })) },
