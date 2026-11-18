@@ -931,7 +931,7 @@ export async function runConsignmentForMerchant({
     a full pass over our location, and most runs have no sale at all.
   */
   const dealsInPlay =
-    listings.some((listing) => listing.ownStock) ||
+    listings.some((listing) => listing.onSale) ||
     state.rows.some((row) => row.refPrice || (row.productTags || []).includes("bf-deal"));
 
   if (showsDeals(merchant.name) && dealsInPlay) {

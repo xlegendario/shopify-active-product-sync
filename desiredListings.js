@@ -252,7 +252,15 @@ export function cheapestPerPair(inventoryRows, { excludeSellerRecordId } = {}) {
           the discount it is selling at.
         */
         ownStock: row.own_stock === true,
-        referencePrice: num(row.reference_price)
+        referencePrice: num(row.reference_price),
+
+        /*
+          On sale: a reference above the ask. Our own pairs get one from
+          kcOwnStock; a partner's or anyone's row can be given one by hand
+          (reference_price = the ask before it came down), e.g. the partner
+          Crocs on 18-11-2026.
+        */
+        onSale: row.own_stock === true || num(row.reference_price) > num(row.selling_price_suggested)
       });
     }
   }
@@ -333,8 +341,8 @@ export function buildDesiredListings({
       for a consignor's pair at the normal price, and keeping it would hide
       the discount on exactly the page the ads point to.
     */
-    if (priceSync && (pair.ownStock || !ownPriced.has(`${pair.sku}|${pair.size}`))) {
-      const named = pair.ownStock ? 0 : num(customPrices.get(`${pair.sku}|${pair.size}`));
+    if (priceSync && (pair.onSale || !ownPriced.has(`${pair.sku}|${pair.size}`))) {
+      const named = pair.onSale ? 0 : num(customPrices.get(`${pair.sku}|${pair.size}`));
 
       if (named > 0) {
         /*
@@ -377,7 +385,7 @@ export function buildDesiredListings({
         invoiced: cost.gross,
         sellingPrice: selling,
         priceSetByUs: true,
-        referenceSellingPrice: pair.ownStock
+        referenceSellingPrice: pair.onSale
           ? referenceSellingPrice({ pair, merchantFields, inventoryType, selling })
           : null
       });

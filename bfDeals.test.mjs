@@ -30,7 +30,7 @@ test("a sale pair of ours beats a custom price and carries its normal store pric
 });
 
 test("deal changes: set, clear, tag, untag, activate", () => {
-  const listings = [{ sku: "A", size: "42", ownStock: true, referenceSellingPrice: 200, sellingPrice: 150 }];
+  const listings = [{ sku: "A", size: "42", ownStock: true, onSale: true, referenceSellingPrice: 200, sellingPrice: 150 }];
   const rows = [
     { sku: "A", size: "42", variantId: "v1", productId: "p1", quantity: 1, refPrice: null, productTags: [], productStatus: "DRAFT" },
     { sku: "B", size: "40", variantId: "v2", productId: "p2", quantity: 0, refPrice: "180.00", productTags: ["bf-deal"], productStatus: "ACTIVE" }
@@ -48,7 +48,7 @@ test("deal changes: set, clear, tag, untag, activate", () => {
 });
 
 test("option B: the from-price is the price before the sale, captured once, never above the Ideal's", () => {
-  const listings = [{ sku: "A", size: "42", ownStock: true, referenceSellingPrice: 313, sellingPrice: 173 }];
+  const listings = [{ sku: "A", size: "42", ownStock: true, onSale: true, referenceSellingPrice: 313, sellingPrice: 173 }];
   const row = { sku: "A", size: "42", variantId: "v1", productId: "p1", quantity: 1, productTags: [], productStatus: "ACTIVE" };
 
   // First run: the store asked 204 before; captured.
@@ -66,4 +66,16 @@ test("option B: the from-price is the price before the sale, captured once, neve
 
   // Before above the Ideal's price: capped.
   assert.deepEqual(dealChanges({ rows: [{ ...row, refPrice: null }], listings, priceBefore: new Map([["v1", 400]]) }).setRefs, [{ variantId: "v1", value: "313.00" }]);
+});
+
+test("a partner row with a reference above its ask is a deal too", async () => {
+  const { buildDesiredListings } = await import("./desiredListings.js");
+  const union = { "Offer Method": "Firm Range", "Offer Margin": 0, "Margin Method": "Percentage", "Minimum Margin %": 0.2 };
+  const { listings } = buildDesiredListings({
+    inventoryRows: [{ id: "p", sku: "205759-610", size: "42-43", vat_type: "Margin", selling_price_suggested: 68, reference_price: 80, quantity: 5, seller_id: "SE-00781", seller_record_id: "r" }],
+    merchantFields: union,
+    priceSync: true
+  });
+  assert.equal(listings[0].onSale, true);
+  assert.ok(listings[0].referenceSellingPrice > listings[0].sellingPrice);
 });

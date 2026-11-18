@@ -60,7 +60,7 @@ export function dealChanges({ rows, listings, priceBefore = new Map() }) {
   const reference = new Map();
 
   for (const listing of listings || []) {
-    if (!listing.ownStock || !(Number(listing.referenceSellingPrice) > 0)) continue;
+    if (!listing.onSale || !(Number(listing.referenceSellingPrice) > 0)) continue;
 
     reference.set(`${normalizeSku(listing.sku)}|${sizeKey(listing.size)}`, {
       cap: Number(listing.referenceSellingPrice),
