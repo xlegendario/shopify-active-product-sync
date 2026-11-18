@@ -107,9 +107,10 @@ export function readFlagSetting(merchantFields, fieldName = "Consignment Flag Me
 
 const CATALOGUE = `
   query Catalogue($cursor: String) {
-    products(first: 250, after: $cursor, query: "status:active") {
+    products(first: 250, after: $cursor, query: "status:active OR status:draft") {
       nodes {
         id
+        status
         variants(first: 250) {
           nodes {
             id
@@ -260,7 +261,15 @@ export async function readStoreCatalogue(graphql) {
           quantity: 0,
 
           otherStock: Number(variant.inventoryQuantity) || 0,
-          productStatus: "ACTIVE"
+
+          /*
+            Drafts too (18-11-2026). UNION's curation drafted pages whose
+            sizes were never connected to our location; read as active only,
+            those sizes looked missing, the plan tried to create them again
+            and Shopify refused in silence - so a pair on sale never reached
+            a drafted page. Seen, they are connected and stocked instead.
+          */
+          productStatus: product.status || "ACTIVE"
         });
       }
     }
