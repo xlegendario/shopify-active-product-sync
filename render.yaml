@@ -110,6 +110,19 @@ services:
       - key: ANTHROPIC_API_KEY
         sync: false
 
+      # Trends: elke maandag de verkoopscores van het hele netwerk naar
+      # storefront_scores, en voor deze winkels een lijst populaire schoenen
+      # en kleding die er nog niet op staan (Your Shelf > Suggested). Met
+      # "Trend Auto Add?" aan in Merchants worden ze meteen toegevoegd.
+      # Verwijdert nooit iets.
+      - key: TRENDS_CLIENTS
+        value: CL-00031
+      - key: CRON_TRENDS
+        value: '0 6 * * 1'
+      # Discord-webhook voor de wekelijkse melding (in het dashboard).
+      - key: TRENDS_DISCORD_WEBHOOK
+        sync: false
+
       # Secrets: in het Render dashboard invullen, niet hier.
       #
       # WEBHOOK_SECRET is een willekeurige waarde die jij verzint. Hij komt

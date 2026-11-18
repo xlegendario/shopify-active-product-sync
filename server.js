@@ -10,6 +10,7 @@ import { storeProPrices, supabase as marketDb } from "./marketPrices.js";
 import { describeStore, createDescriptionWriter } from "./productDescriptions.js";
 import { photoSources } from "./storePhotos.js";
 import { fillModels, sortCollections } from "./storefrontOrder.js";
+import { runTrends, supabaseRest } from "./trends.js";
 
 const app = express();
 
@@ -215,7 +216,7 @@ async function airtableRequest(path, options = {}) {
   return data;
 }
 
-async function fetchAllAirtableRecords(tableName, filterByFormula = "") {
+async function fetchAllAirtableRecords(tableName, filterByFormula = "", fields = []) {
   const table = encodeURIComponent(tableName);
   const records = [];
 
@@ -225,6 +226,9 @@ async function fetchAllAirtableRecords(tableName, filterByFormula = "") {
   if (filterByFormula) {
     params.set("filterByFormula", filterByFormula);
   }
+
+  // Only these fields, when given: the order logs are wide and long.
+  for (const field of fields) params.append("fields[]", field);
 
   let offset = null;
 
@@ -4147,6 +4151,60 @@ async function storefrontAll({ onlyClientId = "", apply = process.env.STOREFRONT
   return reports;
 }
 
+/*
+ * What sells across the network, weekly (trends.js): scores into
+ * storefront_scores, and for the stores in TRENDS_CLIENTS a list of shoes
+ * and clothing to add (Your Shelf > Suggested). A store with "Trend Auto
+ * Add?" on in Merchants gets them chosen straight away. Never removes.
+ */
+const TRENDS_AUTO_FIELD = process.env.TRENDS_AUTO_FIELD || "Trend Auto Add?";
+const TRENDS_PORTAL_URL = process.env.TRENDS_PORTAL_URL || "https://portal.lojiq.io/portal/listings";
+
+async function trendsNotify(store, suggestions, auto) {
+  const NL = String.fromCharCode(10);
+  const hook = process.env.TRENDS_DISCORD_WEBHOOK || "";
+  if (!hook || !suggestions.length) return;
+
+  const lines = suggestions.slice(0, 15).map((s) =>
+    `- ${s.name || s.sku} (${s.sku}) - score ${s.score}` + (s.fast_sizes ? " - 48h" : "") + (s.lojiq_price ? ` - from EUR ${Math.round(s.lojiq_price)}` : "")
+  );
+
+  const content = (
+    `**${store.name}: ${suggestions.length} trending ${suggestions.length === 1 ? "product" : "products"} not on the shelf yet**` +
+    (auto ? " (Trend Auto Add? is on: all added)" : "") + NL +
+    lines.join(NL) + (suggestions.length > 15 ? `${NL}...and ${suggestions.length - 15} more` : "") +
+    `${NL}Review and add: ${TRENDS_PORTAL_URL} (tab Suggested)`
+  ).slice(0, 1990);
+
+  await fetch(hook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content }) });
+}
+
+async function trendsAll({ onlyClientId = "", apply = process.env.TRENDS_APPLY !== "false" } = {}) {
+  const wanted = String(process.env.TRENDS_CLIENTS || "CL-00031").split(",").map((id) => id.trim()).filter(Boolean);
+  const merchants = (await fetchActiveMerchants()).filter(
+    (m) => wanted.includes(m.fields["Client ID"]) && (!onlyClientId || m.fields["Client ID"] === onlyClientId)
+  );
+
+  const result = await runTrends({
+    airtable: (table, formula, fields) => fetchAllAirtableRecords(table, formula, fields),
+    db: supabaseRest({ url: SUPABASE_URL, key: SUPABASE_SERVICE_ROLE_KEY }),
+    stores: merchants.map((m) => ({
+      recordId: m.recordId,
+      name: m.name,
+      autoAdd: Boolean(m.fields[TRENDS_AUTO_FIELD]),
+      graphql: async (query, variables) => (await shopifyGraphQL(m, query, variables)).data
+    })),
+    // Sales of the stores we suggest for do not count towards their own list, nor the test store.
+    skipChannels: String(process.env.TRENDS_SKIP_STORES || "UNION Amsterdam,Test Store Auto-Supply").split(",").map((s) => s.trim()).filter(Boolean),
+    apply,
+    apiVersion: SHOPIFY_API_VERSION,
+    notify: trendsNotify
+  });
+
+  console.log(`TRENDS done: ${result.rows} rows, ${result.scored} styles scored, ${result.kept} written as ${result.source}` + (apply ? "" : " (dry)"));
+  return result;
+}
+
 const JOBS = {
   consignment: {
     schedule: process.env.CRON_CONSIGNMENT || "*/30 * * * *",
@@ -4199,6 +4257,18 @@ const JOBS = {
     what: "models for new pages and collections in order by sales score (STOREFRONT_CLIENTS)",
     run: ({ client, apply } = {}) =>
       storefrontAll({ onlyClientId: client || "", apply: apply === undefined ? process.env.STOREFRONT_APPLY !== "false" : String(apply) !== "false" })
+  },
+
+  trends: {
+    /*
+      Weekly, Monday morning: 180 days of orders from every store, so a week
+      is fine-grained enough, and the list is waiting at the start of the
+      week. Before the storefront job, so the collections sort on it at night.
+    */
+    schedule: process.env.CRON_TRENDS || "0 6 * * 1",
+    what: "sales scores from every store into storefront_scores; trending products to add for TRENDS_CLIENTS (Suggested, or added with Trend Auto Add?)",
+    run: ({ client, apply } = {}) =>
+      trendsAll({ onlyClientId: client || "", apply: apply === undefined ? process.env.TRENDS_APPLY !== "false" : String(apply) !== "false" })
   },
 
   products: {
