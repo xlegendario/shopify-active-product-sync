@@ -79,3 +79,14 @@ test("a partner row with a reference above its ask is a deal too", async () => {
   assert.equal(listings[0].onSale, true);
   assert.ok(listings[0].referenceSellingPrice > listings[0].sellingPrice);
 });
+
+test("a shop's own price under its normal one is a deal in that shop", async () => {
+  const { buildDesiredListings } = await import("./desiredListings.js");
+  const union = { "Offer Method": "Firm Range", "Offer Margin": 0, "Margin Method": "Percentage", "Minimum Margin (%)": 0.3, "Base Costs": 10 };
+  const row = { id: "p", sku: "205759-610", size: "42-43", vat_type: "Margin", selling_price_suggested: 80, quantity: 5, seller_id: "SE-00781", seller_record_id: "r" };
+  const normal = buildDesiredListings({ inventoryRows: [row], merchantFields: union, priceSync: true }).listings[0].sellingPrice;
+  const { listings } = buildDesiredListings({ inventoryRows: [row], merchantFields: union, priceSync: true, customPrices: new Map([["205759-610|42-43", normal - 5]]) });
+  assert.equal(listings[0].sellingPrice, normal - 5);
+  assert.equal(listings[0].onSale, true);
+  assert.equal(listings[0].referenceSellingPrice, normal);
+});

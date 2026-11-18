@@ -356,13 +356,23 @@ export function buildDesiredListings({
           continue;
         }
 
+        /*
+          A shop's own price under its normal one is a sale in that shop
+          only (Dario, 18-11-2026: the partner Crocs cheaper on UNION, the
+          same everywhere else). Its normal price is the reference, so the
+          shop can show the discount like any other deal.
+        */
+        const normal = minimumSellingPrice({ buyingPrice: cost.net, vatType: pair.vatType, merchantFields });
+        const shopSale = normal !== null && named < normal;
+
         listings.push({
           ...pair,
           cost: cost.net,
           invoiced: cost.gross,
           sellingPrice: named,
           priceSetByUs: true,
-          priceNamedByStore: true
+          priceNamedByStore: true,
+          ...(shopSale ? { onSale: true, referenceSellingPrice: normal } : {})
         });
 
         continue;
