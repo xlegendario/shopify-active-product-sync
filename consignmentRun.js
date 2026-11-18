@@ -30,6 +30,7 @@ import { wantsNormalizedPhotos, normalizedPhotoUrls, isNormalizedPhoto } from ".
 import { readStoreState, readOurLocationStock, readFlagSetting } from "./storeState.js";
 import { expressOptionOn } from "./delivery.js";
 import { showsDeals, dealChanges, writeDealChanges } from "./bfDeals.js";
+import { nearestEnding, priceEnding } from "./storePricing.js";
 
 /*
  * Our consignment stock, whole - but only what ships fast.
@@ -366,14 +367,14 @@ export async function customPriceRowsFor(merchantRecordId, { supabaseUrl, supaba
   return rows;
 }
 
-export function customPricesOffOurStock(rows, listings) {
+export function customPricesOffOurStock(rows, listings, ending = 0) {
   const ours = new Set(listings.map((listing) => `${normalizeSku(listing.sku)}|${sizeKey(listing.size)}`));
   const changes = [];
 
   for (const row of rows) {
     const sku = normalizeSku(row.sku);
     const size = sizeKey(row.size);
-    const price = Number(row.custom_price);
+    const price = nearestEnding(Number(row.custom_price), ending);
 
     if (!sku || !size || !(price > 0) || !row.shopify_variant_id || !row.shopify_product_id) continue;
     if (ours.has(`${sku}|${size}`)) continue;
@@ -692,6 +693,11 @@ export async function runConsignmentForMerchant({
   const consignmentSync = Boolean(fields["Consignment Sync?"]);
   const priceSync = Boolean(fields["Price Sync?"]);
 
+  // A whole number typed as a custom price still lands on the store's
+  // Price Ending (UNION: 100 -> 99,95).
+  const ending = priceEnding(fields);
+  customPrices = new Map([...customPrices].map(([key, price]) => [key, nearestEnding(price, ending)]));
+
   /*
     CHANGED - Product Sync? is no longer read. Which pages we make is now
     the store's choice per product in its catalogue (`choices`), never a
@@ -777,7 +783,7 @@ export async function runConsignmentForMerchant({
     custom price is the shop setting it.
   */
   const customElsewhere = priceSync
-    ? customPricesOffOurStock(await customPriceRowsFor(merchant.recordId, { supabaseUrl, supabaseKey }), listings)
+    ? customPricesOffOurStock(await customPriceRowsFor(merchant.recordId, { supabaseUrl, supabaseKey }), listings, ending)
     : [];
 
   plan.setPrices = [...setPrices, ...customElsewhere];

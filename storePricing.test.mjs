@@ -231,3 +231,13 @@ test("a store with a Price Ending gets the least accepted price on that ending",
     }
   }
 });
+
+test("a custom price lands on the nearest price with the ending", async () => {
+  const { nearestEnding } = await import("./storePricing.js");
+
+  assert.equal(nearestEnding(100, 0.95), 99.95);
+  assert.equal(nearestEnding(130, 0.95), 129.95);
+  assert.equal(nearestEnding(129.5, 0.95), 129.95);
+  assert.equal(nearestEnding(99.95, 0.95), 99.95);
+  assert.equal(nearestEnding(100, 0), 100);
+});

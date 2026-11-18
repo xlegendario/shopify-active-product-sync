@@ -190,6 +190,22 @@ export function downToEnding(value, ending = 0) {
   return cents(at <= value + 1e-9 ? at : at - 1);
 }
 
+/*
+ * A price the store typed itself, put on its ending: the nearest price that
+ * ends in it, so 100 becomes 99,95 and 129,50 becomes 129,95 (Dario,
+ * 18-11-2026: a whole number in Custom Price still shows as ,95).
+ */
+export function nearestEnding(value, ending = 0) {
+  const price = Number(value);
+
+  if (!ending || !(price > 0)) return price;
+
+  const down = downToEnding(price, ending);
+  const up = upToEnding(price, ending);
+
+  return price - down <= up - price ? down : up;
+}
+
 function toStepUp(value) {
   return Math.ceil(value / STEP) * STEP;
 }
