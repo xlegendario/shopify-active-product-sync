@@ -201,23 +201,42 @@ export function scoreOf({ channels, wtb = 0 }) {
  * scored:  scoreSales() result
  * chosen:  Set of style codes with any catalogue choice for this store
  * onShelf: Set of style codes on the store's Shopify
- * dismissed: Set of style codes the store said "not for us" to
+ * dismissed: Map(style code -> score when the store said "not for us").
+ *            Such a style stays away until it is back in trend
+ *            (backInTrend): then it is listed again, marked, with the old score.
  *
  * No maximum: everything that qualifies is listed, best first.
  */
-export function pickCandidates({ scored, chosen = new Set(), onShelf = new Set(), dismissed = new Set(), minScore = MIN_SCORE }) {
+export function pickCandidates({ scored, chosen = new Set(), onShelf = new Set(), dismissed = new Map(), minScore = MIN_SCORE }) {
   const list = [];
 
   for (const r of scored.values()) {
     if (r.score < minScore) continue;
     if (r.units === 0 && r.wtb < 2) continue;
     if (!isStyleCode(r.sku)) continue;
-    if (chosen.has(r.sku) || onShelf.has(r.sku) || dismissed.has(r.sku)) continue;
+    if (chosen.has(r.sku) || onShelf.has(r.sku)) continue;
+    if (dismissed.has(r.sku) && !backInTrend(dismissed.get(r.sku), r.score)) continue;
     if (!isWanted({ title: r.title, brand: r.brand })) continue;
-    list.push(r);
+    list.push(dismissed.has(r.sku) ? { ...r, returnedFrom: Number(dismissed.get(r.sku)) || 0 } : r);
   }
 
   return list.sort((a, b) => b.score - a.score || b.units - a.units || a.sku.localeCompare(b.sku));
+}
+
+/*
+ * A style set aside as "not for us" comes back once its score is at least
+ * 10 points above the score it was set aside at (Dario, 18-11-2026: "30
+ * naar 40 kan ons alsnog laten denken 'wellicht toch proberen'"), and is
+ * itself a candidate (MIN_SCORE, checked in pickCandidates). Set aside
+ * again, the score of that moment is the new base, so it does not return
+ * every week. Without a known score it never comes back by itself.
+ */
+export const BACK_MIN_GAIN = 10;
+
+export function backInTrend(dismissedScore, score) {
+  const was = Number(dismissedScore);
+  if (dismissedScore === null || dismissedScore === undefined || !Number.isFinite(was)) return false;
+  return score >= was + BACK_MIN_GAIN && score >= MIN_SCORE;
 }
 
 /*
@@ -482,8 +501,9 @@ export async function runTrends({ airtable, db, stores, skipChannels, apply = fa
     const choices = await db.all(`store_catalogue_choices?select=sku&merchant_record_id=eq.${encodeURIComponent(store.recordId)}&order=sku.asc`);
     const products = await db.all(`store_catalogue_products?select=sku&merchant_record_id=eq.${encodeURIComponent(store.recordId)}&order=shopify_product_id.asc`);
     const chosen = new Set(choices.map((c) => normSku(c.sku)));
-    const dismissedRows = await db.all(`store_trend_suggestions?select=sku&merchant_record_id=eq.${encodeURIComponent(store.recordId)}&dismissed_at=not.is.null&order=sku.asc`);
-    const dismissed = new Set(dismissedRows.map((d) => normSku(d.sku)));
+    const dismissedRows = await db.all(`store_trend_suggestions?select=sku,score,dismissed_score&merchant_record_id=eq.${encodeURIComponent(store.recordId)}&dismissed_at=not.is.null&order=sku.asc`);
+    // The score at the moment it was set aside; older rows without one fall back to the score they were listed with.
+    const dismissed = new Map(dismissedRows.map((d) => [normSku(d.sku), d.dismissed_score ?? d.score ?? null]));
     const onShelf = await activeShelfSkus(store.graphql);
     for (const p of products) if (p.sku) onShelf.add(normSku(p.sku));
 
@@ -515,7 +535,12 @@ export async function runTrends({ airtable, db, stores, skipChannels, apply = fa
         lojiq_price: s?.price ?? null,
         market_price: market.get(p.sku) ?? null,
         picture_url: s?.picture || null,
-        suggested_at: now.toISOString()
+        suggested_at: now.toISOString(),
+        // Back in trend: listed again, no longer set aside, with the score it was set aside at.
+        returned_from_score: p.returnedFrom ?? null,
+        dismissed_at: null,
+        dismissed_reason: null,
+        dismissed_score: null
       };
     });
 
@@ -525,7 +550,9 @@ export async function runTrends({ airtable, db, stores, skipChannels, apply = fa
       // The list is derived: rebuilt each week. What the store dismissed stays, so it stays away.
       await db.send(`store_trend_suggestions?merchant_record_id=eq.${encodeURIComponent(store.recordId)}&dismissed_at=is.null`, "DELETE");
       for (let i = 0; i < suggestions.length; i += 500) {
-        await db.send("store_trend_suggestions", "POST", suggestions.slice(i, i + 500));
+        // Upsert: a style back in trend replaces its own "not for us" row.
+        await db.send("store_trend_suggestions?on_conflict=merchant_record_id,sku", "POST", suggestions.slice(i, i + 500),
+          "resolution=merge-duplicates,return=minimal");
       }
 
       if (auto && suggestions.length) {
@@ -536,11 +563,12 @@ export async function runTrends({ airtable, db, stores, skipChannels, apply = fa
       }
     }
 
-    log(`TRENDS ${store.name}: ${suggestions.length} suggestions, ${dismissed.size} dismissed earlier` +
+    const back = suggestions.filter((x) => x.returned_from_score !== null).length;
+    log(`TRENDS ${store.name}: ${suggestions.length} suggestions (${back} back in trend), ${dismissed.size - back} still set aside` +
       (auto ? (apply ? ", all chosen (Trend Auto Add? on)" : ", would all be chosen (Trend Auto Add? on)") : "") +
       (apply ? "" : " (dry)"));
 
-    const report = { store: store.name, suggestions: suggestions.length, autoAdded: auto && apply ? suggestions.length : 0, top: suggestions.slice(0, 15) };
+    const report = { store: store.name, suggestions: suggestions.length, backInTrend: back, autoAdded: auto && apply ? suggestions.length : 0, top: suggestions.slice(0, 15) };
     if (full) report.list = suggestions;
     reports.push(report);
     if (notify && apply) await notify(store, suggestions, auto).catch((e) => log("TRENDS notify failed: " + e.message));

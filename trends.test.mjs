@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  normSku, scoreSales, scoreOf, pickCandidates, isWanted, isStyleCode, knownBrand, summariseStock, channelText, runTrends, MIN_SCORE
+  normSku, scoreSales, scoreOf, pickCandidates, isWanted, isStyleCode, backInTrend, knownBrand, summariseStock, channelText, runTrends, MIN_SCORE
 } from "./trends.js";
 
 test("normSku drops the size from a style code", () => {
@@ -178,17 +178,43 @@ test("isStyleCode: no sets of two codes and no shop slugs", () => {
   for (const bad of ["125BT212062F/160BT212012F", "FEAR-OF-GOD-ESSENTIALS-DARK-OATMEAL-SUMMER-SET", "", "SUMMER SET", "ABC"]) assert.equal(isStyleCode(bad), false, bad);
 });
 
-test("a dismissed style is never suggested again, and the weekly rebuild keeps it dismissed", async () => {
+test("backInTrend: at least 10 points above the score it was set aside at, and 30 or more", () => {
+  assert.equal(backInTrend(30, 40), true);   // Dario's example
+  assert.equal(backInTrend(30, 39), false);
+  assert.equal(backInTrend(80, 90), true);
+  assert.equal(backInTrend(80, 89), false);
+  assert.equal(backInTrend(12, 29), false);  // +17 but below 30
+  assert.equal(backInTrend(12, 30), true);
+  assert.equal(backInTrend(null, 500), false); // no known score: stays away
+});
+
+test("a dismissed style stays away until it is back in trend, then returns marked", () => {
   const scored = new Map([["DD1391-104", { sku: "DD1391-104", title: "Nike Dunk Low Court Purple", brand: "", units: 30, wtb: 0, channels: new Map([["A", 15], ["B", 15]]), score: 36 }]]);
   assert.equal(pickCandidates({ scored }).length, 1);
-  assert.equal(pickCandidates({ scored, dismissed: new Set(["DD1391-104"]) }).length, 0);
+  assert.equal(pickCandidates({ scored, dismissed: new Map([["DD1391-104", 27]]) }).length, 0);
+  const back = pickCandidates({ scored, dismissed: new Map([["DD1391-104", 26]]) });
+  assert.equal(back.length, 1);
+  assert.equal(back[0].returnedFrom, 26);
+});
 
-  const f = fakes({ autoAdd: true });
-  const all = f.db.all;
-  f.db.all = async (path) => (path.startsWith("store_trend_suggestions") && path.includes("dismissed_at=not.is.null") ? [{ sku: "HQ4199-100" }] : all(path));
-  const out = await runTrends({ ...f, skipChannels: ["UNION Amsterdam"], apply: true, apiVersion: "x", log: () => {} });
+test("weekly rebuild keeps a dismissed style away, and brings one back in trend (auto-added when the switch is on)", async () => {
+  // HQ4199-100 scores 36 in the fakes.
+  const stay = fakes({ autoAdd: true });
+  const all = stay.db.all;
+  stay.db.all = async (path) => (path.includes("dismissed_at=not.is.null") ? [{ sku: "HQ4199-100", score: 30, dismissed_score: 27 }] : all(path));
+  const out = await runTrends({ ...stay, skipChannels: ["UNION Amsterdam"], apply: true, apiVersion: "x", log: () => {} });
   assert.equal(out.reports[0].suggestions, 0);
-  assert.ok(!f.writes.some((w) => w.path.startsWith("store_catalogue_choices")));
-  const del = f.writes.find((w) => w.method === "DELETE");
-  assert.match(del.path, /dismissed_at=is\.null/);
+  assert.ok(!stay.writes.some((w) => w.path.startsWith("store_catalogue_choices")));
+  assert.match(stay.writes.find((w) => w.method === "DELETE").path, /dismissed_at=is\.null/);
+
+  const back = fakes({ autoAdd: true });
+  const all2 = back.db.all;
+  back.db.all = async (path) => (path.includes("dismissed_at=not.is.null") ? [{ sku: "HQ4199-100", score: 26, dismissed_score: 26 }] : all2(path));
+  const out2 = await runTrends({ ...back, skipChannels: ["UNION Amsterdam"], apply: true, apiVersion: "x", log: () => {} });
+  assert.equal(out2.reports[0].backInTrend, 1);
+  const list = back.writes.find((w) => w.method === "POST" && w.path.startsWith("store_trend_suggestions"));
+  assert.match(list.path, /on_conflict=merchant_record_id,sku/);
+  assert.equal(list.body[0].returned_from_score, 26);
+  assert.equal(list.body[0].dismissed_at, null);
+  assert.equal(back.writes.find((w) => w.path.startsWith("store_catalogue_choices")).body[0].sku, "HQ4199-100");
 });
