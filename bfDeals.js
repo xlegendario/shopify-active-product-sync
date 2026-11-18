@@ -109,10 +109,18 @@ export function dealChanges({ rows, listings, priceBefore = new Map() }) {
       sku: row.sku,
       status: row.productStatus,
       tagged: (row.productTags || []).includes(DEAL_TAG),
-      deal: false
+      deal: false,
+      shown: false
     };
 
+    /*
+      deal: a pair on sale is listed here, so a drafted page goes live.
+      shown: a size actually carries a from-price above its price. Only that
+      earns the tag and a place in Black Friday Deals - a shop's long-standing
+      own price (UNION's Essentials at 100) is no discount anybody sees.
+    */
     if (deal) product.deal = true;
+    if (wanted !== null) product.shown = true;
 
     products.set(row.productId, product);
   }
@@ -122,10 +130,10 @@ export function dealChanges({ rows, listings, priceBefore = new Map() }) {
   return {
     setRefs,
     clearRefs,
-    tag: all.filter((p) => p.deal && !p.tagged).map((p) => p.productId),
-    untag: all.filter((p) => !p.deal && p.tagged).map((p) => p.productId),
+    tag: all.filter((p) => p.shown && !p.tagged).map((p) => p.productId),
+    untag: all.filter((p) => !p.shown && p.tagged).map((p) => p.productId),
     activate: all.filter((p) => p.deal && p.status === "DRAFT").map((p) => p.productId),
-    deals: all.filter((p) => p.deal).length
+    deals: all.filter((p) => p.shown).length
   };
 }
 

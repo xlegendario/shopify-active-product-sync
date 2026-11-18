@@ -59,10 +59,10 @@ test("option B: the from-price is the price before the sale, captured once, neve
   assert.deepEqual(next.setRefs, []);
   assert.deepEqual(next.clearRefs, []);
 
-  // A page built for the deal has no before: no from-price, still tagged.
+  // A page built for the deal has no before: no from-price, so no tag either.
   const fresh = dealChanges({ rows: [{ ...row, refPrice: null }], listings, priceBefore: new Map() });
   assert.deepEqual(fresh.setRefs, []);
-  assert.deepEqual(fresh.tag, ["p1"]);
+  assert.deepEqual(fresh.tag, []);
 
   // Before above the Ideal's price: capped.
   assert.deepEqual(dealChanges({ rows: [{ ...row, refPrice: null }], listings, priceBefore: new Map([["v1", 400]]) }).setRefs, [{ variantId: "v1", value: "313.00" }]);
