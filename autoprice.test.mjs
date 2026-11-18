@@ -179,3 +179,17 @@ test("the cost conversions", () => {
   assert.equal(safeStockxCost(200), 220.47);
   assert.equal(safeStockxCost(0), null);
 });
+
+test("with a Price Ending the slow way down stays on the ending", () => {
+  const store = { ...UNION, "Price Ending": 0.95 };
+  const target = minimumSellingPrice({ buyingPrice: 150, vatType: "Margin", merchantFields: store });
+  const r = priceSize({
+    observations: { stockx_pro: { cost: 150, observedAt: hoursAgo(1) } },
+    previous: { status: "open", price: 300, pricedAt: hoursAgo(24) },
+    merchantFields: store, now: NOW
+  });
+
+  assert.equal(Math.round((target % 1) * 100), 95);
+  assert.equal(r.price, 285.95);
+  assert.equal(r.reason, "coming down slowly");
+});

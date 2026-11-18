@@ -202,3 +202,32 @@ test("half sizes sort too", () => {
     ["EU 36", "EU 37.5", "EU 40", "EU 44.5", "EU 45"]
   );
 });
+
+test("a store with a Price Ending gets the least accepted price on that ending", async () => {
+  const { priceEnding, upToEnding, downToEnding } = await import("./storePricing.js");
+
+  assert.equal(upToEnding(104, 0.95), 104.95);
+  assert.equal(upToEnding(103.95, 0.95), 103.95);
+  assert.equal(upToEnding(103.96, 0.95), 104.95);
+  assert.equal(upToEnding(103.2, 0.95), 103.95);
+  assert.equal(downToEnding(104, 0.95), 103.95);
+  assert.equal(downToEnding(104.95, 0.95), 104.95);
+  assert.equal(priceEnding({ "Price Ending": 0.95 }), 0.95);
+  assert.equal(priceEnding({ "Price Ending": 1 }), 0);
+  assert.equal(priceEnding({}), 0);
+
+  for (const base of [PERCENTAGE_STORE, SIMPLE_STORE, FIRM_RANGE_STORE]) {
+    const merchantFields = { ...base, "Price Ending": 0.95 };
+
+    for (let cost = 20; cost <= 900; cost += 7.5) {
+      const selling = minimumSellingPrice({ buyingPrice: cost, vatType: "Margin", merchantFields });
+      const whole = minimumSellingPrice({ buyingPrice: cost, vatType: "Margin", merchantFields: base });
+
+      assert.equal(Math.round((selling % 1) * 100), 95, `cost ${cost} gave ${selling}`);
+      assert.ok(passesMarginGate({ buyingPrice: cost, sellingPrice: selling, vatType: "Margin", merchantFields }));
+      assert.ok(!passesMarginGate({ buyingPrice: cost, sellingPrice: Math.round((selling - 1) * 100) / 100, vatType: "Margin", merchantFields }));
+      // Firm Range steps between bands, so only the smooth methods sit right next to the whole-euro price.
+      if (base !== FIRM_RANGE_STORE) assert.ok(selling === whole - 0.05 || Math.abs(selling - (whole + 0.95)) < 1e-9, `cost ${cost}: ${selling} vs whole ${whole}`);
+    }
+  }
+});

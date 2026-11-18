@@ -25,7 +25,7 @@
  *      a few percent a day, so one seller dumping a single pair for a day
  *      does not drag the whole shelf down with it.
  */
-import { minimumSellingPrice } from "./storePricing.js";
+import { downToEnding, minimumSellingPrice, priceEnding, upToEnding } from "./storePricing.js";
 
 export const SETTINGS = {
   // How old a read may be before it stops counting, in hours.
@@ -153,8 +153,11 @@ export function priceSize({ observations, previous = null, merchantFields, now =
 
   // Coming down: no further than the daily step allows since the last price.
   const days = Math.max(hoursBetween(previous.pricedAt || now, now) / 24, 0);
-  const floor = Math.ceil(shown * (1 - settings.dropPerDay * days));
-  const price = Math.max(targetPrice, Math.min(shown, floor));
+  // On the store's own price ending, if it has one; a price from before
+  // the ending was set steps down onto it.
+  const ending = priceEnding(merchantFields);
+  const floor = upToEnding(shown * (1 - settings.dropPerDay * days), ending);
+  const price = Math.max(targetPrice, Math.min(downToEnding(shown, ending), floor));
 
   return {
     status: "open",

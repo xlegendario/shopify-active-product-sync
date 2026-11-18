@@ -158,6 +158,38 @@ function roomForUs(sellingPrice, merchantFields, kind) {
   return null;
 }
 
+/*
+ * The cents a store's prices end in, from Merchants "Price Ending" (0.95 on
+ * UNION since 18-11-2026: 104,95 and 93,95 read as one price list where 104
+ * and 93 did not). Empty, zero or anything outside 0-1: whole euros, as
+ * before.
+ */
+export function priceEnding(merchantFields) {
+  const ending = Math.round(num(merchantFields?.["Price Ending"]) * 100) / 100;
+
+  return ending > 0 && ending < 1 ? ending : 0;
+}
+
+const cents = (value) => Math.round(value * 100) / 100;
+
+// The lowest price at or above value that ends in ending (whole euros for 0).
+export function upToEnding(value, ending = 0) {
+  if (!ending) return Math.ceil(value);
+
+  const below = Math.floor(value) - 1 + ending;
+
+  return cents(below >= value - 1e-9 ? below : below + 1 >= value - 1e-9 ? below + 1 : below + 2);
+}
+
+// The highest price at or below value that ends in ending.
+export function downToEnding(value, ending = 0) {
+  if (!ending) return Math.floor(value);
+
+  const at = Math.floor(value) + ending;
+
+  return cents(at <= value + 1e-9 ? at : at - 1);
+}
+
 function toStepUp(value) {
   return Math.ceil(value / STEP) * STEP;
 }
@@ -266,7 +298,12 @@ export function minimumSellingPrice({ buyingPrice: cost, vatType, merchantFields
     agrees. What comes back is the lowest whole euro the forward rule accepts,
     which makes the two exact inverses of each other by construction.
   */
-  let selling = Math.ceil(raw);
+  /*
+    A store with a Price Ending walks the same way on its own grid: 103,95,
+    104,95, ... - so the answer is the lowest such price the gate accepts.
+  */
+  const ending = priceEnding(merchantFields);
+  let selling = upToEnding(raw, ending);
 
   const accepts = (price) => {
     const allowed = maximumBuyingPrice({ sellingPrice: price, vatType, merchantFields });
@@ -274,9 +311,9 @@ export function minimumSellingPrice({ buyingPrice: cost, vatType, merchantFields
     return allowed !== null && allowed >= paid;
   };
 
-  for (let step = 0; step < 25 && !accepts(selling); step += 1) selling += 1;
+  for (let step = 0; step < 25 && !accepts(selling); step += 1) selling = cents(selling + 1);
 
-  while (selling > 1 && accepts(selling - 1)) selling -= 1;
+  while (selling > 1 && accepts(cents(selling - 1))) selling = cents(selling - 1);
 
   return selling;
 }
