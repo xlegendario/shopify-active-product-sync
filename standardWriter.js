@@ -95,8 +95,15 @@ const sizeOf = (variant) => {
 
 /*
  * A page whose options are not in the order shoppers should see them: sizes
- * by the ladder (Standard sizes are appended at the end), and Standard
- * before Express - the cheaper choice on the left, as the store asked.
+ * by the ladder (Standard sizes are appended at the end), and Express
+ * before Standard.
+ *
+ * Express first in Shopify, not on screen: a page opens on its first
+ * variant that can be bought, and with Standard first that was the
+ * Standard of the smallest size - also where the theme hides Standard
+ * because it is dearer than Express, so the page opened on a price nobody
+ * could see a card for (18-11-2026). The theme puts the Standard card on
+ * the left with CSS, as the store asked.
  */
 function sizesOutOfOrder(product) {
   const options = product?.options || [];
@@ -107,7 +114,7 @@ function sizesOutOfOrder(product) {
   const sizesWrong = sortEuSizes(names).some((name, i) => name !== names[i]);
 
   const values = (delivery?.optionValues || []).map((v) => v.name);
-  const deliveryWrong = values.includes(STANDARD) && values.includes(EXPRESS) && values.indexOf(STANDARD) > values.indexOf(EXPRESS);
+  const deliveryWrong = values.includes(STANDARD) && values.includes(EXPRESS) && values.indexOf(EXPRESS) > values.indexOf(STANDARD);
 
   return sizesWrong || deliveryWrong;
 }
@@ -303,14 +310,14 @@ export async function writeStandardVariants({ graphql, skus, listingsBySku, appl
 
         /*
           Shopify wants every option of the page in a reorder, not only the
-          one that moves: sizes sorted, Standard before Express.
+          one that moves: sizes sorted, Express before Standard.
         */
         const options = (after?.options || []).map((o) => {
           const byName = new Map(o.optionValues.map((v) => [v.name, v.id]));
           const names = o.name === plan.sizeOptionName
             ? sortEuSizes(o.optionValues.map((v) => v.name))
             : DELIVERY_NAMES.test(o.name)
-              ? [STANDARD, EXPRESS].filter((n) => byName.has(n))
+              ? [EXPRESS, STANDARD].filter((n) => byName.has(n))
               : o.optionValues.map((v) => v.name);
 
           return { id: o.id, values: names.map((name) => ({ id: byName.get(name) })) };

@@ -9,6 +9,7 @@ import { autopriceMerchant } from "./autopriceRun.js";
 import { storeProPrices, supabase as marketDb } from "./marketPrices.js";
 import { describeStore, createDescriptionWriter } from "./productDescriptions.js";
 import { photoSources } from "./storePhotos.js";
+import { fillModels, sortCollections } from "./storefrontOrder.js";
 
 const app = express();
 
@@ -4093,6 +4094,59 @@ async function describeAll({ onlyClientId = "", apply = DESCRIPTION_APPLY } = {}
   return reports;
 }
 
+/*
+ * The storefront's order (storefrontOrder.js): new pages get a model, and
+ * the listed collections are put back in order by sales score. Only the
+ * stores in STOREFRONT_CLIENTS; it never removes or unpublishes anything.
+ */
+const STOREFRONT_COLLECTIONS =
+  process.env.STOREFRONT_COLLECTIONS ||
+  "adidas,nike,jordan,nike-jordan,new-balance,asics,maison-mihara-yasuhiro,fear-of-god,ugg,salomon,shoes,clothing";
+
+async function storefrontScores() {
+  const scores = new Map();
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from("storefront_scores")
+      .select("sku, score")
+      .order("sku")
+      .range(from, from + 999);
+    if (error) throw new Error("storefront_scores: " + error.message);
+    for (const r of data) scores.set(String(r.sku).trim().toUpperCase(), Number(r.score) || 0);
+    if (data.length < 1000) return scores;
+  }
+}
+
+async function storefrontAll({ onlyClientId = "", apply = process.env.STOREFRONT_APPLY !== "false" } = {}) {
+  const wanted = String(process.env.STOREFRONT_CLIENTS || "CL-00031").split(",").map((id) => id.trim()).filter(Boolean);
+  const merchants = (await fetchActiveMerchants()).filter(
+    (m) => wanted.includes(m.fields["Client ID"]) && (!onlyClientId || m.fields["Client ID"] === onlyClientId)
+  );
+
+  if (!merchants.length) return { skipped: "no active store in STOREFRONT_CLIENTS" };
+
+  const scores = await storefrontScores();
+  const handles = STOREFRONT_COLLECTIONS.split(",").map((h) => h.trim()).filter(Boolean);
+  const reports = [];
+
+  for (const merchant of merchants) {
+    const graphql = async (query, variables) => (await shopifyGraphQL(merchant, query, variables)).data;
+    const models = await fillModels({ graphql, apply });
+    const order = await sortCollections({ graphql, handles, scores, apply });
+
+    console.log(
+      `STOREFRONT ${merchant.name}: ${models.set} models set, ${models.unknown.length} unknown` +
+        `, collections moved: ${order.map((o) => `${o.handle} ${o.moved ?? o.skipped}`).join(", ")}` +
+        (apply ? "" : " (dry)")
+    );
+    if (models.unknown.length) console.log("STOREFRONT no model for:", models.unknown.slice(0, 20).join(" | "));
+
+    reports.push({ store: merchant.name, models, order });
+  }
+
+  return reports;
+}
+
 const JOBS = {
   consignment: {
     schedule: process.env.CRON_CONSIGNMENT || "*/30 * * * *",
@@ -4134,6 +4188,17 @@ const JOBS = {
     schedule: process.env.CRON_DESCRIPTIONS || "40 */2 * * *",
     what: "descriptions and SEO text for active products that have none (DESCRIPTION_CLIENTS)",
     run: ({ client } = {}) => describeAll({ onlyClientId: client || "" })
+  },
+
+  storefront: {
+    /*
+      Nightly, after the catalogue pass: pages made during the day get their
+      model and their place in the collections.
+    */
+    schedule: process.env.CRON_STOREFRONT || "30 3 * * *",
+    what: "models for new pages and collections in order by sales score (STOREFRONT_CLIENTS)",
+    run: ({ client, apply } = {}) =>
+      storefrontAll({ onlyClientId: client || "", apply: apply === undefined ? process.env.STOREFRONT_APPLY !== "false" : String(apply) !== "false" })
   },
 
   products: {
