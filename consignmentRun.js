@@ -29,6 +29,7 @@ import { createShopifyWriter, applyPlan, productImageUrl } from "./shopifyWriter
 import { wantsNormalizedPhotos, normalizedPhotoUrls, isNormalizedPhoto } from "./photoNormalize.js";
 import { readStoreState, readOurLocationStock, readFlagSetting } from "./storeState.js";
 import { expressOptionOn } from "./delivery.js";
+import { showsDeals, dealChanges, writeDealChanges } from "./bfDeals.js";
 
 /*
  * Our consignment stock, whole - but only what ships fast.
@@ -53,7 +54,7 @@ export async function fetchConsignmentStock({ supabaseUrl, supabaseKey }) {
     const response = await fetch(
       `${supabaseUrl}/rest/v1/consignment_inventory` +
         `?select=id,sku,size,vat_type,selling_price_suggested,quantity,seller_id,` +
-        `seller_record_id,brand,product_name,lead_time_days,contract_labels_only&quantity=gt.0` +
+        `seller_record_id,brand,product_name,lead_time_days,contract_labels_only,own_stock,reference_price&quantity=gt.0` +
         `&or=(lead_time_days.is.null,lead_time_days.lte.2)`,
       {
         headers: {
@@ -822,7 +823,8 @@ export async function runConsignmentForMerchant({
       pricesRemembered: 0,
       pricesAdded: 0,
       pricesCleared: 0,
-      setFlags: flagChangesFor(afterPlan(state.rows, plan), flag).length
+      setFlags: flagChangesFor(afterPlan(state.rows, plan), flag).length,
+      deals: showsDeals(merchant.name) ? dealSummary(dealChanges({ rows: afterPlan(state.rows, plan), listings })) : null
     };
   }
 
@@ -906,14 +908,41 @@ export async function runConsignmentForMerchant({
     product created in this same run gets its flag in this same run.
   */
   let flagsSet = 0;
+  let after = null;
 
   if (flag) {
-    const after = await readOurLocationStock(graphql, locationId, flag);
+    after = await readOurLocationStock(graphql, locationId, flag);
     const changes = flagChangesFor(after, flag);
 
     await writer.setFlags(changes, flag);
 
     flagsSet = changes.length;
+  }
+
+  /*
+    Our own pairs on sale, shown as a discount (bfDeals.js). From the same
+    after-read as the flag, so a page built in this run is a deal in this
+    run. Never allowed to hold up the push.
+  */
+  let deals = null;
+
+  /*
+    Only when there is something to show or to take away: the after-read is
+    a full pass over our location, and most runs have no sale at all.
+  */
+  const dealsInPlay =
+    listings.some((listing) => listing.ownStock) ||
+    state.rows.some((row) => row.refPrice || (row.productTags || []).includes("bf-deal"));
+
+  if (showsDeals(merchant.name) && dealsInPlay) {
+    try {
+      after = after || await readOurLocationStock(graphql, locationId, flag);
+      const changes = dealChanges({ rows: after, listings });
+      deals = { ...dealSummary(changes), problems: await writeDealChanges(graphql, changes) };
+    } catch (err) {
+      console.error("DEALS NOT WRITTEN", { merchant: merchant.name, error: err.message });
+      deals = { error: err.message };
+    }
   }
 
   return {
@@ -925,9 +954,22 @@ export async function runConsignmentForMerchant({
     pricesAdded: prices.added,
     pricesCleared: prices.cleared,
     setFlags: flagsSet,
+    deals,
     choicesMarked,
     done: report.done.length,
     problems: report.problems.slice(0, 10)
+  };
+}
+
+// What a deals pass did or would do, in counts.
+function dealSummary(changes) {
+  return {
+    products: changes.deals,
+    setRefs: changes.setRefs.length,
+    clearRefs: changes.clearRefs.length,
+    tag: changes.tag.length,
+    untag: changes.untag.length,
+    activate: changes.activate.length
   };
 }
 

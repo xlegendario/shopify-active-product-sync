@@ -53,7 +53,8 @@ function ourLevelsQuery(flag) {
                 price
                 inventoryQuantity
                 selectedOptions { name value }
-                product { id status }
+                product { id status tags }
+                refPrice: metafield(namespace: "lojiq", key: "ref_price") { value }
                 ${metafield}
               }
               sku
@@ -199,6 +200,10 @@ export async function readOurLocationStock(graphql, locationId, flag = null) {
         otherStock: Math.max(0, (Number(variant.inventoryQuantity) || 0) - quantityOf(node)),
 
         productStatus: variant.product?.status || "",
+        productTags: variant.product?.tags || [],
+
+        // The "from" price of one of our sale pairs, as the theme reads it.
+        refPrice: variant.refPrice?.value ?? null,
 
         /*
           What the store's flag says today, so only the ones that disagree

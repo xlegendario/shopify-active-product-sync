@@ -174,6 +174,28 @@ export function storeCost({ ask, vatType, merchantFields, inventoryType = "all" 
   return { net, gross: Math.ceil(onGrid * (1 + rate)) };
 }
 
+/*
+ * What the store would ask for one of our sale pairs at its normal price.
+ *
+ * The same two steps as the real price - our ask to the store's cost, the
+ * cost to its selling price - only from the reference (Ideal Selling Price)
+ * instead of the sale ask. UNION shows its "from" price off this, so the
+ * percentage on the page is the one we really give. Null when there is no
+ * discount to show: no reference, or one that does not come out above the
+ * price the pair is actually listed at.
+ */
+export function referenceSellingPrice({ pair, merchantFields, inventoryType = "all", selling }) {
+  if (!(num(pair.referencePrice) > num(pair.ask))) return null;
+
+  const cost = storeCost({ ask: pair.referencePrice, vatType: pair.vatType, merchantFields, inventoryType });
+
+  if (cost === null) return null;
+
+  const reference = minimumSellingPrice({ buyingPrice: cost.net, vatType: pair.vatType, merchantFields });
+
+  return reference !== null && reference > num(selling) ? reference : null;
+}
+
 /* ------------------------------------------------------------------ *
  * The list
  * ------------------------------------------------------------------ */
@@ -222,7 +244,15 @@ export function cheapestPerPair(inventoryRows, { excludeSellerRecordId } = {}) {
         productName: text(row.product_name),
         brand: text(row.brand),
         quantity: num(row.quantity),
-        inventoryId: text(row.id)
+        inventoryId: text(row.id),
+
+        /*
+          Our own pairs on sale (kcOwnStock in sneakerask-consignment). The
+          reference is what the pair normally costs, so a store can show
+          the discount it is selling at.
+        */
+        ownStock: row.own_stock === true,
+        referencePrice: num(row.reference_price)
       });
     }
   }
@@ -295,8 +325,16 @@ export function buildDesiredListings({
       continue;
     }
 
-    if (priceSync && !ownPriced.has(`${pair.sku}|${pair.size}`)) {
-      const named = num(customPrices.get(`${pair.sku}|${pair.size}`));
+    /*
+      A pair of ours on sale is priced by us, whatever the store named.
+
+      The sale is one decision for every channel: Dario lowers the ask and
+      every shop follows from it. A custom or own price on that size was set
+      for a consignor's pair at the normal price, and keeping it would hide
+      the discount on exactly the page the ads point to.
+    */
+    if (priceSync && (pair.ownStock || !ownPriced.has(`${pair.sku}|${pair.size}`))) {
+      const named = pair.ownStock ? 0 : num(customPrices.get(`${pair.sku}|${pair.size}`));
 
       if (named > 0) {
         /*
@@ -333,7 +371,16 @@ export function buildDesiredListings({
         continue;
       }
 
-      listings.push({ ...pair, cost: cost.net, invoiced: cost.gross, sellingPrice: selling, priceSetByUs: true });
+      listings.push({
+        ...pair,
+        cost: cost.net,
+        invoiced: cost.gross,
+        sellingPrice: selling,
+        priceSetByUs: true,
+        referenceSellingPrice: pair.ownStock
+          ? referenceSellingPrice({ pair, merchantFields, inventoryType, selling })
+          : null
+      });
       continue;
     }
 
