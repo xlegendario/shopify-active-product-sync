@@ -824,7 +824,7 @@ export async function runConsignmentForMerchant({
       pricesAdded: 0,
       pricesCleared: 0,
       setFlags: flagChangesFor(afterPlan(state.rows, plan), flag).length,
-      deals: showsDeals(merchant.name) ? dealSummary(dealChanges({ rows: afterPlan(state.rows, plan), listings })) : null
+      deals: showsDeals(merchant.name) ? dealSummary(dealChanges({ rows: afterPlan(state.rows, plan), listings, priceBefore: pricesBefore(state.rows) })) : null
     };
   }
 
@@ -937,7 +937,7 @@ export async function runConsignmentForMerchant({
   if (showsDeals(merchant.name) && dealsInPlay) {
     try {
       after = after || await readOurLocationStock(graphql, locationId, flag);
-      const changes = dealChanges({ rows: after, listings });
+      const changes = dealChanges({ rows: after, listings, priceBefore: pricesBefore(state.rows) });
       deals = { ...dealSummary(changes), problems: await writeDealChanges(graphql, changes) };
     } catch (err) {
       console.error("DEALS NOT WRITTEN", { merchant: merchant.name, error: err.message });
@@ -959,6 +959,12 @@ export async function runConsignmentForMerchant({
     done: report.done.length,
     problems: report.problems.slice(0, 10)
   };
+}
+
+// What each variant cost in the store when this run began, before any price
+// we set in it: the "before the sale" price a deal's from-price starts at.
+function pricesBefore(rows) {
+  return new Map(rows.filter((row) => row.variantId && row.price > 0).map((row) => [row.variantId, row.price]));
 }
 
 // What a deals pass did or would do, in counts.

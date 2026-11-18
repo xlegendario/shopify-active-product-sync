@@ -30,13 +30,13 @@ test("a sale pair of ours beats a custom price and carries its normal store pric
 });
 
 test("deal changes: set, clear, tag, untag, activate", () => {
-  const listings = [{ sku: "A", size: "42", ownStock: true, referenceSellingPrice: 200 }];
+  const listings = [{ sku: "A", size: "42", ownStock: true, referenceSellingPrice: 200, sellingPrice: 150 }];
   const rows = [
     { sku: "A", size: "42", variantId: "v1", productId: "p1", quantity: 1, refPrice: null, productTags: [], productStatus: "DRAFT" },
     { sku: "B", size: "40", variantId: "v2", productId: "p2", quantity: 0, refPrice: "180.00", productTags: ["bf-deal"], productStatus: "ACTIVE" }
   ];
 
-  const c = dealChanges({ rows, listings });
+  const c = dealChanges({ rows, listings, priceBefore: new Map([["v1", 210]]) });
 
   assert.deepEqual(c.setRefs, [{ variantId: "v1", value: "200.00" }]);
   assert.deepEqual(c.clearRefs, [{ variantId: "v2" }]);
@@ -45,4 +45,25 @@ test("deal changes: set, clear, tag, untag, activate", () => {
   assert.deepEqual(c.activate, ["p1"]);
   assert.equal(showsDeals("UNION Amsterdam", {}), true);
   assert.equal(showsDeals("FastCop", {}), false);
+});
+
+test("option B: the from-price is the price before the sale, captured once, never above the Ideal's", () => {
+  const listings = [{ sku: "A", size: "42", ownStock: true, referenceSellingPrice: 313, sellingPrice: 173 }];
+  const row = { sku: "A", size: "42", variantId: "v1", productId: "p1", quantity: 1, productTags: [], productStatus: "ACTIVE" };
+
+  // First run: the store asked 204 before; captured.
+  assert.deepEqual(dealChanges({ rows: [{ ...row, refPrice: null }], listings, priceBefore: new Map([["v1", 204]]) }).setRefs, [{ variantId: "v1", value: "204.00" }]);
+
+  // Next run the store price is the sale price already; the captured 204 stays.
+  const next = dealChanges({ rows: [{ ...row, refPrice: "204.00" }], listings, priceBefore: new Map([["v1", 173]]) });
+  assert.deepEqual(next.setRefs, []);
+  assert.deepEqual(next.clearRefs, []);
+
+  // A page built for the deal has no before: no from-price, still tagged.
+  const fresh = dealChanges({ rows: [{ ...row, refPrice: null }], listings, priceBefore: new Map() });
+  assert.deepEqual(fresh.setRefs, []);
+  assert.deepEqual(fresh.tag, ["p1"]);
+
+  // Before above the Ideal's price: capped.
+  assert.deepEqual(dealChanges({ rows: [{ ...row, refPrice: null }], listings, priceBefore: new Map([["v1", 400]]) }).setRefs, [{ variantId: "v1", value: "313.00" }]);
 });

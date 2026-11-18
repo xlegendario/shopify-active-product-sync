@@ -8,10 +8,15 @@
  * this does, for the stores that show one (UNION Amsterdam, for its Black
  * Friday ads):
  *
- *   - lojiq.ref_price on the variant: what the store would ask at the pair's
- *     normal price. The theme's "from" price is that times the Black Friday
- *     mark-up, so a pair dropped from 160 to 100 reads as the discount it is
- *     rather than as the same 25% every other pair shows.
+ *   - lojiq.ref_price on the variant: what the store asked for this size
+ *     before the sale, captured once on the run that first lists the deal
+ *     and then kept while the deal lasts (Dario, 18-11-2026, option B). Never
+ *     above what the pair's Ideal would give. The theme's "from" price is that
+ *     times the Black Friday mark-up, so a pair dropped from 204 to 173 shows
+ *     the drop on top of the 25% every other pair shows - and never a "from"
+ *     price the shop never asked.
+ *   - a size with no earlier price in the store (a page built for the deal)
+ *     gets no ref_price: there is no "before" to show.
  *   - the tag bf-deal on the product, which the "Black Friday Deals"
  *     collection is built on.
  *   - a page that is a draft goes live. UNION's curation drafted most of its
@@ -51,13 +56,16 @@ const money = (value) => (Math.round(Number(value) * 100) / 100).toFixed(2);
  * list there is one of ours on sale with a reference price. Everything else
  * that carries a ref_price loses it.
  */
-export function dealChanges({ rows, listings }) {
+export function dealChanges({ rows, listings, priceBefore = new Map() }) {
   const reference = new Map();
 
   for (const listing of listings || []) {
     if (!listing.ownStock || !(Number(listing.referenceSellingPrice) > 0)) continue;
 
-    reference.set(`${normalizeSku(listing.sku)}|${sizeKey(listing.size)}`, Number(listing.referenceSellingPrice));
+    reference.set(`${normalizeSku(listing.sku)}|${sizeKey(listing.size)}`, {
+      cap: Number(listing.referenceSellingPrice),
+      selling: Number(listing.sellingPrice)
+    });
   }
 
   const setRefs = [];
@@ -67,13 +75,28 @@ export function dealChanges({ rows, listings }) {
   for (const row of rows || []) {
     if (!row.variantId || !row.productId) continue;
 
-    const wanted = row.quantity > 0
+    const deal = row.quantity > 0
       ? reference.get(`${normalizeSku(row.sku)}|${sizeKey(row.size)}`) ?? null
       : null;
 
     const has = row.refPrice === null || row.refPrice === undefined || row.refPrice === ""
       ? null
       : Number(row.refPrice);
+
+    /*
+      Kept once captured: the run after the first one sees the sale price as
+      the store's price, and would otherwise move the "from" price down with
+      it. Captured from what the store asked when this run began, capped at
+      the Ideal's price, and only when that is above what it sells for now.
+    */
+    const before = Number(priceBefore.get(row.variantId)) || 0;
+    const wanted = !deal
+      ? null
+      : has !== null
+        ? has
+        : before > deal.selling
+          ? Math.min(before, deal.cap)
+          : null;
 
     if (wanted !== null && (has === null || money(has) !== money(wanted))) {
       setRefs.push({ variantId: row.variantId, value: money(wanted) });
@@ -89,7 +112,7 @@ export function dealChanges({ rows, listings }) {
       deal: false
     };
 
-    if (wanted !== null) product.deal = true;
+    if (deal) product.deal = true;
 
     products.set(row.productId, product);
   }
