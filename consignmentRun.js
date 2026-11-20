@@ -48,15 +48,21 @@ import { nearestEnding, priceEnding } from "./storePricing.js";
  * An empty lead_time_days is the old promise, so nothing that was already
  * being pushed changes.
  */
-export async function fetchConsignmentStock({ supabaseUrl, supabaseKey }) {
+export async function fetchConsignmentStock({ supabaseUrl, supabaseKey, slow = false }) {
   const rows = [];
+
+  /*
+    slow: only what takes longer than two days - the supplier stock that a
+    store with a Partner location gets there, apart from the rest.
+  */
+  const leadTime = slow ? `&lead_time_days=gt.2` : `&or=(lead_time_days.is.null,lead_time_days.lte.2)`;
 
   for (let from = 0; ; from += 1000) {
     const response = await fetch(
       `${supabaseUrl}/rest/v1/consignment_inventory` +
         `?select=id,sku,size,vat_type,selling_price_suggested,quantity,seller_id,` +
         `seller_record_id,brand,product_name,lead_time_days,contract_labels_only,own_stock,reference_price&quantity=gt.0` +
-        `&or=(lead_time_days.is.null,lead_time_days.lte.2)`,
+        leadTime,
       {
         headers: {
           apikey: supabaseKey,
@@ -662,6 +668,37 @@ function pricesAfterThisRun({ listings, currentPrices, setPrices }) {
   });
 }
 
+/*
+ * The slow stock minus every size the fast pass already lists, so a size
+ * is on one of our two locations and never on both.
+ */
+export function withoutPairs(stock, listings) {
+  const taken = new Set((listings || []).map((l) => normalizeSku(l.sku) + "|" + sizeKey(l.size)));
+
+  return (stock || []).filter((row) => !taken.has(normalizeSku(row.sku) + "|" + sizeKey(row.size)));
+}
+
+/*
+ * What the slow pass may know of the store's catalogue choices: only what
+ * keeps our stock off a page (unlinked, switched off), and as already
+ * handled, so the page is not drafted a second time.
+ */
+export function blockingChoicesOnly(choices) {
+  return new Map(
+    [...(choices || new Map())]
+      .filter(([, c]) => c?.choice === "unlinked" || c?.choice === "deactivated")
+      .map(([sku, c]) => [sku, { ...c, status: "done" }])
+  );
+}
+
+function summarisePartner(partner) {
+  if (partner.error || partner.skipped) return { error: partner.error, skipped: partner.skipped };
+
+  const { onOurLocation, wanted, rejected, setQuantities, setPrices, clearQuantities, activate, pricesLeftAlone, done, problems } = partner;
+
+  return { onOurLocation, wanted, rejected, setQuantities, setPrices, clearQuantities, activate, pricesLeftAlone, done, problems };
+}
+
 export async function runConsignmentForMerchant({
   merchant,
   graphql,
@@ -676,7 +713,16 @@ export async function runConsignmentForMerchant({
   // them; nothing in the push itself needs Supabase.
   supabaseUrl = "",
   supabaseKey = "",
-  apply = false
+  apply = false,
+  /*
+    The supplier stock that takes longer than two days, for a store with a
+    "Shopify Partner Location ID". It goes onto that second location in a
+    pass of its own, so the store can see which pairs are the slow ones and
+    give them other shipping (Genky, 20-11-2026). Only for a size we have no
+    fast pair of: fast wins, and one size carries one price.
+  */
+  slowStock = [],
+  partnerPass = false
 }) {
   const fields = merchant.fields || {};
 
@@ -714,11 +760,16 @@ export async function runConsignmentForMerchant({
     return { ...base, skipped: "Consignment Sync is off" };
   }
 
-  const locationId = fields["Shopify Location ID"];
+  const mainLocationId = String(fields["Shopify Location ID"] ?? "").trim();
+  const partnerLocationId = String(fields["Shopify Partner Location ID"] ?? "").trim();
+  const locationId = partnerPass ? partnerLocationId : mainLocationId;
 
   if (!locationId) {
     return { ...base, skipped: "No Shopify Location ID" };
   }
+
+  // Both Lojiq locations are ours; neither may read as the store's own stock.
+  const otherOurs = partnerPass ? mainLocationId : partnerLocationId;
 
   /*
     One store wants a flag on each variant its theme reads. That setting
@@ -741,7 +792,12 @@ export async function runConsignmentForMerchant({
     ours, which is the closest thing to "does it keep its own stock" that
     does not depend on somebody ticking a box.
   */
-  const state = await readStoreState(graphql, { locationId, flag });
+  const state = await readStoreState(graphql, {
+    locationId,
+    // The flag is the main pass's business: it reads our main location.
+    flag: partnerPass ? null : flag,
+    alsoOurs: otherOurs && otherOurs !== locationId ? [otherOurs] : []
+  });
 
   const currentPrices = new Map(
     state.rows
@@ -782,7 +838,7 @@ export async function runConsignmentForMerchant({
     purpose: that one protects a price the shop set on its own stock, and a
     custom price is the shop setting it.
   */
-  const customElsewhere = priceSync
+  const customElsewhere = priceSync && !partnerPass
     ? customPricesOffOurStock(await customPriceRowsFor(merchant.recordId, { supabaseUrl, supabaseKey }), listings, ending)
     : [];
 
@@ -820,11 +876,38 @@ export async function runConsignmentForMerchant({
     pricesLeftAlone: pricesLeftAlone.length
   };
 
+  /*
+    The slow pass, once the fast one has decided. Run from here so the
+    prices of both passes are remembered in one call: that call clears
+    whatever it is not given, so two calls would wipe each other.
+  */
+  const slowPass = (wrote) => !partnerPass && partnerLocationId
+    ? runConsignmentForMerchant({
+        merchant,
+        graphql,
+        stock: withoutPairs(slowStock, listings),
+        ladders,
+        photos,
+        customPrices,
+        // Only stocks pages that exist; making pages stays with the main pass.
+        choices: blockingChoicesOnly(choices),
+        ownPriced,
+        supabaseUrl,
+        supabaseKey,
+        apply: wrote,
+        partnerPass: true
+      })
+    : null;
+
   if (!apply) {
+    const partner = await slowPass(false);
+
     return {
       ...base,
       dryRun: true,
       ...counts,
+      partner: partner ? summarisePartner(partner) : undefined,
+      pricePairs: pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices }),
       pagesMirrored: 0,
       pricesRemembered: 0,
       pricesAdded: 0,
@@ -859,7 +942,7 @@ export async function runConsignmentForMerchant({
     The store's choices, marked done or failed so its catalogue stops
     saying "next pass". Never allowed to hold up the push either.
   */
-  const choicesMarked = await markChoices(
+  const choicesMarked = partnerPass ? 0 : await markChoices(
     merchant.recordId,
     choiceOutcomes({ choices, plan, current, outcomes: report.outcomes }),
     { supabaseUrl, supabaseKey }
@@ -895,10 +978,34 @@ export async function runConsignmentForMerchant({
     And then the prices, which need those rows to exist - which is why this
     sits after the writing rather than beside the plan.
   */
+  const ownPairs = pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices });
+
+  if (partnerPass) {
+    return {
+      ...base,
+      partnerPass: true,
+      dryRun: false,
+      ...counts,
+      pagesMirrored,
+      pricePairs: ownPairs,
+      done: report.done.length,
+      problems: report.problems.slice(0, 10)
+    };
+  }
+
+  let partner = null;
+
+  try {
+    partner = await slowPass(true);
+  } catch (err) {
+    console.error("CONSIGNMENT PARTNER PASS FAILED", { merchant: merchant.name, error: err.message });
+    partner = { error: err.message };
+  }
+
   const prices = priceSync
     ? await rememberShopPrices({
         merchantRecordId: merchant.recordId,
-        pairs: pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices }),
+        pairs: [...ownPairs, ...(partner?.pricePairs || [])],
         supabaseUrl,
         supabaseKey
       }).catch((err) => {
@@ -962,6 +1069,7 @@ export async function runConsignmentForMerchant({
     setFlags: flagsSet,
     deals,
     choicesMarked,
+    partner: partner ? summarisePartner(partner) : undefined,
     done: report.done.length,
     problems: report.problems.slice(0, 10)
   };
@@ -1022,6 +1130,13 @@ export async function runConsignmentForAll({
     return { merchants: 0, results: [], message: "Consignment stock came back empty - nothing was touched" };
   }
 
+  /*
+    The slow supplier stock, only when some store has a Partner location to
+    put it on.
+  */
+  const wantsSlow = wanted.some((m) => String(m.fields?.["Shopify Partner Location ID"] ?? "").trim());
+  const slowStock = wantsSlow ? await fetchConsignmentStock({ supabaseUrl, supabaseKey, slow: true }) : [];
+
   const skus = [...new Set(stock.map((row) => String(row.sku || "").trim().toUpperCase()))]
     .filter(Boolean)
     .sort();
@@ -1047,7 +1162,8 @@ export async function runConsignmentForAll({
           ownPriced: await ownPricedFor(merchant.recordId, { supabaseUrl, supabaseKey }),
           supabaseUrl,
           supabaseKey,
-          apply
+          apply,
+          slowStock
         })
       );
     } catch (error) {

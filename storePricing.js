@@ -167,7 +167,21 @@ function roomForUs(sellingPrice, merchantFields, kind) {
 export function priceEnding(merchantFields) {
   const ending = Math.round(num(merchantFields?.["Price Ending"]) * 100) / 100;
 
-  return ending > 0 && ending < 1 ? ending : 0;
+  if (ending > 0 && ending < 1) return ending;
+
+  /*
+    A whole digit from 1 to 9 is the last digit of a whole-euro price:
+    9 gives 129, 139, 149 (Genky Sneakers, 20-11-2026).
+  */
+  if (Number.isInteger(ending) && ending >= 1 && ending <= 9) return ending;
+
+  return 0;
+}
+
+// How far apart two prices on the store's grid are: ten euros for a last
+// digit, one euro for cents.
+export function endingStep(ending = 0) {
+  return ending >= 1 ? 10 : 1;
 }
 
 const cents = (value) => Math.round(value * 100) / 100;
@@ -175,6 +189,8 @@ const cents = (value) => Math.round(value * 100) / 100;
 // The lowest price at or above value that ends in ending (whole euros for 0).
 export function upToEnding(value, ending = 0) {
   if (!ending) return Math.ceil(value);
+
+  if (ending >= 1) return Math.ceil((value - ending - 1e-9) / 10) * 10 + ending;
 
   const below = Math.floor(value) - 1 + ending;
 
@@ -184,6 +200,8 @@ export function upToEnding(value, ending = 0) {
 // The highest price at or below value that ends in ending.
 export function downToEnding(value, ending = 0) {
   if (!ending) return Math.floor(value);
+
+  if (ending >= 1) return Math.floor((value - ending + 1e-9) / 10) * 10 + ending;
 
   const at = Math.floor(value) + ending;
 
@@ -327,9 +345,11 @@ export function minimumSellingPrice({ buyingPrice: cost, vatType, merchantFields
     return allowed !== null && allowed >= paid;
   };
 
-  for (let step = 0; step < 25 && !accepts(selling); step += 1) selling = cents(selling + 1);
+  const step = endingStep(ending);
 
-  while (selling > 1 && accepts(cents(selling - 1))) selling = cents(selling - 1);
+  for (let tries = 0; tries < 25 && !accepts(selling); tries += 1) selling = cents(selling + step);
+
+  while (selling > step && accepts(cents(selling - step))) selling = cents(selling - step);
 
   return selling;
 }

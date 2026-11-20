@@ -213,7 +213,7 @@ test("a store with a Price Ending gets the least accepted price on that ending",
   assert.equal(downToEnding(104, 0.95), 103.95);
   assert.equal(downToEnding(104.95, 0.95), 104.95);
   assert.equal(priceEnding({ "Price Ending": 0.95 }), 0.95);
-  assert.equal(priceEnding({ "Price Ending": 1 }), 0);
+  assert.equal(priceEnding({ "Price Ending": 10 }), 0);
   assert.equal(priceEnding({}), 0);
 
   for (const base of [PERCENTAGE_STORE, SIMPLE_STORE, FIRM_RANGE_STORE]) {
@@ -240,4 +240,27 @@ test("a custom price lands on the nearest price with the ending", async () => {
   assert.equal(nearestEnding(129.5, 0.95), 129.95);
   assert.equal(nearestEnding(99.95, 0.95), 99.95);
   assert.equal(nearestEnding(100, 0), 100);
+});
+
+test("Price Ending 9 puts whole-euro prices on a 9, and the margin still holds", async () => {
+  const { priceEnding, upToEnding, downToEnding, nearestEnding, minimumSellingPrice, maximumBuyingPrice } = await import("./storePricing.js");
+
+  assert.equal(priceEnding({ "Price Ending": 9 }), 9);
+  assert.equal(upToEnding(120, 9), 129);
+  assert.equal(upToEnding(129, 9), 129);
+  assert.equal(upToEnding(129.5, 9), 139);
+  assert.equal(downToEnding(128, 9), 119);
+  assert.equal(nearestEnding(133, 9), 129);
+  assert.equal(nearestEnding(135, 9), 139);
+
+  // Genky: every band 75 on top of the cost, rounded up to a 9.
+  const fields = { "Margin Method": "Firm Range", "Base Costs": 0, "VAT Rate": 0.21, "Price Ending": 9 };
+  for (const band of ["<75", "75–99", "100–124", "974>"]) fields[`FR ${band} Min Margin`] = 75;
+
+  for (const cost of [50, 100, 137.5, 212.5, 400]) {
+    const price = minimumSellingPrice({ buyingPrice: cost, vatType: "Margin", merchantFields: fields });
+    assert.equal(price % 10, 9, `cost ${cost} -> ${price}`);
+    assert.ok(price - cost >= 75 && price - cost < 85, `cost ${cost} -> ${price}`);
+    assert.ok(maximumBuyingPrice({ sellingPrice: price, vatType: "Margin", merchantFields: fields }) >= cost);
+  }
 });

@@ -310,12 +310,35 @@ export async function hasOtherLocations(graphql, locationId) {
  * supply the product id and the store's price for pairs we have not stocked
  * yet.
  */
-export async function readStoreState(graphql, { locationId, includeCatalogue = null, flag = null }) {
+export async function readStoreState(graphql, { locationId, includeCatalogue = null, flag = null, alsoOurs = [] }) {
   const wantCatalogue =
     includeCatalogue === null ? await hasOtherLocations(graphql, locationId) : includeCatalogue;
 
   const catalogue = wantCatalogue ? await readStoreCatalogue(graphql) : [];
   const ours = await readOurLocationStock(graphql, locationId, flag);
+
+  /*
+    A store can have a second Lojiq location: "Lojiq Plug & Play Fulfillment
+    Partner", where the supplier stock that takes five days goes (Genky,
+    20-11-2026). What sits there is ours too, so it must not count as the
+    store's own stock - or every pair we have on both would keep the price
+    the store had, and the slow pass would read the fast one as the shop's.
+  */
+  const elsewhereOurs = new Map();
+
+  for (const other of alsoOurs.filter(Boolean)) {
+    for (const row of await readOurLocationStock(graphql, other)) {
+      elsewhereOurs.set(row.variantId, (elsewhereOurs.get(row.variantId) || 0) + row.quantity);
+    }
+  }
+
+  if (elsewhereOurs.size) {
+    for (const row of [...catalogue, ...ours]) {
+      const there = elsewhereOurs.get(row.variantId) || 0;
+
+      if (there > 0) row.otherStock = Math.max(0, row.otherStock - there);
+    }
+  }
 
   return {
     rows: [...catalogue, ...ours],
