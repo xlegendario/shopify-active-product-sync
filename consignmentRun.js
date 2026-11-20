@@ -907,7 +907,8 @@ export async function runConsignmentForMerchant({
       dryRun: true,
       ...counts,
       partner: partner ? summarisePartner(partner) : undefined,
-      pricePairs: pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices }),
+      // Only the slow pass hands its pairs back, to be remembered with the main ones.
+      pricePairs: partnerPass ? pricesAfterThisRun({ listings, currentPrices, setPrices: plan.setPrices }) : undefined,
       pagesMirrored: 0,
       pricesRemembered: 0,
       pricesAdded: 0,
