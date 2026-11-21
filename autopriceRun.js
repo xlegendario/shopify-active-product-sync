@@ -7,7 +7,7 @@
  * the open prices written to Shopify as "<size> / Standard" variants
  * (standardWriter.js); for any other store nothing goes to Shopify.
  */
-import { priceSize } from "./autoprice.js";
+import { allowedSources, priceSize } from "./autoprice.js";
 import { refreshMarketPrices, readDewuFee, supabase } from "./marketPrices.js";
 import { expressOptionOn } from "./delivery.js";
 import { writeStandardVariants } from "./standardWriter.js";
@@ -40,7 +40,11 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
       of its own: AUTOPRICE_GOAT=true once the Retailed plan carries it.
     */
     const retailedKey = String(env.AUTOPRICE_GOAT || "").toLowerCase() === "true" ? env.RETAILED_API_KEY : "";
-    market = await refreshMarketPrices(skus, { db, retailedKey, dewuFee, log });
+    // A store that does not price from Dewu does not spend Dewu reads.
+    const sources = allowedSources(merchant);
+    const skipDewu = Boolean(sources && !sources.has("dewu"));
+
+    market = await refreshMarketPrices(skus, { db, retailedKey, dewuFee, skipDewu, log });
   }
 
   const observations = new Map();

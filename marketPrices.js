@@ -272,7 +272,7 @@ const HOURS = 3600000;
  * for one SKU is logged and skipped; the rest carry on.
  */
 export async function refreshMarketPrices(skus, {
-  db, retailedKey, dewuFee,
+  db, retailedKey, dewuFee, skipDewu = false,
   every = { stockx_api: 6, dewu: 24, goat: 24 },
   log = console
 } = {}) {
@@ -326,7 +326,7 @@ export async function refreshMarketPrices(skus, {
         product.api_checked_at = new Date().toISOString();
       }
 
-      if (product.dewu_spu_id && due(product.dewu_checked_at, every.dewu)) {
+      if (!skipDewu && product.dewu_spu_id && due(product.dewu_checked_at, every.dewu)) {
         note("dewu", await readDewu(product, dewuFee));
         product.dewu_checked_at = new Date().toISOString();
       }

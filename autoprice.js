@@ -19,8 +19,11 @@
  *      little dear for a while, never under water.
  *   3. Dewu only up to its ceiling: the supplier does not accept offers above
  *      it, so a dearer Dewu price is a pair we would never actually get.
- *   4. The cheapest remaining cost, with the store's margin on top.
- *   5. Up at once, down slowly. A rising cost moves the price straight away,
+ *   4. Only the sources the store allows (Merchants "Autoprice Sources";
+ *      empty is all of them), and a Dewu cost carries the store's Dewu
+ *      markup (Merchants "Autoprice Dewu Markup") before its margin.
+ *   5. The cheapest remaining cost, with the store's margin on top.
+ *   6. Up at once, down slowly. A rising cost moves the price straight away,
  *      because selling below it loses money. A falling cost is followed only
  *      a few percent a day, so one seller dumping a single pair for a day
  *      does not drag the whole shelf down with it.
@@ -30,8 +33,14 @@ import { downToEnding, minimumSellingPrice, priceEnding, upToEnding } from "./st
 export const SETTINGS = {
   // How old a read may be before it stops counting, in hours.
   maxAgeHours: { stockx_pro: 36, stockx_api: 36, dewu: 48, goat: 48 },
-  // The Dewu supplier never accepts an offer above this all-in cost.
-  dewuMaxCost: 210,
+  /*
+    The Dewu supplier never accepts an offer above this all-in cost.
+
+    CHANGED - 210, while the Outsource Engine and the partner flow stop at
+    200: a size priced on a Dewu cost of 205 could sell and then never be
+    offered to the partner (21-11-2026).
+  */
+  dewuMaxCost: 200,
   // How far a price may come down per day, as a share of the shown price.
   dropPerDay: 0.05,
   /*
@@ -48,6 +57,37 @@ export const SETTINGS = {
 };
 
 const vatTypeOf = (source, settings) => settings.vatTypeBySource?.[source] || "Margin";
+
+// Merchants "Autoprice Sources" names a platform; a cost row names a feed.
+const PLATFORM = { stockx_pro: "stockx", stockx_api: "stockx", goat: "goat", dewu: "dewu" };
+
+/*
+ * The platforms a store wants priced from. Empty is all of them - how every
+ * store priced before the field existed.
+ */
+export function allowedSources(merchantFields) {
+  const raw = merchantFields?.["Autoprice Sources"];
+  const names = (Array.isArray(raw) ? raw : String(raw || "").split(","))
+    .map((name) => String(name?.name ?? name).trim().toLowerCase())
+    .filter(Boolean);
+
+  return names.length ? new Set(names) : null;
+}
+
+/*
+ * What a store adds to a Dewu cost before its margin, in euros.
+ *
+ * Lojiq's own cut on an Asia pair. It lifts the shop price, and with it the
+ * store's Maximum Buying Price, to about this much above Dewu - the room the
+ * Outsource Engine asks for (Merchants "Asia Min Spread") before it offers
+ * the order to the partner. Kept apart from that threshold on purpose: Dewu
+ * moves between pricing and the order. Empty is none, as for UNION.
+ */
+export function dewuMarkup(merchantFields) {
+  const amount = Number(merchantFields?.["Autoprice Dewu Markup"]);
+
+  return Number.isFinite(amount) && amount > 0 ? amount : 0;
+}
 
 /*
  * StockX's public lowest ask, made into a cost we can safely sell against.
@@ -111,8 +151,10 @@ const hoursBetween = (from, to) => (new Date(to) - new Date(from)) / 3600000;
  *
  * observations: { stockx_pro: {cost, observedAt}, stockx_api: {...}, dewu: {...}, goat: {...} }
  */
-export function usableCosts(observations, { now = new Date(), settings = SETTINGS } = {}) {
+export function usableCosts(observations, { now = new Date(), settings = SETTINGS, sources = null } = {}) {
   const fresh = (source) => {
+    if (sources && !sources.has(PLATFORM[source])) return null;
+
     const row = observations?.[source];
 
     if (!row || !(Number(row.cost) > 0) || !row.observedAt) return null;
@@ -151,7 +193,8 @@ export function usableCosts(observations, { now = new Date(), settings = SETTING
  * Returns { status, source, cost, targetPrice, price, pricedAt, reason }.
  */
 export function priceSize({ observations, previous = null, merchantFields, now = new Date(), settings = SETTINGS }) {
-  const costs = usableCosts(observations, { now, settings });
+  const costs = usableCosts(observations, { now, settings, sources: allowedSources(merchantFields) });
+  const markup = dewuMarkup(merchantFields);
 
   if (!costs.length) {
     return { status: "closed", source: null, cost: null, targetPrice: null, price: null, pricedAt: null, reason: "no fresh cost" };
@@ -163,7 +206,15 @@ export function priceSize({ observations, previous = null, merchantFields, now =
     lowest selling price wins.
   */
   const priced = costs
-    .map((c) => ({ ...c, target: minimumSellingPrice({ buyingPrice: c.cost, vatType: vatTypeOf(c.source, settings), merchantFields }) }))
+    .map((c) => ({
+      ...c,
+      // The ceiling above is on what the partner is paid; the markup is ours on top.
+      target: minimumSellingPrice({
+        buyingPrice: c.source === "dewu" ? c.cost + markup : c.cost,
+        vatType: vatTypeOf(c.source, settings),
+        merchantFields
+      })
+    }))
     .filter((c) => c.target);
   const best = priced.sort((a, b) => a.target - b.target)[0] || costs[0];
   const targetPrice = best.target || null;

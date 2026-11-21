@@ -4,8 +4,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { priceSize, usableCosts, safeStockxCost, goatCost, goatEuroCost, dewuCost } from "./autoprice.js";
-import { minimumSellingPrice } from "./storePricing.js";
+import { priceSize, usableCosts, safeStockxCost, goatCost, goatEuroCost, dewuCost, allowedSources, dewuMarkup } from "./autoprice.js";
+import { minimumSellingPrice, maximumBuyingPrice } from "./storePricing.js";
 
 // UNION's Firm Range bands (CL-00031), as in Merchants on 16-11-2026.
 const UNION = {
@@ -73,19 +73,52 @@ test("the cheapest fresh source wins", () => {
   assert.equal(r.price, priceOf(160));
 });
 
-test("Dewu above 210 is a pair we would never get", () => {
+test("Dewu above 200 is a pair we would never get", () => {
   const costs = usableCosts({
     stockx_pro: { cost: 260, observedAt: hoursAgo(1) },
-    dewu: { cost: 215, observedAt: hoursAgo(1) }
+    dewu: { cost: 205, observedAt: hoursAgo(1) }
   }, { now: NOW });
 
   assert.deepEqual(costs.map((c) => c.source), ["stockx_pro"]);
 });
 
-test("Dewu at exactly 210 still counts", () => {
-  const costs = usableCosts({ dewu: { cost: 210, observedAt: hoursAgo(1) } }, { now: NOW });
+test("Dewu at exactly 200 still counts", () => {
+  const costs = usableCosts({ dewu: { cost: 200, observedAt: hoursAgo(1) } }, { now: NOW });
 
   assert.equal(costs[0].source, "dewu");
+});
+
+test("a store's sources leave the others out; empty is all of them", () => {
+  const observations = {
+    stockx_pro: { cost: 180, observedAt: hoursAgo(1) },
+    dewu: { cost: 120, observedAt: hoursAgo(1) },
+    goat: { cost: 170, observedAt: hoursAgo(1) }
+  };
+
+  assert.equal(allowedSources({}), null);
+  assert.deepEqual(usableCosts(observations, { now: NOW, sources: allowedSources({ "Autoprice Sources": ["StockX", "GOAT"] }) }).map((c) => c.source), ["goat", "stockx_pro"]);
+
+  const r = priceSize({ observations, merchantFields: { ...UNION, "Autoprice Sources": ["StockX"] }, now: NOW });
+  assert.equal(r.source, "stockx_pro");
+});
+
+test("the Dewu markup lifts the price, and the store's Max lands that far above Dewu", () => {
+  const observations = { dewu: { cost: 140, observedAt: hoursAgo(1) } };
+
+  const plain = priceSize({ observations, merchantFields: UNION, now: NOW });
+  const marked = priceSize({ observations, merchantFields: { ...UNION, "Autoprice Dewu Markup": 12.5 }, now: NOW });
+
+  assert.equal(dewuMarkup({}), 0);
+  assert.equal(plain.price, minimumSellingPrice({ buyingPrice: 140, vatType: "Margin", merchantFields: UNION }));
+  assert.equal(marked.price, minimumSellingPrice({ buyingPrice: 152.5, vatType: "Margin", merchantFields: UNION }));
+  // What we pay stays the partner's price; only the shop price carries the markup.
+  assert.equal(marked.cost, 140);
+
+  // The order's Max (the Airtable formula, margin goods: no VAT type on a
+  // Standard order) gives back at least Dewu + markup - the spread the
+  // Outsource Engine asks for.
+  const max = maximumBuyingPrice({ sellingPrice: marked.price, vatType: "Margin", merchantFields: UNION });
+  assert.ok(max >= 152.5 && max < 152.5 + 15, `max ${max}`);
 });
 
 test("the API stands in only when Pro is stale", () => {
