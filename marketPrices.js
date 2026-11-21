@@ -398,20 +398,16 @@ export async function storeProPrices({ db, sku, sizes }) {
  * StockX's sizes for the same product, whose "native" is that same US scale;
  * a size StockX does not have is left out rather than guessed.
  *
- * A GOAT price far below StockX's for the same size is almost always the
- * wrong shoe or the wrong scale (a women's or kids' ladder), so a size under
- * 60% of the StockX cost is skipped.
+ * The one check is the product: the extension only sends a product whose own
+ * sku matches exactly. No price check on top - a GOAT ask far under StockX
+ * is usually a real cheap pair in a thin size (EU 47 at 111,58 against
+ * 230,37 on StockX, 21-11-2026), which is the point of reading GOAT.
  */
 export async function storeGoatPrices({ db, sku, slug = null, sizes = [] }) {
   const at = new Date().toISOString();
   const code = clean(sku);
   const [product] = await db.select("market_products", "select=sku,stockx_sizes&sku=eq." + encodeURIComponent(code));
   const euByUs = new Map((product?.stockx_sizes || []).map((s) => [String(Number(String(s.native).replace(/[^\d.]/g, ""))), s.eu]));
-
-  const stockx = new Map();
-  for (const r of await db.select("market_prices", "select=size,source,cost&sku=eq." + encodeURIComponent(code) + "&source=in.(stockx_pro,stockx_api)")) {
-    if (!stockx.has(r.size) || r.source === "stockx_pro") stockx.set(r.size, Number(r.cost));
-  }
 
   const rows = [];
   let skipped = 0;
@@ -420,12 +416,9 @@ export async function storeGoatPrices({ db, sku, slug = null, sizes = [] }) {
     const eu = euByUs.get(String(Number(s?.us)));
     const cost = goatEuroCost(s?.cents);
 
-    if (!eu || !cost) continue;
+    if (!eu || !cost) { skipped += 1; continue; }
 
     const size = sizeKey(eu);
-    const sx = stockx.get(size);
-
-    if (sx && cost < sx * 0.6) { skipped += 1; continue; }
 
     rows.push({ sku: code, size, source: "goat", cost, raw: { us: Number(s.us), eurCents: Number(s.cents), slug }, observed_at: at });
   }
