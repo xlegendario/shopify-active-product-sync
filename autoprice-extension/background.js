@@ -26,7 +26,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = ([a, b]) => a + Math.random() * (b - a);
 
 async function settings() {
-  return chrome.storage.local.get(["server", "secret", "email", "password", "enabled", "pausedUntil", "tabId"]);
+  return chrome.storage.local.get(["server", "secret", "email", "password", "enabled", "pausedUntil", "tabId", "goatTabId"]);
 }
 
 async function status(text) {
@@ -135,6 +135,153 @@ async function readProPage() {
   }
 
   return { sizes };
+}
+
+/*
+ * Runs inside a goat.com tab: every size's lowest new ask, in euro cents.
+ *
+ * Through GOAT's own JSON endpoints, called from the goat.com tab so its
+ * cookies and Cloudflare clearance come along - the same way the Outsource
+ * Engine's price check does it since GOAT rebuilt the site (21-11-2026).
+ * GOAT serves two versions side by side: the rebuilt one (/api-web/,
+ * /api/v2/, /en-nl/product/ pages) and the older one (/web-api/). The
+ * rebuilt one is tried first; the older one only when its endpoints are not
+ * there. Search is fuzzy, so a product only counts when its own sku matches.
+ */
+async function readGoatPage(sku, storedSlug) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const compact = (v) => String(v || "").toUpperCase().replace(/[\s\-._]/g, "");
+  const matches = (a, b) => {
+    const parts = (v) => String(v || "").split("/").map(compact).filter(Boolean);
+    const right = new Set(parts(b));
+    return parts(a).some((x) => right.has(x));
+  };
+
+  for (let i = 0; i < 30; i += 1) {
+    if (!/just a moment|attention required|checking your browser/i.test(document.title) && document.readyState === "complete") break;
+    await sleep(1000);
+  }
+
+  async function request(path, init = {}) {
+    const res = await fetch(new URL(path, location.origin).toString(), {
+      credentials: "include",
+      ...init,
+      headers: { Accept: "application/json", ...(init.headers || {}) }
+    });
+    if (res.ok) return res.json();
+    const error = new Error(`GOAT ${path.split("?")[0]} answered ${res.status}`);
+    error.siteMissing = [400, 404, 405, 410, 415].includes(res.status);
+    throw error;
+  }
+
+  const ranked = (slugs) => {
+    const wanted = compact(sku);
+    const out = storedSlug ? [storedSlug] : [];
+    slugs.filter(Boolean)
+      .sort((a, b) => Number(compact(b).includes(wanted)) - Number(compact(a).includes(wanted)))
+      .forEach((slug) => { if (!out.includes(slug)) out.push(slug); });
+    return out.slice(0, 5);
+  };
+
+  async function rebuilt() {
+    const search = await request("/api/v2/consumer-search/search-suggestions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ salesChannel: 1, queryString: sku, pageLimit: 10, productLimit: 10, recordTypes: [1, 4], queries: [] })
+    });
+
+    let slug = null;
+    let pages404 = 0;
+    const candidates = ranked((search?.productItems || []).map((p) => p.slug));
+
+    for (const candidate of candidates) {
+      const page = await fetch(`/en-nl/product/${encodeURIComponent(candidate)}`, { credentials: "include" });
+      if (page.status === 404) { pages404 += 1; continue; }
+      if (!page.ok) continue;
+      const area = document.createElement("textarea");
+      area.innerHTML = ((await page.text()).match(/<title>([^<]*)<\/title>/) || [])[1] || "";
+      const parts = area.value.split("|").map((x) => x.trim());
+      if (parts.length >= 3 && matches(sku, parts[1])) { slug = candidate; break; }
+    }
+
+    if (!slug) {
+      const error = new Error("no exact GOAT product");
+      error.siteMissing = candidates.length > 0 && pages404 === candidates.length;
+      throw error;
+    }
+
+    const bar = await request(`/api-web/buy-bar/v2?productTemplateId=${encodeURIComponent(slug)}&countryCode=NL&currency=EUR`);
+    const sizes = [];
+
+    for (const o of bar?.sizeOptions || []) {
+      if (o.shoeCondition !== "new_no_defects" || o.boxCondition !== "good_condition") continue;
+      // "Buy New" is the ship-to-verify price; instant is the dearer one.
+      const prices = (o?.shippingOptions?.shipToVerify || []).map((x) => Number(x?.amount)).filter((x) => Number.isFinite(x) && x > 0);
+      if (prices.length) sizes.push({ us: Number(o?.sizeOption?.value), cents: Math.min(...prices) });
+    }
+
+    return { slug, sizes };
+  }
+
+  async function older() {
+    const search = await request(`/web-api/consumer-search/get-product-search-results?salesChannelId=1&queryString=${encodeURIComponent(sku)}&sortType=1&pageLimit=12&pageNumber=1`);
+
+    for (const candidate of ranked((search?.data?.productsList || []).map((p) => p.slug))) {
+      const template = await request(`/web-api/v1/product_templates/${encodeURIComponent(candidate)}`).catch(() => null);
+      if (!template?.id || !matches(sku, template.sku)) continue;
+
+      const asks = await request(`/web-api/v1/product_variants/buy_bar_data?productTemplateId=${encodeURIComponent(template.id)}&countryCode=NL`);
+      const sizes = (Array.isArray(asks) ? asks : [])
+        .filter((a) => a.shoeCondition === "new_no_defects" && a.boxCondition === "good_condition")
+        .map((a) => ({ us: Number(a?.sizeOption?.value), cents: Number(a?.lowestPriceCents?.amount) }))
+        .filter((a) => a.cents > 0);
+
+      return { slug: template.slug || candidate, sizes };
+    }
+
+    throw new Error("no exact GOAT product");
+  }
+
+  try {
+    return await rebuilt();
+  } catch (error) {
+    if (!error.siteMissing) return { error: error.message };
+    try { return await older(); } catch (e) { return { error: e.message }; }
+  }
+}
+
+/*
+ * GOAT for the same product, right after its Pro read. Its own tab, so the
+ * Pro tab stays where it is. A failure here never stops the Pro loop: the
+ * product just has no GOAT price until its next round.
+ */
+async function readGoatFor(s, next) {
+  let tabId = s.goatTabId;
+
+  try {
+    if (tabId) await chrome.tabs.get(tabId);
+  } catch {
+    tabId = null;
+  }
+
+  if (!tabId) {
+    const tab = await chrome.tabs.create({ url: "https://www.goat.com/en-nl", active: false });
+    tabId = tab.id;
+    await chrome.storage.local.set({ goatTabId: tabId });
+  }
+
+  await waitForComplete(tabId);
+
+  const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: readGoatPage, args: [next.sku, next.goatSlug || null] });
+
+  if (!result || result.error) {
+    await api(s, "/autoprice/goat", { sku: next.sku, slug: null, sizes: [] });
+    return `GOAT: ${result?.error || "no answer"}`;
+  }
+
+  const r = await api(s, "/autoprice/goat", { sku: next.sku, slug: result.slug, sizes: result.sizes });
+
+  return `GOAT ${r.stored} sizes`;
 }
 
 /*
@@ -252,7 +399,10 @@ async function runOnce() {
   const r = await api(s, "/autoprice/stockx-pro", { sku: next.sku, sizes: read.sizes });
 
   await chrome.storage.local.set({ pausedUntil: 0 });
-  await status(`${next.sku}: ${r.stored} sizes`);
+
+  const goat = await readGoatFor(s, next).catch((error) => `GOAT failed: ${error.message}`);
+
+  await status(`${next.sku}: ${r.stored} sizes, ${goat}`);
 }
 
 async function loop() {

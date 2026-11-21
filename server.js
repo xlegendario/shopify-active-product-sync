@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 import { runConsignmentForAll, backfillPhotosForAll } from "./consignmentRun.js";
 import { normalizeSize } from "./sizes.js";
 import { autopriceMerchant } from "./autopriceRun.js";
-import { storeProPrices, supabase as marketDb } from "./marketPrices.js";
+import { storeProPrices, storeGoatPrices, supabase as marketDb } from "./marketPrices.js";
 import { describeStore, createDescriptionWriter } from "./productDescriptions.js";
 import { photoSources } from "./storePhotos.js";
 import { fillModels, sortCollections } from "./storefrontOrder.js";
@@ -4021,12 +4021,12 @@ app.get("/autoprice/pro-next", async (req, res) => {
     const cutoff = new Date(Date.now() - minHours * 3600000).toISOString();
     const rows = await db.select(
       "market_products",
-      "select=sku,stockx_product_id,pro_checked_at&stockx_product_id=not.is.null" +
+      "select=sku,stockx_product_id,goat_slug,pro_checked_at&stockx_product_id=not.is.null" +
         "&or=(pro_checked_at.is.null,pro_checked_at.lt.%22" + encodeURIComponent(cutoff) + "%22)" +
         "&order=pro_checked_at.asc.nullsfirst&limit=1"
     );
 
-    res.json(rows[0] ? { sku: rows[0].sku, productId: rows[0].stockx_product_id } : { idle: true });
+    res.json(rows[0] ? { sku: rows[0].sku, productId: rows[0].stockx_product_id, goatSlug: rows[0].goat_slug || null } : { idle: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4039,6 +4039,18 @@ app.post("/autoprice/stockx-pro", async (req, res) => {
   try {
     const stored = await storeProPrices({ db: autopriceDb(), sku: req.body?.sku, sizes: req.body?.sizes });
     res.json({ ok: true, stored });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// What the extension read on goat.com: { sku, slug, sizes: [{ us, cents }] }.
+app.post("/autoprice/goat", async (req, res) => {
+  if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const result = await storeGoatPrices({ db: autopriceDb(), sku: req.body?.sku, slug: req.body?.slug, sizes: req.body?.sizes });
+    res.json({ ok: true, ...result });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

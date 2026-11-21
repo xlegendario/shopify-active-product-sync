@@ -82,6 +82,19 @@ export function goatCost(frUsd) {
   return Math.round((usd * GOAT_FX + GOAT_SHIPPING) * 100) / 100;
 }
 
+/*
+ * goat.com's own Dutch price, read by the autopricing extension: the lowest
+ * new ask in a good box, in euro cents, costs and taxes included as the page
+ * shows it. Plus the same flat shipping, as the Outsource Engine counts it.
+ */
+export function goatEuroCost(cents) {
+  const amount = Number(cents);
+
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  return Math.round((Math.round(amount) / 100 + GOAT_SHIPPING) * 100) / 100;
+}
+
 // Dewu's RMB price as our all-in cost, the same formula the Outsource Engine uses.
 export function dewuCost(rmb, fee) {
   const yuan = Number(rmb);

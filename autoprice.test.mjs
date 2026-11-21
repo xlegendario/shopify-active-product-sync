@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { priceSize, usableCosts, safeStockxCost, goatCost, dewuCost } from "./autoprice.js";
+import { priceSize, usableCosts, safeStockxCost, goatCost, goatEuroCost, dewuCost } from "./autoprice.js";
 import { minimumSellingPrice } from "./storePricing.js";
 
 // UNION's Firm Range bands (CL-00031), as in Merchants on 16-11-2026.
@@ -191,6 +191,9 @@ test("StockX is priced with VAT on top, so a dearer Dewu cost can still win", ()
 });
 
 test("the cost conversions", () => {
+  // goat.com NL: 119,45 for a new pair + 15 shipping (HF3713-002 US 8.5, 21-11-2026)
+  assert.equal(goatEuroCost(11945), 134.45);
+  assert.equal(goatEuroCost(0), null);
   assert.equal(goatCost(199.48), 199.52);
   assert.equal(dewuCost(1500, 35), 197.5);
   // 200 ask: 194 buy now + 15.52 fee + 10.95

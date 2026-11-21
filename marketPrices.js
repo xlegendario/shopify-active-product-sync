@@ -15,7 +15,7 @@
  */
 import { createStockxClient } from "./stockxSizes.js";
 import { normalizeSize as sizeKey } from "./sizes.js";
-import { safeStockxCost, goatCost, dewuCost } from "./autoprice.js";
+import { safeStockxCost, goatCost, goatEuroCost, dewuCost } from "./autoprice.js";
 
 const STOCKX = "https://api.stockx.com/v2/catalog";
 const RETAILED = "https://app.retailed.io/api/v1/scraper/goat";
@@ -388,4 +388,54 @@ export async function storeProPrices({ db, sku, sizes }) {
   await db.upsert("market_products", [{ sku: clean(sku), pro_checked_at: at }], "sku");
 
   return unique.length;
+}
+
+/*
+ * What the autopricing extension read on goat.com for one product.
+ *
+ * sizes: [{ us, cents }] - GOAT's own size value (the product's US scale)
+ * and the lowest new ask in a good box, in euro cents. Mapped to EU through
+ * StockX's sizes for the same product, whose "native" is that same US scale;
+ * a size StockX does not have is left out rather than guessed.
+ *
+ * A GOAT price far below StockX's for the same size is almost always the
+ * wrong shoe or the wrong scale (a women's or kids' ladder), so a size under
+ * 60% of the StockX cost is skipped.
+ */
+export async function storeGoatPrices({ db, sku, slug = null, sizes = [] }) {
+  const at = new Date().toISOString();
+  const code = clean(sku);
+  const [product] = await db.select("market_products", "select=sku,stockx_sizes&sku=eq." + encodeURIComponent(code));
+  const euByUs = new Map((product?.stockx_sizes || []).map((s) => [String(Number(String(s.native).replace(/[^\d.]/g, ""))), s.eu]));
+
+  const stockx = new Map();
+  for (const r of await db.select("market_prices", "select=size,source,cost&sku=eq." + encodeURIComponent(code) + "&source=in.(stockx_pro,stockx_api)")) {
+    if (!stockx.has(r.size) || r.source === "stockx_pro") stockx.set(r.size, Number(r.cost));
+  }
+
+  const rows = [];
+  let skipped = 0;
+
+  for (const s of Array.isArray(sizes) ? sizes : []) {
+    const eu = euByUs.get(String(Number(s?.us)));
+    const cost = goatEuroCost(s?.cents);
+
+    if (!eu || !cost) continue;
+
+    const size = sizeKey(eu);
+    const sx = stockx.get(size);
+
+    if (sx && cost < sx * 0.6) { skipped += 1; continue; }
+
+    rows.push({ sku: code, size, source: "goat", cost, raw: { us: Number(s.us), eurCents: Number(s.cents), slug }, observed_at: at });
+  }
+
+  const unique = [...new Map(rows.sort((x, y) => y.cost - x.cost).map((r) => [r.size, r])).values()];
+
+  // Like Pro: this read replaces the last one, so a sold-out size drops out.
+  if (db.remove) await db.remove("market_prices", `sku=eq.${encodeURIComponent(code)}&source=eq.goat`);
+  if (unique.length) await db.upsert("market_prices", unique, "sku,size,source");
+  await db.upsert("market_products", [{ sku: code, goat_slug: slug || null, goat_checked_at: at }], "sku");
+
+  return { stored: unique.length, skipped };
 }
