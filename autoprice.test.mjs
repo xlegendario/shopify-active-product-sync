@@ -55,6 +55,8 @@ const UNION = {
 const NOW = new Date("2026-11-16T12:00:00Z");
 const hoursAgo = (h) => new Date(NOW - h * 3600000).toISOString();
 const priceOf = (cost) => minimumSellingPrice({ buyingPrice: cost, vatType: "Margin", merchantFields: UNION });
+// A StockX cost is without VAT, so it is priced with 21% on top.
+const stockxPriceOf = (cost) => minimumSellingPrice({ buyingPrice: cost, vatType: "VAT21", merchantFields: UNION });
 
 test("the cheapest fresh source wins", () => {
   const r = priceSize({
@@ -120,8 +122,8 @@ test("a rising cost moves the price up at once", () => {
     merchantFields: UNION, now: NOW
   });
 
-  assert.equal(r.price, priceOf(250));
-  assert.ok(r.price > 250);
+  assert.equal(r.price, stockxPriceOf(250));
+  assert.ok(r.price > 250 * 1.21);
 });
 
 test("a falling cost is followed at most 5% a day", () => {
@@ -154,11 +156,11 @@ test("hourly runs still let the price come down", () => {
 test("the slow way down never goes below the margin price", () => {
   const r = priceSize({
     observations: { stockx_pro: { cost: 190, observedAt: hoursAgo(1) } },
-    previous: { status: "open", price: priceOf(190) + 40, pricedAt: hoursAgo(24 * 10) },
+    previous: { status: "open", price: stockxPriceOf(190) + 40, pricedAt: hoursAgo(24 * 10) },
     merchantFields: UNION, now: NOW
   });
 
-  assert.equal(r.price, priceOf(190));
+  assert.equal(r.price, stockxPriceOf(190));
   assert.equal(r.reason, "down");
 });
 
@@ -169,7 +171,23 @@ test("a closed size reopens at its margin price, not slowly", () => {
     merchantFields: UNION, now: NOW
   });
 
-  assert.equal(r.price, priceOf(150));
+  assert.equal(r.price, stockxPriceOf(150));
+});
+
+test("StockX is priced with VAT on top, so a dearer Dewu cost can still win", () => {
+  // HF3713-002 42 on 21-11-2026: Pro 117,28 without VAT, Dewu 132,88 margin goods.
+  const r = priceSize({
+    observations: {
+      stockx_pro: { cost: 117.28, observedAt: hoursAgo(1) },
+      dewu: { cost: 132.88, observedAt: hoursAgo(1) }
+    },
+    merchantFields: UNION, now: NOW
+  });
+
+  assert.equal(r.source, "dewu");
+  assert.equal(r.cost, 132.88);
+  assert.equal(r.price, priceOf(132.88));
+  assert.ok(priceOf(132.88) < stockxPriceOf(117.28));
 });
 
 test("the cost conversions", () => {

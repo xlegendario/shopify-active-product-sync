@@ -34,9 +34,20 @@ export const SETTINGS = {
   dewuMaxCost: 210,
   // How far a price may come down per day, as a share of the shown price.
   dropPerDay: 0.05,
-  // Sourced pairs are priced like a margin-scheme pair.
-  vatType: "Margin"
+  /*
+    How each source's cost is taxed, and so how it is priced.
+
+    CHANGED - everything used to be priced as margin goods. StockX's cost,
+    from Pro and from the API alike, is quoted without VAT: a pair bought
+    there comes with a VAT invoice and is sold with 21% VAT on the whole
+    price. Priced as margin goods it came out about a fifth too cheap
+    (HF3713-002 42 sold at 165,95 on a 117,28 cost, 21-11-2026). Dewu and
+    GOAT are bought without a VAT invoice and stay margin goods.
+  */
+  vatTypeBySource: { stockx_pro: "VAT21", stockx_api: "VAT21", dewu: "Margin", goat: "Margin" }
 };
+
+const vatTypeOf = (source, settings) => settings.vatTypeBySource?.[source] || "Margin";
 
 /*
  * StockX's public lowest ask, made into a cost we can safely sell against.
@@ -133,8 +144,16 @@ export function priceSize({ observations, previous = null, merchantFields, now =
     return { status: "closed", source: null, cost: null, targetPrice: null, price: null, pricedAt: null, reason: "no fresh cost" };
   }
 
-  const best = costs[0];
-  const targetPrice = minimumSellingPrice({ buyingPrice: best.cost, vatType: settings.vatType, merchantFields });
+  /*
+    The cheapest cost is not always the cheapest price: a StockX cost carries
+    VAT on top and a Dewu cost does not. So every source is priced, and the
+    lowest selling price wins.
+  */
+  const priced = costs
+    .map((c) => ({ ...c, target: minimumSellingPrice({ buyingPrice: c.cost, vatType: vatTypeOf(c.source, settings), merchantFields }) }))
+    .filter((c) => c.target);
+  const best = priced.sort((a, b) => a.target - b.target)[0] || costs[0];
+  const targetPrice = best.target || null;
 
   if (!targetPrice) {
     return { status: "closed", source: best.source, cost: best.cost, targetPrice: null, price: null, pricedAt: null, reason: "no margin rule" };
