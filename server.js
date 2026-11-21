@@ -6,7 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 import { runConsignmentForAll, backfillPhotosForAll } from "./consignmentRun.js";
 import { normalizeSize } from "./sizes.js";
 import { autopriceMerchant } from "./autopriceRun.js";
-import { storeProPrices, storeGoatPrices, supabase as marketDb } from "./marketPrices.js";
+import { storeProPrices, storeGoatPrices, supabase as marketDb, refreshMarketPrices, readDewuFee } from "./marketPrices.js";
 import { describeStore, createDescriptionWriter } from "./productDescriptions.js";
 import { photoSources } from "./storePhotos.js";
 import { fillModels, sortCollections } from "./storefrontOrder.js";
@@ -3947,6 +3947,18 @@ async function autopriceAlert(message) {
   }).catch(() => null);
 }
 
+async function refreshWoovinCandidatePrices() {
+  const db = marketDb({ supabaseUrl: process.env.SUPABASE_URL, supabaseKey: process.env.SUPABASE_SERVICE_ROLE_KEY });
+  const rows = await db.select("woovin_sourcing_candidates", "select=sku&order=rank.asc");
+  const skus = [...new Set(rows.map((r) => String(r.sku || "").trim().toUpperCase()).filter(Boolean))];
+
+  if (!skus.length) return { skipped: "no Woovin candidates" };
+
+  const dewuFee = await readDewuFee({ airtableToken: process.env.AIRTABLE_TOKEN, airtableBaseId: process.env.AIRTABLE_BASE_ID });
+
+  return refreshMarketPrices(skus, { db, dewuFee, log: console });
+}
+
 async function autopriceAll({ onlyClientId = "", skus = "", apply = true } = {}) {
   /*
     The switch is Price Sync? in Merchants: a store where we set the prices
@@ -4247,6 +4259,18 @@ const JOBS = {
     what: "autopricing for the stores with Price Sync? on; Standard variants on Shopify where Express Option? is on",
     run: ({ client, skus, apply } = {}) =>
       autopriceAll({ onlyClientId: client || "", skus: skus || "", apply: String(apply ?? "true") !== "false" })
+  },
+
+  woovinMarket: {
+    /*
+      Market prices for the styles the Woovin service lists without holding
+      them (woovin_sourcing_candidates, the top of Woovin's catalogue). Same
+      reader and same table as autopricing, so Dewu, StockX and GOAT are kept
+      fresh the same way; the Woovin service does the listing.
+    */
+    schedule: process.env.CRON_WOOVIN_MARKET || "50 */6 * * *",
+    what: "market prices for the styles listed on Woovin without holding them",
+    run: () => refreshWoovinCandidatePrices()
   },
 
   descriptions: {
