@@ -302,7 +302,8 @@ async function readGoatPage(sku, storedSlug) {
   };
 
   for (let i = 0; i < 30; i += 1) {
-    if (!/just a moment|attention required|checking your browser/i.test(document.title) && document.readyState === "complete") break;
+    // "interactive" is enough: the read is fetches from this origin, not the page.
+    if (!/just a moment|attention required|checking your browser/i.test(document.title) && document.readyState !== "loading") break;
     await sleep(1000);
   }
 
@@ -414,7 +415,24 @@ async function readGoatFor(s, next) {
     await chrome.storage.local.set({ goatTabId: tabId });
   }
 
-  await waitForComplete(tabId);
+  /*
+    The GOAT tab only needs to be on goat.com: the read is a few fetches from
+    that origin, not anything on the page. A tab that never reports
+    "complete" (some request on goat.com that keeps it loading) used to fail
+    every product after a 60 s wait - no GOAT price from 22-11 06:24 until
+    23-11. Now: a short wait, one reload if it is stuck or not on goat.com,
+    and the read goes ahead either way.
+  */
+  const onGoat = async () => /^https:\/\/(www\.)?goat\.com\//.test((await chrome.tabs.get(tabId)).url || "");
+
+  if (!(await onGoat())) await chrome.tabs.update(tabId, { url: "https://www.goat.com/en-nl" });
+
+  try {
+    await waitForComplete(tabId, 15000);
+  } catch {
+    await chrome.tabs.reload(tabId);
+    await waitForComplete(tabId, 15000).catch(() => null);
+  }
 
   const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: readGoatPage, args: [next.sku, next.goatSlug || null] });
 
