@@ -24,10 +24,14 @@
 const ALARM = "autoprice-tick";
 /*
  * A pause between products. It was 20-40 s when every product meant a page
- * load and four clicks; a read is now two kinds of request, so a few
- * seconds keeps the pace of a person paging through Pro, not of a script.
+ * load and four clicks; a read is now two kinds of request. 3-6 s ran a
+ * full hour on 23-11-2026 without StockX slowing us down, so 1-2 s.
+ *
+ * The server can set it per product (pauseMs from /autoprice/pro-next,
+ * AUTOPRICE_PRO_PAUSE_MS on Render), so the pace changes without a reload.
  */
-const BETWEEN_PRODUCTS_MS = [3000, 6000];
+const BETWEEN_PRODUCTS_MS = [1000, 2000];
+let pauseRange = BETWEEN_PRODUCTS_MS;
 const IDLE_WAIT_MS = 10 * 60 * 1000;
 const LOGGED_OUT_WAIT_MS = 30 * 60 * 1000;
 
@@ -525,6 +529,10 @@ async function runOnce() {
     return;
   }
 
+  pauseRange = Array.isArray(next.pauseMs) && next.pauseMs.length === 2 && next.pauseMs.every((n) => Number(n) >= 0)
+    ? next.pauseMs.map(Number)
+    : BETWEEN_PRODUCTS_MS;
+
   const url = `https://pro.stockx.com/purchasing/create/${next.productId}`;
   const apiRead = async (tabId) => {
     const [{ result }] = await chrome.scripting.executeScript({
@@ -616,7 +624,7 @@ async function loop() {
         await wait(60000);
       }
 
-      await wait(jitter(BETWEEN_PRODUCTS_MS));
+      await wait(jitter(pauseRange));
     }
   } finally {
     running = false;

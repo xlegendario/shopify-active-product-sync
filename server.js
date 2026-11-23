@@ -4038,7 +4038,18 @@ app.get("/autoprice/pro-next", async (req, res) => {
         "&order=pro_checked_at.asc.nullsfirst&limit=1"
     );
 
-    res.json(rows[0] ? { sku: rows[0].sku, productId: rows[0].stockx_product_id, goatSlug: rows[0].goat_slug || null } : { idle: true });
+    /*
+      The pause between products, in ms as "min-max" (AUTOPRICE_PRO_PAUSE_MS),
+      handed to the extension with every product so the pace can be changed
+      on Render without reloading the extension on the VPS. Empty = the
+      extension's own default.
+    */
+    const [pauseMin, pauseMax] = String(process.env.AUTOPRICE_PRO_PAUSE_MS || "").split("-").map(Number);
+    const pauseMs = pauseMin >= 0 && pauseMax >= pauseMin ? [pauseMin, pauseMax] : undefined;
+
+    res.json(rows[0]
+      ? { sku: rows[0].sku, productId: rows[0].stockx_product_id, goatSlug: rows[0].goat_slug || null, pauseMs }
+      : { idle: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
