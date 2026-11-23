@@ -5,9 +5,15 @@
  * profile, its own queue, so it can never hold up the price checks on real
  * orders. It only reads the Buy Now table; it never bids or buys.
  *
- * Loop: ask the server which product is due, open its Pro page, switch to
- * EU sizes, show all sizes, select the Buy Now column, read every row's
- * Total (incl. tax), send it back, wait, repeat.
+ * Loop: ask the server which product is due, read its sizes and their
+ * Total (incl. tax) for buying now, send it back, wait, repeat.
+ *
+ * Since 23-11-2026 the read goes through Pro's own GraphQL, from inside an
+ * open Pro page (readProApi): about a second per product instead of the
+ * clicks through EU / All Sizes / Buy Now and the table text. The Pro page
+ * stays open and is only reloaded now and then, so its login stays fresh.
+ * The clicking read (readProPage) is kept as the fallback for a page whose
+ * own data client is not there.
  *
  * When StockX shows a login page: try once to log in with the e-mail and
  * password saved in the popup, but only if a plain form appears. Anything
@@ -16,9 +22,23 @@
  */
 
 const ALARM = "autoprice-tick";
-const BETWEEN_PRODUCTS_MS = [20000, 40000];
+/*
+ * A pause between products. It was 20-40 s when every product meant a page
+ * load and four clicks; a read is now two kinds of request, so a few
+ * seconds keeps the pace of a person paging through Pro, not of a script.
+ */
+const BETWEEN_PRODUCTS_MS = [3000, 6000];
 const IDLE_WAIT_MS = 10 * 60 * 1000;
 const LOGGED_OUT_WAIT_MS = 30 * 60 * 1000;
+
+// When StockX answers "too many requests": stop for a while, then carry on.
+const THROTTLED_WAIT_MS = 20 * 60 * 1000;
+
+// The Pro page is reloaded this often, so the login behind it is renewed.
+const RELOAD_PRO_EVERY_MS = 30 * 60 * 1000;
+
+// Totals asked at the same time, per product.
+const PRICING_PARALLEL = 5;
 
 let running = false;
 
@@ -26,7 +46,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = ([a, b]) => a + Math.random() * (b - a);
 
 async function settings() {
-  return chrome.storage.local.get(["server", "secret", "email", "password", "enabled", "pausedUntil", "tabId", "goatTabId"]);
+  return chrome.storage.local.get(["server", "secret", "email", "password", "enabled", "pausedUntil", "tabId", "goatTabId", "proLoadedAt"]);
 }
 
 async function status(text) {
@@ -76,6 +96,130 @@ async function workTab(s, url) {
   await chrome.storage.local.set({ tabId: tab.id });
 
   return tab.id;
+}
+
+/*
+ * The Pro tab, if it is open on a product page, loaded and not older than
+ * RELOAD_PRO_EVERY_MS; otherwise null and the caller loads it.
+ */
+async function openProTab(s) {
+  if (!s.tabId || !s.proLoadedAt || Date.now() - s.proLoadedAt > RELOAD_PRO_EVERY_MS) return null;
+
+  try {
+    const tab = await chrome.tabs.get(s.tabId);
+
+    return tab.status === "complete" && String(tab.url || "").startsWith("https://pro.stockx.com/purchasing/create/") ? tab.id : null;
+  } catch {
+    return null;
+  }
+}
+
+/*
+ * Runs inside an open Pro page, in the page's own world: any product's sizes
+ * and totals through the GraphQL client the page itself uses
+ * (window.__APOLLO_CLIENT__), so the login, the headers and the persisted
+ * queries all come along exactly as when a person clicks.
+ *
+ *   ProductVariants  every size with its EU label and the lowest ask
+ *                    (= the Buy Now column)
+ *   PurchasePricing  what buying that ask costs in all: processing,
+ *                    shipping, VAT for a VAT-registered NL buyer
+ *                    (= the Total (incl. tax) column)
+ *
+ * The two query documents are taken from the page's own queries, which is
+ * why the page has to be a product page that has loaded once. Checked on
+ * 22-11-2026 against the table: 30 products, 472 sizes, the same totals.
+ */
+async function readProApi(productId, parallel) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  if (location.hostname.startsWith("accounts.")) return { error: "logged_out" };
+
+  let docs = window.__lojiqDocs;
+
+  for (let i = 0; i < 30 && !(docs?.variants && docs?.pricing); i += 1) {
+    const client = window.__APOLLO_CLIENT__;
+    const queries = client?.queryManager?.queries ? [...client.queryManager.queries.values()] : [];
+    const find = (name) => queries.find((q) => q.document?.definitions?.some((d) => d.name?.value === name))?.document;
+
+    // The account's VAT number as the page itself sends it (a reference, "*01").
+    const vatId = queries.map((q) => q.variables?.buyerVatId).find(Boolean);
+
+    docs = { variants: find("ProductVariants"), pricing: find("PurchasePricing"), vatId };
+
+    if (docs.variants && docs.pricing) window.__lojiqDocs = docs;
+    else await sleep(1000);
+  }
+
+  const client = window.__APOLLO_CLIENT__;
+
+  if (!client || !docs?.variants || !docs?.pricing) return { error: "not_ready" };
+
+  const classify = (error) => {
+    const status = error?.networkError?.statusCode || error?.networkError?.response?.status;
+    const text = String(error?.message || error).toLowerCase();
+
+    if (status === 401 || status === 403 || /unauthori[sz]ed|unauthenticated|forbidden|login required/.test(text)) return "logged_out";
+    if (status === 429 || /too many|rate limit/.test(text)) return "throttled";
+
+    return "failed: " + String(error?.message || error).slice(0, 150);
+  };
+
+  const ask = (query, variables) => client.query({ query, variables, fetchPolicy: "network-only" });
+
+  let variants;
+
+  try {
+    const r = await ask(docs.variants, {
+      id: productId, currency: "EUR", country: "NL", market: "NL.vat-registered",
+      skipFlexEligible: true, skipGuidance: false
+    });
+
+    variants = r?.data?.product?.variants;
+  } catch (error) {
+    return { error: classify(error) };
+  }
+
+  if (!Array.isArray(variants)) return { error: "no product" };
+
+  const rows = [];
+
+  for (const v of variants) {
+    if (v?.hidden) continue;
+
+    const standard = v?.market?.state?.askServiceLevels?.standard;
+    const buyNow = Number(standard?.lowest?.amount);
+
+    if (!(buyNow > 0)) continue;
+
+    const eu = (v?.sizeChart?.displayOptions || []).find((o) => o?.type === "eu")?.size;
+    const size = String(eu || v?.traits?.size || "").replace(/^EU\s*/i, "").trim();
+
+    if (size) rows.push({ id: v.id, size, buyNow, asks: Number(standard?.count) });
+  }
+
+  const sizes = {};
+
+  try {
+    for (let i = 0; i < rows.length; i += parallel) {
+      await Promise.all(rows.slice(i, i + parallel).map(async (row) => {
+        const r = await ask(docs.pricing, {
+          tradeContext: "buying", currencyCode: "EUR", buyerVatId: docs.vatId || "*01", skipStoredPricing: true,
+          variants: [{ amount: { currencyCode: "EUR", value: row.buyNow }, uuid: row.id, quantity: 1 }]
+        });
+
+        const total = Number(r?.data?.shippedPricing?.estimate?.total);
+
+        if (total > 0) {
+          sizes[row.size] = { total, buyNow: row.buyNow, ...(Number.isFinite(row.asks) ? { asks: row.asks } : {}) };
+        }
+      }));
+    }
+  } catch (error) {
+    return { error: classify(error) };
+  }
+
+  return { sizes };
 }
 
 /*
@@ -364,12 +508,42 @@ async function runOnce() {
   }
 
   const url = `https://pro.stockx.com/purchasing/create/${next.productId}`;
-  const tabId = await workTab(s, url);
+  const apiRead = async (tabId) => {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId }, world: "MAIN", func: readProApi, args: [next.productId, PRICING_PARALLEL]
+    });
 
-  await waitForComplete(tabId);
+    return result || { error: "not_ready" };
+  };
 
-  const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: readProPage });
-  let read = result;
+  /*
+    The open Pro page is used as it is while it is fresh: no page load per
+    product. A stale, missing or broken page is loaded again - on this
+    product, so the clicking read can take over when the API read cannot.
+  */
+  let tabId = await openProTab(s);
+  let read = tabId ? await apiRead(tabId) : null;
+
+  // A failed read never counts: an empty read would wipe the product's prices.
+  if (!read || (read.error && !["throttled", "no product"].includes(read.error))) {
+    tabId = await workTab(s, url);
+    await waitForComplete(tabId);
+    await chrome.storage.local.set({ proLoadedAt: Date.now() });
+
+    read = await apiRead(tabId);
+
+    if (read.error === "not_ready" || String(read.error).startsWith("failed")) {
+      const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: readProPage });
+      read = result;
+    }
+  }
+
+  if (read?.error === "throttled") {
+    await chrome.storage.local.set({ pausedUntil: Date.now() + THROTTLED_WAIT_MS });
+    await status("StockX asked us to slow down - waiting 20 minutes");
+    await alert(s, "StockX Pro answered 'too many requests' to the autopricing reader. It waits 20 minutes and carries on; if this repeats, the pace in the extension is too high.");
+    return;
+  }
 
   if (read?.error === "logged_out") {
     read = await handleLoggedOut(s, tabId, url);
