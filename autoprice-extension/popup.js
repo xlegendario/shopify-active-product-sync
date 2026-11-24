@@ -2,10 +2,10 @@ const $ = (id) => document.getElementById(id);
 const fields = ["server", "secret", "email", "password"];
 
 async function render() {
-  const s = await chrome.storage.local.get([...fields, "enabled", "lastStatus"]);
-  for (const f of fields) $(f).value = s[f] || "";
+  const s = await chrome.storage.local.get([...fields, "enabled", "lastStatus", "goatStatus"]);
+  for (const f of fields) if (document.activeElement !== $(f)) $(f).value = s[f] || "";
   $("toggle").textContent = s.enabled ? "Stop" : "Start";
-  $("status").textContent = s.lastStatus || "";
+  $("status").textContent = [s.lastStatus, s.goatStatus && "GOAT: " + s.goatStatus].filter(Boolean).join("\n");
 }
 
 $("save").onclick = async () => {

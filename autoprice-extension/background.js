@@ -5,8 +5,9 @@
  * profile, its own queue, so it can never hold up the price checks on real
  * orders. It only reads the Buy Now table; it never bids or buys.
  *
- * Loop: ask the server which product is due, read its sizes and their
- * Total (incl. tax) for buying now, send it back, wait, repeat.
+ * Loop: ask the server which products are due (a batch since v1.3), read
+ * their sizes and Total (incl. tax) for buying now, send them back, repeat.
+ * GOAT is read by a second loop next to it, with its own queue.
  *
  * Since 23-11-2026 the read goes through Pro's own GraphQL, from inside an
  * open Pro page (readProApi): about a second per product instead of the
@@ -44,7 +45,16 @@ const RELOAD_PRO_EVERY_MS = 30 * 60 * 1000;
 // Totals asked at the same time, per product.
 const PRICING_PARALLEL = 5;
 
-let running = false;
+/*
+ * v1.3: products are handed out in batches, and GOAT runs as its own loop in
+ * its own tab instead of after every Pro read. GOAT's pause is its own too
+ * (AUTOPRICE_GOAT_PAUSE_MS on Render); until that is set, 2-4 s, which is
+ * about the pace GOAT had riding along with Pro.
+ */
+const PRO_BATCH = 20;
+const GOAT_BATCH = 20;
+const GOAT_BETWEEN_MS = [2000, 4000];
+let goatPauseRange = GOAT_BETWEEN_MS;
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = ([a, b]) => a + Math.random() * (b - a);
@@ -305,11 +315,16 @@ async function readGoatPage(sku, storedSlug) {
     return parts(a).some((x) => right.has(x));
   };
 
+  const challenged = () => /just a moment|attention required|checking your browser/i.test(document.title);
+
   for (let i = 0; i < 30; i += 1) {
     // "interactive" is enough: the read is fetches from this origin, not the page.
-    if (!/just a moment|attention required|checking your browser/i.test(document.title) && document.readyState !== "loading") break;
+    if (!challenged() && document.readyState !== "loading") break;
     await sleep(1000);
   }
+
+  // Cloudflare still checking after half a minute: GOAT wants us to slow down.
+  if (challenged()) return { error: "Cloudflare check on goat.com", throttled: true };
 
   async function request(path, init = {}) {
     const res = await fetch(new URL(path, location.origin).toString(), {
@@ -320,8 +335,20 @@ async function readGoatPage(sku, storedSlug) {
     if (res.ok) return res.json();
     const error = new Error(`GOAT ${path.split("?")[0]} answered ${res.status}`);
     error.siteMissing = [400, 404, 405, 410, 415].includes(res.status);
+    error.throttled = [403, 429].includes(res.status);
     throw error;
   }
+
+  /*
+    Three kinds of no: the product is not on GOAT (its prices are cleared,
+    as before), GOAT is slowing us down (the GOAT loop pauses), or something
+    else went wrong (the old prices stay and the product goes to the back).
+  */
+  const failure = (error) => ({
+    error: error.message,
+    notFound: /no exact GOAT product/.test(error.message),
+    throttled: Boolean(error.throttled)
+  });
 
   const ranked = (slugs) => {
     const wanted = compact(sku);
@@ -394,17 +421,17 @@ async function readGoatPage(sku, storedSlug) {
   try {
     return await rebuilt();
   } catch (error) {
-    if (!error.siteMissing) return { error: error.message };
-    try { return await older(); } catch (e) { return { error: e.message }; }
+    if (!error.siteMissing) return failure(error);
+    try { return await older(); } catch (e) { return failure(e); }
   }
 }
 
 /*
- * GOAT for the same product, right after its Pro read. Its own tab, so the
- * Pro tab stays where it is. A failure here never stops the Pro loop: the
- * product just has no GOAT price until its next round.
+ * The goat.com tab, made or put back on goat.com when needed. Checked once
+ * per batch rather than per product: the read is fetches from that origin,
+ * so the tab only has to be there.
  */
-async function readGoatFor(s, next) {
+async function goatTab(s) {
   let tabId = s.goatTabId;
 
   try {
@@ -438,16 +465,7 @@ async function readGoatFor(s, next) {
     await waitForComplete(tabId, 15000).catch(() => null);
   }
 
-  const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: readGoatPage, args: [next.sku, next.goatSlug || null] });
-
-  if (!result || result.error) {
-    await api(s, "/autoprice/goat", { sku: next.sku, slug: null, sizes: [] });
-    return `GOAT: ${result?.error || "no answer"}`;
-  }
-
-  const r = await api(s, "/autoprice/goat", { sku: next.sku, slug: result.slug, sizes: result.sizes });
-
-  return `GOAT ${r.stored} sizes`;
+  return tabId;
 }
 
 /*
@@ -515,28 +533,17 @@ async function handleLoggedOut(s, tabId, productUrl) {
   return null;
 }
 
-async function runOnce() {
+/*
+ * One Pro read for one product. Returns what to post, or stop: true when the
+ * Pro loop has to pause (throttled, logged out, page did not open) - the
+ * pause and the alert are set here.
+ */
+async function readPro(item) {
   const s = await settings();
-
-  if (!s.enabled || !s.server || !s.secret) return;
-  if (s.pausedUntil && Date.now() < s.pausedUntil) return;
-
-  const next = await api(s, "/autoprice/pro-next");
-
-  if (next.idle) {
-    await chrome.storage.local.set({ pausedUntil: Date.now() + IDLE_WAIT_MS });
-    await status("nothing due");
-    return;
-  }
-
-  pauseRange = Array.isArray(next.pauseMs) && next.pauseMs.length === 2 && next.pauseMs.every((n) => Number(n) >= 0)
-    ? next.pauseMs.map(Number)
-    : BETWEEN_PRODUCTS_MS;
-
-  const url = `https://pro.stockx.com/purchasing/create/${next.productId}`;
+  const url = `https://pro.stockx.com/purchasing/create/${item.productId}`;
   const apiRead = async (tabId) => {
     const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId }, world: "MAIN", func: readProApi, args: [next.productId, PRICING_PARALLEL]
+      target: { tabId }, world: "MAIN", func: readProApi, args: [item.productId, PRICING_PARALLEL]
     });
 
     return result || { error: "not_ready" };
@@ -550,7 +557,6 @@ async function runOnce() {
   let tabId = await openProTab(s);
   let read = tabId ? await apiRead(tabId) : null;
 
-  // A failed read never counts: an empty read would wipe the product's prices.
   if (!read || (read.error && !["throttled", "no product"].includes(read.error))) {
     tabId = await workTab(s, url);
     await waitForComplete(tabId);
@@ -567,13 +573,13 @@ async function runOnce() {
   if (read?.error === "throttled") {
     await chrome.storage.local.set({ pausedUntil: Date.now() + THROTTLED_WAIT_MS });
     await status("StockX asked us to slow down - waiting 20 minutes");
-    await alert(s, "StockX Pro answered 'too many requests' to the autopricing reader. It waits 20 minutes and carries on; if this repeats, the pace in the extension is too high.");
-    return;
+    await alert(s, "StockX Pro answered 'too many requests' to the autopricing reader. It waits 20 minutes and carries on; if this repeats, the pace (AUTOPRICE_PRO_PAUSE_MS on Render) is too high.");
+    return { stop: true };
   }
 
   if (read?.error === "logged_out") {
     read = await handleLoggedOut(s, tabId, url);
-    if (!read) return;
+    if (!read) return { stop: true };
   }
 
   /*
@@ -586,54 +592,180 @@ async function runOnce() {
     await chrome.storage.local.set({ pausedUntil: Date.now() + LOGGED_OUT_WAIT_MS });
     await status("StockX Pro did not open - logged out? Log in, then press Start");
     await alert(s, "StockX Pro did not open on the VPS (logged out?). Log in once in the autopricing Chrome profile and press Start in the extension.");
-    return;
+    return { stop: true };
   }
 
+  /*
+    No such product, or no table: an empty read, which clears its Pro prices.
+    Anything else that went wrong keeps the old prices (failed: true); the
+    product only goes to the back of the queue.
+  */
   if (read?.error) {
-    await status(`${next.sku}: ${read.error}`);
-    // The page was there but had no table: marked as read so it does not block the queue.
-    await api(s, "/autoprice/stockx-pro", { sku: next.sku, sizes: {} });
-    return;
+    const empty = read.error === "no product" || read.error === "no price table";
+
+    return { error: read.error, body: empty ? { sku: item.sku, sizes: {} } : { sku: item.sku, failed: true } };
   }
 
-  const r = await api(s, "/autoprice/stockx-pro", { sku: next.sku, sizes: read.sizes });
-
-  await chrome.storage.local.set({ pausedUntil: 0 });
-
-  const goat = await readGoatFor(s, next).catch((error) => `GOAT failed: ${error.message}`);
-
-  await status(`${next.sku}: ${r.stored} sizes, ${goat}`);
+  return { body: { sku: item.sku, sizes: read.sizes } };
 }
 
-async function loop() {
-  if (running) return;
+/*
+ * A batch of Pro reads. Posts go out without waiting, so the next read can
+ * start; the batch ends by waiting for all of them, and only then is the next
+ * batch asked for - so the server never hands out a product whose answer is
+ * still on its way.
+ */
+async function proBatch() {
+  const s = await settings();
+  const next = await api(s, `/autoprice/pro-next?n=${PRO_BATCH}`);
 
-  running = true;
+  if (next.idle || !next.items?.length) {
+    await chrome.storage.local.set({ pausedUntil: Date.now() + IDLE_WAIT_MS });
+    await status("Pro: nothing due");
+    return;
+  }
+
+  pauseRange = validPause(next.pauseMs) || BETWEEN_PRODUCTS_MS;
+
+  const started = Date.now();
+  const pending = [];
+  const tally = { read: 0, sizes: 0, errors: 0, postFailed: 0 };
 
   try {
-    for (;;) {
-      const s = await settings();
+    for (const item of next.items) {
+      const { stop, body, error } = await readPro(item);
 
-      if (!s.enabled) break;
-      if (s.pausedUntil && Date.now() < s.pausedUntil) break;
+      if (stop) break;
 
-      try {
-        await runOnce();
-      } catch (error) {
-        await status("error: " + error.message);
-        await wait(60000);
-      }
+      tally.read += 1;
+      if (error) tally.errors += 1;
+
+      pending.push(
+        api(s, "/autoprice/stockx-pro", body)
+          .then((r) => { tally.sizes += Number(r?.stored) || 0; })
+          .catch(() => { tally.postFailed += 1; })
+      );
 
       await wait(jitter(pauseRange));
     }
   } finally {
-    running = false;
+    await Promise.all(pending);
   }
+
+  const perProduct = tally.read ? ((Date.now() - started) / tally.read / 1000).toFixed(1) : "-";
+
+  await status(`Pro: ${tally.read} products, ${tally.sizes} sizes, ${perProduct} s each` +
+    (tally.errors ? `, ${tally.errors} read errors` : "") + (tally.postFailed ? `, ${tally.postFailed} posts failed` : ""));
+}
+
+/*
+ * A batch of GOAT reads, in the GOAT tab, next to the Pro loop. A product
+ * not on GOAT is posted empty (its GOAT prices go), a failed read keeps the
+ * old prices, and a GOAT that slows us down pauses only this loop.
+ */
+async function goatBatch() {
+  const s = await settings();
+  const next = await api(s, `/autoprice/goat-next?n=${GOAT_BATCH}`);
+
+  if (next.idle || !next.items?.length) {
+    await chrome.storage.local.set({ goatPausedUntil: Date.now() + IDLE_WAIT_MS });
+    await goatStatus("nothing due");
+    return;
+  }
+
+  goatPauseRange = validPause(next.pauseMs) || GOAT_BETWEEN_MS;
+
+  const tabId = await goatTab(s);
+  const started = Date.now();
+  const pending = [];
+  const tally = { read: 0, sizes: 0, notFound: 0, errors: 0, postFailed: 0 };
+
+  try {
+    for (const item of next.items) {
+      const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: readGoatPage, args: [item.sku, item.goatSlug || null] });
+
+      if (result?.throttled) {
+        await chrome.storage.local.set({ goatPausedUntil: Date.now() + THROTTLED_WAIT_MS });
+        await goatStatus(`GOAT asked us to slow down (${result.error}) - waiting 20 minutes`);
+        await alert(s, `goat.com is slowing the autopricing reader down (${result.error}). The GOAT reads wait 20 minutes; if this repeats, raise AUTOPRICE_GOAT_PAUSE_MS on Render.`);
+        break;
+      }
+
+      let body;
+
+      if (result && !result.error) body = { sku: item.sku, slug: result.slug, sizes: result.sizes };
+      else if (result?.notFound) { body = { sku: item.sku, slug: null, sizes: [] }; tally.notFound += 1; }
+      else { body = { sku: item.sku, failed: true }; tally.errors += 1; }
+
+      tally.read += 1;
+
+      pending.push(
+        api(s, "/autoprice/goat", body)
+          .then((r) => { tally.sizes += Number(r?.stored) || 0; })
+          .catch(() => { tally.postFailed += 1; })
+      );
+
+      await wait(jitter(goatPauseRange));
+    }
+  } finally {
+    await Promise.all(pending);
+  }
+
+  const perProduct = tally.read ? ((Date.now() - started) / tally.read / 1000).toFixed(1) : "-";
+
+  await goatStatus(`${tally.read} products, ${tally.sizes} sizes, ${perProduct} s each` +
+    (tally.notFound ? `, ${tally.notFound} not on GOAT` : "") + (tally.errors ? `, ${tally.errors} errors` : "") +
+    (tally.postFailed ? `, ${tally.postFailed} posts failed` : ""));
+}
+
+function validPause(range) {
+  return Array.isArray(range) && range.length === 2 && range.every((n) => Number(n) >= 0) ? range.map(Number) : null;
+}
+
+async function goatStatus(text) {
+  await chrome.storage.local.set({ goatStatus: new Date().toLocaleTimeString() + " " + text });
+}
+
+/*
+ * Two loops side by side, each with its own pause: a GOAT problem never
+ * stops the Pro reads, and a logged-out Pro never stops GOAT.
+ */
+const loops = { pro: false, goat: false };
+
+async function runLoop(name, pausedKey, batch, onError) {
+  if (loops[name]) return;
+
+  loops[name] = true;
+
+  try {
+    for (;;) {
+      const s = await chrome.storage.local.get(["enabled", "server", "secret", pausedKey]);
+
+      if (!s.enabled || !s.server || !s.secret) break;
+      if (s[pausedKey] && Date.now() < s[pausedKey]) break;
+
+      try {
+        await batch();
+      } catch (error) {
+        await onError("error: " + error.message);
+        await wait(60000);
+      }
+    }
+  } finally {
+    loops[name] = false;
+  }
+}
+
+function loop() {
+  runLoop("pro", "pausedUntil", proBatch, status);
+  runLoop("goat", "goatPausedUntil", goatBatch, goatStatus);
 }
 
 // The alarm wakes the service worker again after Chrome put it to sleep.
 chrome.alarms.create(ALARM, { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((a) => { if (a.name === ALARM) loop(); });
-chrome.runtime.onMessage.addListener((m) => { if (m?.type === "kick") { chrome.storage.local.set({ pausedUntil: 0 }); loop(); } });
+chrome.runtime.onMessage.addListener((m) => {
+  if (m?.type === "kick") chrome.storage.local.set({ pausedUntil: 0, goatPausedUntil: 0 }).then(loop);
+});
 chrome.runtime.onStartup.addListener(loop);
 chrome.runtime.onInstalled.addListener(loop);

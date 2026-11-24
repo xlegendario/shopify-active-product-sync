@@ -4019,60 +4019,119 @@ function autopriceAuthorized(req) {
 }
 
 /*
- * The extension asks which product to read next on StockX Pro.
+ * A pause range in ms from an env value "min-max", handed to the extension
+ * with its work so the pace can be changed on Render without reloading the
+ * extension on the VPS. Empty or malformed = the extension's own default.
+ */
+function pauseFromEnv(name) {
+  const [min, max] = String(process.env[name] || "").split("-").map(Number);
+
+  return min >= 0 && max >= min ? [min, max] : undefined;
+}
+
+// How many products one request may hand out; the extension asks for ?n=.
+function batchSize(req) {
+  const n = Math.floor(Number(req.query?.n));
+
+  return n >= 1 ? Math.min(n, 50) : null;
+}
+
+/*
+ * The extension asks which products to read next on StockX Pro.
  *
- * Longest-unread first, over every style an autopricing store has on its
- * shelf. Answers one product at a time so the browser keeps its own pace.
+ * Longest-unread first, over every style in market_products. Without ?n= it
+ * answers one product in the old shape, for extensions before v1.3. With
+ * ?n= it hands out a batch: the extension reads them one by one, posts as
+ * it goes and asks again only when every post of the batch has landed, so
+ * no product is handed out twice.
  */
 app.get("/autoprice/pro-next", async (req, res) => {
   if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
 
   try {
     const db = autopriceDb();
+    const n = batchSize(req);
     const minHours = Number(process.env.AUTOPRICE_PRO_EVERY_HOURS || 20);
     const cutoff = new Date(Date.now() - minHours * 3600000).toISOString();
     const rows = await db.select(
       "market_products",
       "select=sku,stockx_product_id,goat_slug,pro_checked_at&stockx_product_id=not.is.null" +
         "&or=(pro_checked_at.is.null,pro_checked_at.lt.%22" + encodeURIComponent(cutoff) + "%22)" +
-        "&order=pro_checked_at.asc.nullsfirst&limit=1"
+        "&order=pro_checked_at.asc.nullsfirst&limit=" + (n || 1)
     );
 
-    /*
-      The pause between products, in ms as "min-max" (AUTOPRICE_PRO_PAUSE_MS),
-      handed to the extension with every product so the pace can be changed
-      on Render without reloading the extension on the VPS. Empty = the
-      extension's own default.
-    */
-    const [pauseMin, pauseMax] = String(process.env.AUTOPRICE_PRO_PAUSE_MS || "").split("-").map(Number);
-    const pauseMs = pauseMin >= 0 && pauseMax >= pauseMin ? [pauseMin, pauseMax] : undefined;
+    const pauseMs = pauseFromEnv("AUTOPRICE_PRO_PAUSE_MS");
 
-    res.json(rows[0]
-      ? { sku: rows[0].sku, productId: rows[0].stockx_product_id, goatSlug: rows[0].goat_slug || null, pauseMs }
+    if (!rows.length) return res.json({ idle: true });
+
+    if (!n) {
+      return res.json({ sku: rows[0].sku, productId: rows[0].stockx_product_id, goatSlug: rows[0].goat_slug || null, pauseMs });
+    }
+
+    res.json({ items: rows.map((r) => ({ sku: r.sku, productId: r.stockx_product_id })), pauseMs });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/*
+ * The extension asks which products to read next on goat.com.
+ *
+ * Its own queue since v1.3, run next to the Pro reads instead of after each
+ * one: GOAT is a source for every store and for Woovin, so it is never
+ * skipped, it just no longer holds the Pro reads up. Only products with a
+ * StockX size list, since GOAT's US sizes are turned into EU through it.
+ * How often: AUTOPRICE_GOAT_EVERY_HOURS, else the same as Pro.
+ */
+app.get("/autoprice/goat-next", async (req, res) => {
+  if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const db = autopriceDb();
+    const n = batchSize(req) || 1;
+    const minHours = Number(process.env.AUTOPRICE_GOAT_EVERY_HOURS || process.env.AUTOPRICE_PRO_EVERY_HOURS || 20);
+    const cutoff = new Date(Date.now() - minHours * 3600000).toISOString();
+    const rows = await db.select(
+      "market_products",
+      "select=sku,goat_slug,goat_checked_at&stockx_sizes=not.is.null" +
+        "&or=(goat_checked_at.is.null,goat_checked_at.lt.%22" + encodeURIComponent(cutoff) + "%22)" +
+        "&order=goat_checked_at.asc.nullsfirst&limit=" + n
+    );
+
+    res.json(rows.length
+      ? { items: rows.map((r) => ({ sku: r.sku, goatSlug: r.goat_slug || null })), pauseMs: pauseFromEnv("AUTOPRICE_GOAT_PAUSE_MS") }
       : { idle: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// What the extension read: { sku, sizes: { "42.5": { total, buyNow, asks } } }.
+/*
+ * What the extension read: { sku, sizes: { "42.5": { total, buyNow, asks } } }.
+ * { sku, failed: true } is a read that went wrong: old prices stay.
+ */
 app.post("/autoprice/stockx-pro", async (req, res) => {
   if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
 
   try {
-    const stored = await storeProPrices({ db: autopriceDb(), sku: req.body?.sku, sizes: req.body?.sizes });
+    const stored = await storeProPrices({ db: autopriceDb(), sku: req.body?.sku, sizes: req.body?.sizes, failed: req.body?.failed === true });
     res.json({ ok: true, stored });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// What the extension read on goat.com: { sku, slug, sizes: [{ us, cents }] }.
+/*
+ * What the extension read on goat.com: { sku, slug, sizes: [{ us, cents }] }.
+ * Empty sizes = not on GOAT; { sku, failed: true } = the read went wrong.
+ */
 app.post("/autoprice/goat", async (req, res) => {
   if (!autopriceAuthorized(req)) return res.status(401).json({ error: "Unauthorized" });
 
   try {
-    const result = await storeGoatPrices({ db: autopriceDb(), sku: req.body?.sku, slug: req.body?.slug, sizes: req.body?.sizes });
+    const result = await storeGoatPrices({
+      db: autopriceDb(), sku: req.body?.sku, slug: req.body?.slug, sizes: req.body?.sizes, failed: req.body?.failed === true
+    });
     res.json({ ok: true, ...result });
   } catch (error) {
     res.status(500).json({ error: error.message });

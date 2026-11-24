@@ -361,8 +361,20 @@ export async function refreshMarketPrices(skus, {
  *
  * sizes: { "42.5": { total, buyNow, asks } } - EU sizes, Total incl. tax.
  */
-export async function storeProPrices({ db, sku, sizes }) {
+export async function storeProPrices({ db, sku, sizes, failed = false }) {
   const at = new Date().toISOString();
+
+  /*
+    A read that went wrong (a timeout, a 500 from StockX) is not an empty
+    read: the prices it would have replaced are still the best we know. The
+    product only moves to the back of the queue, so one bad product cannot
+    hold the queue up, and its old prices age out by the freshness rule.
+  */
+  if (failed) {
+    await db.upsert("market_products", [{ sku: clean(sku), pro_checked_at: at }], "sku");
+    return 0;
+  }
+
   /*
     Only sizes with a Buy Now. Without one the table still shows a Total,
     but that is the total on a bid - nothing anyone is selling - so a size
@@ -403,9 +415,15 @@ export async function storeProPrices({ db, sku, sizes }) {
  * is usually a real cheap pair in a thin size (EU 47 at 111,58 against
  * 230,37 on StockX, 21-11-2026), which is the point of reading GOAT.
  */
-export async function storeGoatPrices({ db, sku, slug = null, sizes = [] }) {
+export async function storeGoatPrices({ db, sku, slug = null, sizes = [], failed = false }) {
   const at = new Date().toISOString();
   const code = clean(sku);
+
+  // As for Pro: a failed read keeps the old prices and only moves the product back.
+  if (failed) {
+    await db.upsert("market_products", [{ sku: code, goat_checked_at: at }], "sku");
+    return { stored: 0, skipped: 0, failed: true };
+  }
   const [product] = await db.select("market_products", "select=sku,stockx_sizes&sku=eq." + encodeURIComponent(code));
   const euByUs = new Map((product?.stockx_sizes || []).map((s) => [String(Number(String(s.native).replace(/[^\d.]/g, ""))), s.eu]));
 

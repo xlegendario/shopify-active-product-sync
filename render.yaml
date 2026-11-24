@@ -82,8 +82,16 @@ services:
       - key: CRON_AUTOPRICE
         value: '20 */6 * * *'
       # Hoe vaak de extensie een product op StockX Pro opnieuw leest.
+      # 4 tijdens de snelheidstest (24-11-2026), daarna wat nodig is.
       - key: AUTOPRICE_PRO_EVERY_HOURS
-        value: '20'
+        value: '4'
+      # Sinds extensie v1.3 leest GOAT in een eigen lus. Hoe vaak (leeg =
+      # zelfde als Pro) en de pauze tussen producten in ms "min-max" (leeg =
+      # 2000-4000). AUTOPRICE_PRO_PAUSE_MS werkt zoals voorheen.
+      - key: AUTOPRICE_GOAT_EVERY_HOURS
+        sync: false
+      - key: AUTOPRICE_GOAT_PAUSE_MS
+        sync: false
       # Gedeeld geheim met de autopricing-extensie op de VPS.
       - key: AUTOPRICE_SECRET
         sync: false
