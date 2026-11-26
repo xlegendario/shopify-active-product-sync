@@ -71,13 +71,32 @@ async function api(s, path, body) {
   const res = await fetch(s.server.replace(/\/+$/, "") + path, {
     method: body ? "POST" : "GET",
     headers: { "Content-Type": "application/json", "x-autoprice-secret": s.secret },
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
+    // A request that never answers would hang its loop for good.
+    signal: AbortSignal.timeout(60000)
   });
 
   if (!res.ok) throw new Error(`server ${res.status} on ${path}`);
 
   return res.json();
 }
+
+/*
+ * A step that may never come back - a script in a frozen or discarded tab
+ * does not fail, it just never answers. GOAT stood still from 26-11 00:28
+ * that way, with no error and no alert, until the browser was touched.
+ */
+function withTimeout(promise, ms, what) {
+  let timer;
+
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(what + " did not answer in " + Math.round(ms / 1000) + " s")), ms); })
+  ]).finally(() => clearTimeout(timer));
+}
+
+// The longest a whole batch of 20 may take before its loop starts over.
+const BATCH_LIMIT_MS = 15 * 60 * 1000;
 
 async function alert(s, message) {
   await api(s, "/autoprice/alert", { message }).catch(() => null);
@@ -682,7 +701,19 @@ async function goatBatch() {
 
   try {
     for (const item of next.items) {
-      const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: readGoatPage, args: [item.sku, item.goatSlug || null] });
+      let result;
+
+      try {
+        [{ result }] = await withTimeout(
+          chrome.scripting.executeScript({ target: { tabId }, func: readGoatPage, args: [item.sku, item.goatSlug || null] }),
+          45000, "GOAT read"
+        );
+      } catch (error) {
+        // A stuck GOAT tab: close it, the next batch opens a fresh one.
+        await chrome.tabs.remove(tabId).catch(() => null);
+        await chrome.storage.local.set({ goatTabId: null });
+        throw error;
+      }
 
       if (result?.throttled) {
         await chrome.storage.local.set({ goatPausedUntil: Date.now() + THROTTLED_WAIT_MS });
@@ -745,7 +776,7 @@ async function runLoop(name, pausedKey, batch, onError) {
       if (s[pausedKey] && Date.now() < s[pausedKey]) break;
 
       try {
-        await batch();
+        await withTimeout(batch(), BATCH_LIMIT_MS, name + " batch");
       } catch (error) {
         await onError("error: " + error.message);
         await wait(60000);
