@@ -28,7 +28,7 @@
  *      a few percent a day, so one seller dumping a single pair for a day
  *      does not drag the whole shelf down with it.
  */
-import { downToEnding, minimumSellingPrice, priceEnding, upToEnding } from "./storePricing.js";
+import { downToEnding, minimumSellingPrice, priceEnding, storeVatRate, upToEnding } from "./storePricing.js";
 
 export const SETTINGS = {
   // How old a read may be before it stops counting, in hours.
@@ -57,6 +57,49 @@ export const SETTINGS = {
 };
 
 const vatTypeOf = (source, settings) => settings.vatTypeBySource?.[source] || "Margin";
+
+/*
+ * The store's own autopricing margins (autoprice_settings.margin_bands).
+ *
+ * Separate from the Firm Range in Merchants on purpose (Dario, 26-11-2026):
+ * Merchants is what a store earns when we deliver - the order limit - and the
+ * store cannot change it. These bands are how the store builds its selling
+ * price, it sets them itself in the portal, and they may well be lower.
+ *
+ * A band is { from, margin }: from a basis of `from` euros upwards, add
+ * `margin`. The basis is what a pair really costs us: a StockX cost with VAT
+ * on top, GOAT and Dewu as margin goods as they stand. Bands are picked on
+ * that basis, not on the selling price as the Merchants Firm Range is.
+ */
+export function readOwnBands(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+
+  return list
+    .map((b) => ({ from: Number(b?.from), margin: Number(b?.margin) }))
+    .filter((b) => Number.isFinite(b.from) && b.from >= 0 && Number.isFinite(b.margin) && b.margin >= 0)
+    .sort((a, b) => a.from - b.from);
+}
+
+export function costBasis({ cost, source, merchantFields, settings = SETTINGS }) {
+  const paid = Number(cost);
+
+  if (!Number.isFinite(paid) || paid <= 0) return null;
+  if (vatTypeOf(source, settings) !== "VAT21") return paid;
+
+  // No VAT rate in Merchants: the Dutch 21%, the only rate a store has today.
+  const rate = storeVatRate(merchantFields) ?? 0.21;
+
+  return Math.round(paid * (1 + rate) * 100) / 100;
+}
+
+export function ownBandPrice({ basis, bands, merchantFields }) {
+  if (!(basis > 0) || !bands?.length) return null;
+
+  // The last band that starts at or below the basis; below the first band, the first.
+  const band = [...bands].reverse().find((b) => basis >= b.from) || bands[0];
+
+  return upToEnding(basis + band.margin, priceEnding(merchantFields));
+}
 
 // Merchants "Autoprice Sources" names a platform; a cost row names a feed.
 const PLATFORM = { stockx_pro: "stockx", stockx_api: "stockx", goat: "goat", dewu: "dewu" };
@@ -192,12 +235,12 @@ export function usableCosts(observations, { now = new Date(), settings = SETTING
  *
  * Returns { status, source, cost, targetPrice, price, pricedAt, reason }.
  */
-export function priceSize({ observations, previous = null, merchantFields, now = new Date(), settings = SETTINGS }) {
+export function priceSize({ observations, previous = null, merchantFields, ownBands = null, now = new Date(), settings = SETTINGS }) {
   const costs = usableCosts(observations, { now, settings, sources: allowedSources(merchantFields) });
   const markup = dewuMarkup(merchantFields);
 
   if (!costs.length) {
-    return { status: "closed", source: null, cost: null, targetPrice: null, price: null, pricedAt: null, reason: "no fresh cost" };
+    return { status: "closed", source: null, cost: null, basis: null, targetPrice: null, price: null, pricedAt: null, reason: "no fresh cost" };
   }
 
   /*
@@ -205,22 +248,28 @@ export function priceSize({ observations, previous = null, merchantFields, now =
     VAT on top and a Dewu cost does not. So every source is priced, and the
     lowest selling price wins.
   */
+  const bands = ownBands?.length ? ownBands : null;
   const priced = costs
-    .map((c) => ({
-      ...c,
+    .map((c) => {
       // The ceiling above is on what the partner is paid; the markup is ours on top.
-      target: minimumSellingPrice({
-        buyingPrice: c.source === "dewu" ? c.cost + markup : c.cost,
-        vatType: vatTypeOf(c.source, settings),
-        merchantFields
-      })
-    }))
+      const buyingPrice = c.source === "dewu" ? c.cost + markup : c.cost;
+      const basis = costBasis({ cost: buyingPrice, source: c.source, merchantFields, settings });
+
+      return {
+        ...c,
+        basis,
+        target: bands
+          ? ownBandPrice({ basis, bands, merchantFields })
+          : minimumSellingPrice({ buyingPrice, vatType: vatTypeOf(c.source, settings), merchantFields })
+      };
+    })
     .filter((c) => c.target);
   const best = priced.sort((a, b) => a.target - b.target)[0] || costs[0];
   const targetPrice = best.target || null;
+  const basis = best.basis ?? null;
 
   if (!targetPrice) {
-    return { status: "closed", source: best.source, cost: best.cost, targetPrice: null, price: null, pricedAt: null, reason: "no margin rule" };
+    return { status: "closed", source: best.source, cost: best.cost, basis, targetPrice: null, price: null, pricedAt: null, reason: "no margin rule" };
   }
 
   const shown = previous?.status === "open" ? Number(previous.price) : null;
@@ -228,7 +277,7 @@ export function priceSize({ observations, previous = null, merchantFields, now =
   // Nothing to slow down from, or the cost went up: the target as it is.
   if (!shown || targetPrice >= shown) {
     return {
-      status: "open", source: best.source, cost: best.cost, targetPrice, price: targetPrice,
+      status: "open", source: best.source, cost: best.cost, basis, targetPrice, price: targetPrice,
       pricedAt: targetPrice === shown ? previous.pricedAt || now : now,
       reason: shown ? "up or equal" : "new"
     };
@@ -246,6 +295,7 @@ export function priceSize({ observations, previous = null, merchantFields, now =
     status: "open",
     source: best.source,
     cost: best.cost,
+    basis,
     targetPrice,
     price,
     pricedAt: price === shown ? previous.pricedAt || now : now,

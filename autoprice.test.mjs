@@ -247,3 +247,35 @@ test("with a Price Ending the slow way down stays on the ending", () => {
   assert.equal(r.price, 285.95);
   assert.equal(r.reason, "coming down slowly");
 });
+
+test("own margins: band on the cost basis, StockX with VAT, GOAT as it stands", async () => {
+  const { readOwnBands, costBasis, ownBandPrice } = await import("./autoprice.js");
+  const bands = readOwnBands([{ from: 100, margin: 49.5 }, { from: 0, margin: 55 }, { from: 225, margin: 54.5 }, { from: "x", margin: 1 }]);
+  const store = { "VAT Rate": 0.21, "Price Ending": 0.5 };
+
+  assert.deepEqual(bands.map((b) => b.from), [0, 100, 225]);
+  assert.equal(costBasis({ cost: 100, source: "stockx_pro", merchantFields: store }), 121);
+  assert.equal(costBasis({ cost: 100, source: "goat", merchantFields: store }), 100);
+  // 121 + 49.5 = 170.5, already on ,50
+  assert.equal(ownBandPrice({ basis: 121, bands, merchantFields: store }), 170.5);
+  // 99 is below 100: first band, 99 + 55 = 154 -> 154.5
+  assert.equal(ownBandPrice({ basis: 99, bands, merchantFields: store }), 154.5);
+  // 230 + 54.5 = 284.5
+  assert.equal(ownBandPrice({ basis: 230, bands, merchantFields: store }), 284.5);
+});
+
+test("own margins replace the Merchants rule, and the cheapest price wins", () => {
+  const now = new Date("2026-11-26T12:00:00Z");
+  const at = "2026-11-26T10:00:00Z";
+  const store = { ...UNION, "Price Ending": 0.5, "Autoprice Sources": ["StockX", "GOAT"] };
+  const ownBands = [{ from: 0, margin: 55 }, { from: 100, margin: 49.5 }];
+  const r = priceSize({
+    observations: { stockx_pro: { cost: 100, observedAt: at }, goat: { cost: 135, observedAt: at } },
+    merchantFields: store, ownBands, now
+  });
+
+  // StockX 121 + 49.5 = 170.5; GOAT 135 + 49.5 = 184.5
+  assert.equal(r.source, "stockx_pro");
+  assert.equal(r.basis, 121);
+  assert.equal(r.price, 170.5);
+});

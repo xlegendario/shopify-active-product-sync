@@ -7,7 +7,8 @@
  * the open prices written to Shopify as "<size> / Standard" variants
  * (standardWriter.js); for any other store nothing goes to Shopify.
  */
-import { allowedSources, priceSize } from "./autoprice.js";
+import { allowedSources, priceSize, readOwnBands } from "./autoprice.js";
+import { writeLivePrices } from "./livePriceWriter.js";
 import { refreshMarketPrices, readDewuFee, supabase } from "./marketPrices.js";
 import { expressOptionOn } from "./delivery.js";
 import { writeStandardVariants } from "./standardWriter.js";
@@ -19,9 +20,26 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
   const merchantId = merchant["Record ID"];
   const db = supabase({ supabaseUrl: env.SUPABASE_URL, supabaseKey: env.SUPABASE_SERVICE_ROLE_KEY });
 
+  const forStore = "merchant_record_id=eq." + encodeURIComponent(merchantId);
+
+  /*
+    A store with its own autopricing margins (set in the portal). Before the
+    tables exist this reads nothing and the store is priced as before.
+  */
+  const [settingsRow] = await db.select("autoprice_settings", "select=margin_bands&" + forStore).catch(() => []);
+  const ownBands = readOwnBands(settingsRow?.margin_bands);
+  const own = ownBands.length > 0;
+  const liveSkus = own
+    ? new Set((await db.select("autoprice_live", "select=sku&order=sku.asc&" + forStore).catch(() => [])).map((r) => clean(r.sku)))
+    : new Set();
+
   let skus = onlySkus;
 
-  if (!skus) {
+  if (!skus && own) {
+    // Autopricing covers the whole active catalogue, not only what we added.
+    const products = await db.select("store_catalogue_products", "select=sku&status=eq.active&order=sku.asc&" + forStore);
+    skus = products.map((p) => p.sku);
+  } else if (!skus) {
     const choices = await db.select(
       "store_catalogue_choices",
       "select=sku&choice=eq.add&merchant_record_id=eq." + encodeURIComponent(merchantId) + "&order=sku.asc"
@@ -44,7 +62,14 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
     const sources = allowedSources(merchant);
     const skipDewu = Boolean(sources && !sources.has("dewu"));
 
-    market = await refreshMarketPrices(skus, { db, retailedKey, dewuFee, skipDewu, log });
+    /*
+      A whole catalogue is thousands of style codes. The StockX API is only
+      the stand-in for Pro there, so it is read once a day instead of every
+      six hours - Pro keeps them fresh.
+    */
+    const every = own ? { stockx_api: 24, dewu: 24, goat: 24 } : undefined;
+
+    market = await refreshMarketPrices(skus, { db, retailedKey, dewuFee, skipDewu, log, ...(every ? { every } : {}) });
   }
 
   const observations = new Map();
@@ -80,19 +105,35 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
 
   for (const key of new Set([...observations.keys(), ...previous.keys()])) {
     const [sku, size] = key.split("|");
-    const d = priceSize({ observations: observations.get(key) || {}, previous: previous.get(key) || null, merchantFields: merchant, now });
+    /*
+      In test mode nothing is in the shop yet, so there is no shown price to
+      come down slowly from: the store sees the price its margins give, and
+      sees a margin change straight away.
+    */
+    const inTest = own && !liveSkus.has(sku);
+    const d = priceSize({
+      observations: observations.get(key) || {}, previous: inTest ? null : previous.get(key) || null,
+      merchantFields: merchant, ownBands: own ? ownBands : null, now
+    });
 
     tally[d.status] += 1;
     if (d.source) tally.bySource[d.source] = (tally.bySource[d.source] || 0) + 1;
 
     rows.push({
       merchant_record_id: merchantId, sku, size, status: d.status, source: d.source, cost: d.cost,
+      // basis only exists once sql/autoprice_margins.sql ran, and so do own margins.
+      ...(own ? { basis: d.basis } : {}),
       target_price: d.targetPrice, price: d.price, reason: d.reason,
       priced_at: d.pricedAt ? new Date(d.pricedAt).toISOString() : null, updated_at: now.toISOString()
     });
   }
 
   await db.upsert("autoprice_listings", rows, "merchant_record_id,sku,size");
+
+  // The products the store put live get their prices in Shopify; the rest stays a preview.
+  const live = own && liveSkus.size
+    ? await writeLivePrices({ db, graphql, merchantId, liveSkus, rows, apply, log })
+    : null;
 
   let shopify = null;
 
@@ -139,7 +180,10 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
     }
   }
 
-  const summary = { merchant: merchant["Client ID"], skus: skus.length, sizes: rows.length, ...tally, market, shopify };
+  const summary = {
+    merchant: merchant["Client ID"], skus: skus.length, sizes: rows.length, ...tally, market, shopify,
+    ...(own ? { ownMargins: ownBands.length, live } : {})
+  };
   log.log("AUTOPRICE " + JSON.stringify(summary));
 
   return summary;

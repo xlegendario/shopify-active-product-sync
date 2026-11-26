@@ -3988,11 +3988,22 @@ async function autopriceAll({ onlyClientId = "", skus = "", apply = true } = {})
     has Price Sync off.
   */
   const active = await fetchActiveMerchants();
+  /*
+    Or a store with its own autopricing margins from the portal
+    (autoprice_settings): that is the store taking autopricing, whatever
+    Price Sync? says. Without the table this finds none.
+  */
+  const withMargins = new Set(
+    (await autopriceDb().select("autoprice_settings", "select=merchant_record_id,margin_bands").catch(() => []))
+      .filter((r) => Array.isArray(r.margin_bands) && r.margin_bands.length)
+      .map((r) => r.merchant_record_id)
+  );
   const merchants = active.filter((m) =>
-    Boolean(m.fields["Price Sync?"]) && (!onlyClientId || m.fields["Client ID"] === onlyClientId)
+    (Boolean(m.fields["Price Sync?"]) || withMargins.has(m.recordId)) &&
+    (!onlyClientId || m.fields["Client ID"] === onlyClientId)
   );
 
-  if (!merchants.length) return { skipped: "no active store with Price Sync? on" };
+  if (!merchants.length) return { skipped: "no active store with Price Sync? on or own autopricing margins" };
   const results = [];
 
   for (const m of merchants) {
