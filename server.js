@@ -33,6 +33,19 @@ const AIRTABLE_SYNC_ERRORS_TABLE_NAME =
 const AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME =
   process.env.AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME || "Risky Product Matches";
 
+/*
+ * Off unless asked for (26-11-2026).
+ *
+ * The risky-match rows were a copy: every store_listings row in Supabase
+ * already carries match_risk_level and retailed_status, which is where the
+ * portals read them. The copy held ~7,800 Airtable records nobody opened,
+ * in a base that went over its record limit, and every nightly pass spent
+ * Airtable's five requests a second keeping it current. Set
+ * RISKY_MATCHES_IN_AIRTABLE=on to bring the table and its corrections back.
+ */
+const RISKY_MATCHES_IN_AIRTABLE =
+  String(process.env.RISKY_MATCHES_IN_AIRTABLE || "").toLowerCase() === "on";
+
 const AIRTABLE_MERCHANT_ACTIVE_FIELD =
   process.env.AIRTABLE_MERCHANT_ACTIVE_FIELD || "Test Active?";
 
@@ -383,6 +396,8 @@ async function upsertRiskyProductMatch({
   stockxMatched,
   riskyMap
 }) {
+  if (!RISKY_MATCHES_IN_AIRTABLE) return { action: "skipped" };
+
   const productId = String(product.legacyResourceId || getNumericId(product.id));
   const stockxProductName = buildStockxName(retailed);
   const pictureUrl = retailed?.image || "";
@@ -1955,10 +1970,12 @@ async function syncMerchant(merchant, runId) {
   // Rows waiting to be written, a few products' worth at a time.
   const pendingRows = [];
 
-  const existingRiskyRecords = await fetchAllAirtableRecords(
-    AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
-    `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
-  );
+  const existingRiskyRecords = RISKY_MATCHES_IN_AIRTABLE
+    ? await fetchAllAirtableRecords(
+        AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+        `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
+      )
+    : [];
   
   const riskyMap = new Map();
   
@@ -2700,10 +2717,12 @@ app.get("/run-test", async (_req, res) => {
     const products = await fetchActiveProducts(merchant);
     const testProducts = products.slice(0, 5);
     
-    const existingRiskyRecords = await fetchAllAirtableRecords(
-      AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
-      `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
-    );
+    const existingRiskyRecords = RISKY_MATCHES_IN_AIRTABLE
+      ? await fetchAllAirtableRecords(
+          AIRTABLE_RISKY_PRODUCT_MATCHES_TABLE_NAME,
+          `{Merchant Record ID} = '${airtableEscape(merchant.recordId)}'`
+        )
+      : [];
     
     const riskyMap = new Map();
     
@@ -2871,6 +2890,8 @@ app.get("/run-test", async (_req, res) => {
 });
 
 async function applyPendingRiskyCorrections() {
+  if (!RISKY_MATCHES_IN_AIRTABLE) return 0;
+
   const formula = `AND(
     {Match Risk Level} = 'Low',
     OR(
