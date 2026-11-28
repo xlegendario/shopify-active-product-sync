@@ -61,13 +61,26 @@ export function supabase({ supabaseUrl, supabaseKey }) {
     }
   }
 
+  // New rows only: a row that is already there is left exactly as it is.
+  async function insertNew(table, rows, onConflict) {
+    for (let i = 0; i < rows.length; i += 500) {
+      const res = await fetch(base + table + "?on_conflict=" + onConflict, {
+        method: "POST",
+        headers: { ...headers, Prefer: "resolution=ignore-duplicates,return=minimal" },
+        body: JSON.stringify(rows.slice(i, i + 500))
+      });
+
+      if (!res.ok) throw new Error(`Supabase ${res.status} writing ${table}: ${await res.text()}`);
+    }
+  }
+
   async function remove(table, query) {
     const res = await fetch(base + table + "?" + query, { method: "DELETE", headers: { ...headers, Prefer: "return=minimal" } });
 
     if (!res.ok) throw new Error(`Supabase ${res.status} deleting from ${table}: ${await res.text()}`);
   }
 
-  return { select, upsert, remove };
+  return { select, upsert, insertNew, remove };
 }
 
 /* ------------------------------------------------------------------ *

@@ -6,6 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 import { runConsignmentForAll, backfillPhotosForAll } from "./consignmentRun.js";
 import { normalizeSize } from "./sizes.js";
 import { autopriceMerchant } from "./autopriceRun.js";
+import { startBands } from "./autoprice.js";
 import { storeProPrices, storeGoatPrices, supabase as marketDb, refreshMarketPrices, readDewuFee } from "./marketPrices.js";
 import { describeStore, createDescriptionWriter } from "./productDescriptions.js";
 import { photoSources } from "./storePhotos.js";
@@ -3992,19 +3993,24 @@ async function autopriceAll({ onlyClientId = "", skus = "", apply = true } = {})
     Or Autopricing? in Merchants: the store takes autopricing with its own
     margins, whatever Price Sync? says. Its margins live in
     autoprice_settings; a store ticked for the first time gets a row there
-    with the standard margins (the column default), which it then changes in
-    the portal. Unticking keeps the row, so the margins are still there when
+    with its own Lojiq margins from Merchants turned into autopricing bands
+    (startBands), which it then changes in the portal. A store that already
+    has a row - SNEAKEREGEER with the margins it gave us - keeps it. Unticking keeps the row, so the margins are still there when
     it is ticked again.
   */
   const ticked = active.filter((m) => Boolean(m.fields["Autopricing?"]));
 
   if (ticked.length) {
-    // Only the id is sent, so an existing row keeps its margins.
-    await autopriceDb().upsert(
-      "autoprice_settings",
-      ticked.map((m) => ({ merchant_record_id: m.recordId })),
-      "merchant_record_id"
-    ).catch((error) => console.error("AUTOPRICE could not create margin rows:", error.message));
+    const rows = ticked
+      .map((m) => ({ merchant_record_id: m.recordId, margin_bands: startBands(m.fields) }))
+      .filter((r) => r.margin_bands.length);
+
+    if (rows.length < ticked.length) {
+      console.error("AUTOPRICE no Lojiq margins to start from for " +
+        ticked.filter((m) => !rows.some((r) => r.merchant_record_id === m.recordId)).map((m) => m.name).join(", "));
+    }
+
+    await autopriceDb().insertNew("autoprice_settings", rows, "merchant_record_id").catch((error) => console.error("AUTOPRICE could not create margin rows:", error.message));
   }
 
   const merchants = active.filter((m) =>

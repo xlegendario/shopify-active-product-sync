@@ -92,6 +92,42 @@ export function costBasis({ cost, source, merchantFields, settings = SETTINGS })
   return Math.round(paid * (1 + rate) * 100) / 100;
 }
 
+/*
+ * The margins a store starts autopricing with: its own Lojiq margins from
+ * Merchants (Firm Range or Percentage, with Base Costs), turned into margin
+ * bands on the cost basis. Read once, when Autopricing? is first ticked;
+ * after that the bands are the store's own and Merchants no longer moves them.
+ *
+ * Worked out by asking the store's current rule what it adds on top of a pair
+ * at every cost, rounded up to 50 cents, and writing a band wherever that
+ * changes. A Firm Range gives about as many bands as it has; a percentage
+ * changes at every euro, so it is sampled more coarsely to stay within the
+ * 40 bands the portal takes, each band with the margin at its top end.
+ */
+export function startBands(merchantFields, { upTo = 1500 } = {}) {
+  const marginAt = (basis) => {
+    const price = minimumSellingPrice({ buyingPrice: basis, vatType: "MARGIN", merchantFields, round: false });
+
+    return price === null ? null : Math.ceil((price - basis) * 2 - 1e-9) / 2;
+  };
+
+  for (const step of [1, 5, 25, 50]) {
+    const bands = [];
+
+    for (let from = 0; from <= upTo; from += step) {
+      // Coarse bands take the margin at their top end: never below the rule.
+      const margin = marginAt(Math.max(from + step - 1, 1));
+
+      if (margin === null) return [];
+      if (!bands.length || bands[bands.length - 1].margin !== margin) bands.push({ from, margin });
+    }
+
+    if (bands.length <= 40) return bands;
+  }
+
+  return [];
+}
+
 export function ownBandPrice({ basis, bands, merchantFields }) {
   if (!(basis > 0) || !bands?.length) return null;
 

@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { priceSize, usableCosts, safeStockxCost, goatCost, goatEuroCost, dewuCost, allowedSources, dewuMarkup } from "./autoprice.js";
+import { priceSize, usableCosts, safeStockxCost, goatCost, goatEuroCost, dewuCost, allowedSources, dewuMarkup, startBands } from "./autoprice.js";
 import { minimumSellingPrice, maximumBuyingPrice } from "./storePricing.js";
 
 // UNION's Firm Range bands (CL-00031), as in Merchants on 16-11-2026.
@@ -278,4 +278,30 @@ test("own margins replace the Merchants rule, and the cheapest price wins", () =
   assert.equal(r.source, "stockx_pro");
   assert.equal(r.basis, 121);
   assert.equal(r.price, 170.5);
+});
+
+test("start margins come from the store's Lojiq margins", () => {
+  const firm = {
+    "Margin Method": "Firm Range",
+    "FR <75 Min Margin": 50,
+    "FR 75-149 Min Margin": 60,
+    "FR 150-299 Min Margin": 70,
+    "FR >300 Min Margin": 80
+  };
+
+  // 0+50 < 75 until a cost of 25; then 60 until the price reaches 150, ...
+  assert.deepEqual(startBands(firm, { upTo: 400 }), [
+    { from: 0, margin: 50 }, { from: 25, margin: 60 }, { from: 90, margin: 70 }, { from: 230, margin: 80 }
+  ]);
+
+  const pct = startBands({ "Margin Method": "Percentage", "Minimum Margin (%)": 0.2, "Min Margin Amount": 30 });
+
+  assert.ok(pct.length <= 40);
+  // Never below the store's own rule anywhere in a band.
+  for (let i = 0; i < pct.length - 1; i += 1) {
+    const top = pct[i + 1].from - 1;
+    assert.ok(pct[i].margin >= Math.max(30, top / 0.8 - top) - 0.5);
+  }
+
+  assert.deepEqual(startBands({}), []);
 });
