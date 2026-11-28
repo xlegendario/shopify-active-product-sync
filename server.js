@@ -3989,21 +3989,30 @@ async function autopriceAll({ onlyClientId = "", skus = "", apply = true } = {})
   */
   const active = await fetchActiveMerchants();
   /*
-    Or a store with its own autopricing margins from the portal
-    (autoprice_settings): that is the store taking autopricing, whatever
-    Price Sync? says. Without the table this finds none.
+    Or Autopricing? in Merchants: the store takes autopricing with its own
+    margins, whatever Price Sync? says. Its margins live in
+    autoprice_settings; a store ticked for the first time gets a row there
+    with the standard margins (the column default), which it then changes in
+    the portal. Unticking keeps the row, so the margins are still there when
+    it is ticked again.
   */
-  const withMargins = new Set(
-    (await autopriceDb().select("autoprice_settings", "select=merchant_record_id,margin_bands").catch(() => []))
-      .filter((r) => Array.isArray(r.margin_bands) && r.margin_bands.length)
-      .map((r) => r.merchant_record_id)
-  );
+  const ticked = active.filter((m) => Boolean(m.fields["Autopricing?"]));
+
+  if (ticked.length) {
+    // Only the id is sent, so an existing row keeps its margins.
+    await autopriceDb().upsert(
+      "autoprice_settings",
+      ticked.map((m) => ({ merchant_record_id: m.recordId })),
+      "merchant_record_id"
+    ).catch((error) => console.error("AUTOPRICE could not create margin rows:", error.message));
+  }
+
   const merchants = active.filter((m) =>
-    (Boolean(m.fields["Price Sync?"]) || withMargins.has(m.recordId)) &&
+    (Boolean(m.fields["Price Sync?"]) || Boolean(m.fields["Autopricing?"])) &&
     (!onlyClientId || m.fields["Client ID"] === onlyClientId)
   );
 
-  if (!merchants.length) return { skipped: "no active store with Price Sync? on or own autopricing margins" };
+  if (!merchants.length) return { skipped: "no active store with Price Sync? or Autopricing? on" };
   const results = [];
 
   for (const m of merchants) {

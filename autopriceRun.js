@@ -23,10 +23,13 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
   const forStore = "merchant_record_id=eq." + encodeURIComponent(merchantId);
 
   /*
-    A store with its own autopricing margins (set in the portal). Before the
-    tables exist this reads nothing and the store is priced as before.
+    A store with Autopricing? ticked in Merchants prices with its own margins
+    (autoprice_settings, set in the portal). Unticked, the row is kept but
+    not used: the store is priced as before (Firm Range, Price Sync?).
   */
-  const [settingsRow] = await db.select("autoprice_settings", "select=margin_bands&" + forStore).catch(() => []);
+  const [settingsRow] = merchant["Autopricing?"]
+    ? await db.select("autoprice_settings", "select=margin_bands&" + forStore).catch(() => [])
+    : [];
   const ownBands = readOwnBands(settingsRow?.margin_bands);
   const own = ownBands.length > 0;
   const liveSkus = own
