@@ -15,10 +15,11 @@ test("only moved prices are written; Custom Price and unpriced sizes are left al
       row("42", { store_price: 199.5 }),
       row("43", { store_price: 180.5 }),
       row("44", { store_price: 210, custom_price: 210 }),
-      row("45", { store_price: 220 })
+      row("45", { store_price: 220 }),
+      row("44", { store_price: 230, price_mode: "own", shopify_variant_id: "v44b" })
     ]
   });
 
   assert.deepEqual(changes.map((c) => [c.size, c.from, c.to]), [["42", 199.5, 170.5]]);
-  assert.deepEqual(skipped, { custom: 1, same: 1, noPrice: 1 });
+  assert.deepEqual(skipped, { custom: 1, own: 1, same: 1, noPrice: 1 });
 });

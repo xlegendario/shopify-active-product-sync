@@ -9,6 +9,8 @@
  * Left alone:
  *   - a size with a Custom Price: the store priced it itself (own stock, or
  *     simply its own choice);
+ *   - a size on "Keep my price" (price_mode own), set in the portal: the
+ *     store keeps that price, live product or not;
  *   - a closed size (no fresh cost): its price stays as it was;
  *   - a size whose shop price already is the autopricing price.
  *
@@ -35,7 +37,7 @@ const gid = (kind, id) => (String(id).startsWith("gid://") ? String(id) : `gid:/
  */
 export function planLivePrices({ listings, prices }) {
   const changes = [];
-  const skipped = { custom: 0, same: 0, noPrice: 0 };
+  const skipped = { custom: 0, own: 0, same: 0, noPrice: 0 };
 
   for (const l of listings) {
     if (!l.shopify_variant_id || !l.shopify_product_id) continue;
@@ -43,7 +45,8 @@ export function planLivePrices({ listings, prices }) {
     const price = prices.get(clean(l.sku) + "|" + String(l.size || "").trim());
 
     if (!(price > 0)) { skipped.noPrice += 1; continue; }
-    if (Number(l.custom_price) > 0) { skipped.custom += 1; continue; }
+    if (Number(l.custom_price) > 0 || l.price_mode === "custom") { skipped.custom += 1; continue; }
+    if (l.price_mode === "own") { skipped.own += 1; continue; }
 
     const now = Number(l.store_price ?? l.shopify_price);
 
@@ -88,7 +91,7 @@ export async function writeLivePrices({ db, graphql, merchantId, liveSkus, rows,
     */
     listings.push(...await db.select(
       "store_listings",
-      "select=sku,size,shopify_product_id,shopify_variant_id,shopify_price,store_price,custom_price&order=id.asc" +
+      "select=sku,size,shopify_product_id,shopify_variant_id,shopify_price,store_price,custom_price,price_mode&order=id.asc" +
         "&merchant_record_id=eq." + encodeURIComponent(merchantId) +
         "&shopify_product_id=in.(" + ids.map((id) => `"${id}"`).join(",") + ")"
     ));
