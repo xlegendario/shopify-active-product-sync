@@ -133,23 +133,36 @@ export async function autopriceMerchant({ merchant, env = process.env, refresh =
 
   await db.upsert("autoprice_listings", rows, "merchant_record_id,sku,size");
 
-  // The products the store put live get their prices in Shopify; the rest stays a preview.
-  const live = own && liveSkus.size
+  const express = Boolean(graphql && expressOptionOn(merchant));
+
+  /*
+    The products the store put live get their prices in Shopify; the rest
+    stays a preview. A store with Express Option? gets them on its Standard
+    variants below instead: writing the size's own variants there would put
+    the autopricing price on the Express variant, which is our consignors'
+    stock and belongs to the consignment run.
+  */
+  const live = own && liveSkus.size && !express
     ? await writeLivePrices({ db, graphql, merchantId, liveSkus, rows, apply, log })
     : null;
 
   let shopify = null;
 
-  if (graphql && expressOptionOn(merchant)) {
+  if (express) {
     const listingsBySku = new Map();
 
     for (const r of rows) {
       if (r.status !== "open" || !(r.price > 0)) continue;
+      // With own margins only live products, the same test mode as without Express.
+      if (own && !liveSkus.has(r.sku)) continue;
       if (!listingsBySku.has(r.sku)) listingsBySku.set(r.sku, []);
       listingsBySku.get(r.sku).push({ size: r.size, price: r.price });
     }
 
-    shopify = await writeStandardVariants({ graphql, skus, listingsBySku, apply, log });
+    // With own margins, a product back in test mode keeps its Standard sizes as they are.
+    const standardSkus = own ? skus.filter((sku) => liveSkus.has(sku)) : skus;
+
+    shopify = await writeStandardVariants({ graphql, skus: standardSkus, listingsBySku, apply, log });
 
     /*
       A pair the store chose that has no page yet - nobody ever held it, so
